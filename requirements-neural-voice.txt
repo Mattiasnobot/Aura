@@ -1,0 +1,2 @@
+# Local neural speech used by Aura. The voice model lives in ./aura-voices.
+piper-tts==1.4.2

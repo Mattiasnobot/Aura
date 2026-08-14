@@ -1,0 +1,5 @@
+# Optional offline microphone input. Aura's text UI and local speech output need no packages.
+SpeechRecognition>=3.10,<4
+pocketsphinx>=5,<6
+sounddevice>=0.5,<1
+# PyAudio remains supported as a compatibility fallback.

@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07101c">
+  <title>Aura</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <aside id="sidebar" class="sidebar">
+      <div class="brand-row">
+        <div class="brand-mark">A</div>
+        <div><strong>Aura</strong><span>local companion</span></div>
+      </div>
+
+      <div id="faceWrap" class="face-wrap" data-state="idle" aria-label="Aura is idle" role="button" tabindex="0" title="Aura is here — click for quick actions">
+        <div class="orbit orbit-one"></div>
+        <div class="orbit orbit-two"></div>
+        <div class="avatar-stage model-3d">
+          <canvas id="avatarCanvas" class="avatar-canvas" width="260" height="300" role="img" aria-label="Aura's locally rendered depth-projected digital face"></canvas>
+          <div class="holo-scan" aria-hidden="true"></div>
+          <div class="holo-index" aria-hidden="true"><span>AU</span><i></i><span>01</span></div>
+        </div>
+        <div id="stateLabel" class="state-label">IDLE</div>
+      </div>
+
+      <div class="privacy-line"><span></span> Local • private • calm</div>
+      <div id="providerLabel" class="provider-label">LM Studio • checking…</div>
+      <div id="powerLabel" class="power-label">Deep mind • powerful tools</div>
+
+      <nav class="side-actions" aria-label="Aura controls">
+        <button id="voiceButton" class="side-button" aria-pressed="false" aria-describedby="voiceHint" title="Click to talk, or hold while speaking"><span class="button-icon">◉</span> <span id="voiceButtonLabel">Voice</span> <span class="voice-wave" aria-hidden="true"><i></i><i></i><i></i></span></button>
+        <div id="voiceTray" class="voice-tray hidden" aria-live="polite">
+          <div class="voice-tray-head"><strong id="voiceStatus">Ready to listen</strong><button id="voiceCancel" type="button" title="Cancel voice input">×</button></div>
+          <div class="voice-meter" role="meter" aria-label="Microphone level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="voiceMeterFill"></i></div>
+          <p id="voicePartial">Click once for automatic listening, or hold the Voice button while speaking.</p>
+          <div class="voice-tray-actions"><button id="voiceRetry" type="button" class="hidden">Retry</button><span id="voiceHint">Local • click or hold to talk</span></div>
+        </div>
+        <button id="mindButton" class="side-button accent"><span class="button-icon">✦</span> Aura Mind <kbd>Ctrl M</kbd></button>
+        <button id="memoryButton" class="side-button"><span class="button-icon">◇</span> What Aura knows</button>
+        <button id="settingsButton" class="side-button"><span class="button-icon">⚙</span> Settings</button>
+        <button id="workspaceButton" class="side-button"><span class="button-icon">↗</span> Open workspace</button>
+        <button id="tasksButton" class="side-button"><span class="button-icon">✓</span> Recent tasks</button>
+        <button id="filesButton" class="side-button"><span class="button-icon">≡</span> Workspace</button>
+        <button id="quitButton" class="side-button quit-button"><span class="button-icon">○</span> Quit Aura</button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <span id="workspacePath">aura-workspace</span>
+        <button id="collapseSidebar" title="Collapse sidebar">‹</button>
+      </div>
+    </aside>
+
+    <div id="sidebarResizer" class="vertical-resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" title="Drag to resize sidebar"></div>
+
+    <main class="main-panel">
+      <header class="topbar">
+        <div>
+          <h1>Conversation</h1>
+          <p id="activityText">Aura is ready.</p>
+        </div>
+        <div class="top-actions">
+          <button id="toggleLogButton" class="ghost-button">Action log</button>
+          <button id="clearButton" class="ghost-button">Clear</button>
+        </div>
+      </header>
+
+      <section id="conversation" class="conversation" aria-live="polite"></section>
+
+      <div id="logResizer" class="horizontal-resizer" role="separator" aria-orientation="horizontal" aria-label="Resize action log" title="Drag to resize action log"></div>
+      <section id="actionPanel" class="action-panel">
+        <div class="panel-heading">
+          <div class="log-tabs" role="tablist" aria-label="Activity log view">
+            <button id="activityLogTab" class="active" role="tab" aria-selected="true">Activity</button>
+            <button id="diagnosticsLogTab" role="tab" aria-selected="false">Diagnostics</button>
+          </div>
+          <span id="logCount">0 events this session</span>
+        </div>
+        <div id="actionLog" class="action-log"></div>
+      </section>
+
+      <section id="suggestionBar" class="suggestion-bar" aria-label="Suggested actions"></section>
+
+      <section class="composer-shell">
+        <textarea id="composer" rows="2" maxlength="12000" placeholder="Talk to Aura or ask her to build something…" aria-label="Message Aura"></textarea>
+        <div class="composer-actions">
+          <button id="attachButton" class="attach-button" title="Import files into Aura's workspace" aria-label="Import files">＋</button>
+          <input id="filePicker" class="hidden" type="file" multiple>
+          <button id="stopButton" class="stop-button" disabled>Stop</button>
+          <button id="sendButton" class="send-button">Send <span>↗</span></button>
+        </div>
+        <div class="composer-hint">Enter to send • Shift+Enter for a new line • Esc to stop</div>
+      </section>
+    </main>
+
+    <section id="mindView" class="mind-view hidden" aria-label="Aura Mind">
+      <header class="mind-toolbar">
+        <div><strong>Aura Mind</strong><span id="mindSummary">living local map</span></div>
+        <div class="mind-tools">
+          <label>Find <input id="mindSearch" type="search" placeholder="Search the map"></label>
+          <button id="mindFit">Fit</button><button id="mindReset">Reset</button><button id="mindRefresh">Refresh</button>
+          <button id="mindClose" class="mind-close" aria-label="Close Aura Mind">×</button>
+        </div>
+      </header>
+      <canvas id="mindCanvas" tabindex="0" aria-label="Interactive Aura Mind knowledge map">Aura Mind requires a browser with Canvas support.</canvas>
+      <footer class="mind-footer">
+        <div class="mind-detail-row"><div id="mindDetail">Select a node to see what Aura knows about it.</div><div id="mindActions" class="mind-actions hidden"><button id="mindAsk">Ask Aura</button><button id="mindOpen">Open</button></div></div>
+        <small>Drag nodes • drag empty space to pan • mouse wheel to zoom • Esc to close</small>
+      </footer>
+    </section>
+
+    <section id="workspaceView" class="workspace-view hidden" aria-label="Workspace explorer">
+      <header class="workspace-toolbar">
+        <div><strong>Workspace</strong><span id="workspaceSummary">Loading local files…</span></div>
+        <div class="workspace-tools">
+          <label><span>Find</span><input id="workspaceSearch" type="search" placeholder="Filter files"></label>
+          <button id="workspaceTrashToggle">Trash</button>
+          <button id="workspaceHistory">History</button>
+          <button id="workspacePreviewServer">Preview</button>
+          <button id="workspaceRefresh">Refresh</button>
+          <button id="workspaceOpenFolder">Open folder</button>
+          <button id="workspaceClose" class="workspace-close" aria-label="Close workspace explorer">×</button>
+        </div>
+      </header>
+      <div class="workspace-content">
+        <aside class="workspace-tree-panel">
+          <div class="workspace-tree-heading">
+            <span id="workspaceTreeLabel">Files</span>
+            <div class="workspace-tree-heading-actions">
+              <button id="workspaceNewFile">New file</button>
+              <button id="workspaceNewFolder">New folder</button>
+              <button id="workspaceImport">Import</button>
+            </div>
+          </div>
+          <div id="workspaceTree" class="workspace-tree" role="tree"></div>
+        </aside>
+        <section class="workspace-preview-panel">
+          <header class="preview-toolbar">
+            <div><strong id="previewPath">Choose a file</strong><span id="previewMeta">Safe read-only preview</span></div>
+            <div><button id="previewCompare" disabled>Compare</button><button id="previewAsk" disabled>Ask Aura</button><button id="previewOpen" disabled>Open</button></div>
+          </header>
+          <div id="workspacePreview" class="workspace-preview"><div class="preview-empty"><span>◇</span><strong>Select a workspace file</strong><p>Text, code, images, HTML, and SVG can be previewed locally.</p></div></div>
+        </section>
+      </div>
+      <footer>Drop files anywhere in Aura to import them safely • previews never execute scripts</footer>
+    </section>
+  </div>
+
+  <div id="memoryModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="memoryTitle">
+    <div class="modal-card memory-card">
+      <header><div><h2 id="memoryTitle">What Aura knows about you</h2><p id="memoryPrivacy">Local, transparent, and always under your control.</p></div><button class="modal-x" data-close="memoryModal">×</button></header>
+      <div class="memory-overview">
+        <div><span>Name</span><strong id="memoryName">Not set</strong></div>
+        <div><span>Personal memories</span><strong id="memoryCount">0</strong></div>
+        <label><span>Find</span><input id="memorySearch" type="search" placeholder="Filter memories"></label>
+      </div>
+      <form id="memoryTeach" class="memory-teach">
+        <select id="memoryCategory" aria-label="Memory category"></select>
+        <input id="memoryValue" maxlength="240" placeholder="Teach Aura something non-sensitive about you" aria-label="Personal memory">
+        <button class="primary-button" type="submit">Teach Aura</button>
+      </form>
+      <div id="memoryList" class="memory-list"></div>
+      <footer><span>Credentials and sensitive personal details are never learned automatically.</span><button class="primary-button" data-close="memoryModal">Done</button></footer>
+    </div>
+  </div>
+
+  <div id="settingsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="modal-card settings-card">
+      <header><div><h2 id="settingsTitle">Aura settings</h2><p>Stored locally on this computer.</p></div><button class="modal-x" data-close="settingsModal">×</button></header>
+      <div class="settings-grid">
+        <label class="wide">LM Studio URL<input id="settingUrl" type="url"></label>
+        <label class="wide model-field">Model<select id="settingModel"></select><button id="refreshModels" type="button">Refresh models</button></label>
+        <label>Timeout (seconds)<input id="settingTimeout" type="number" min="5" max="900"></label>
+        <label>Temperature<input id="settingTemperature" type="number" min="0" max="2" step="0.1"></label>
+        <label>Maximum tokens<input id="settingTokens" type="number" min="256" max="32768"></label>
+        <label>Thinking depth<select id="settingReasoning"><option value="fast">Fast</option><option value="balanced">Balanced</option><option value="deep">Deep</option></select></label>
+        <label>Autonomy<select id="settingAutonomy"><option value="careful">Careful</option><option value="balanced">Balanced</option><option value="powerful">Powerful</option></select></label>
+        <div class="power-note wide"><strong>Powerful mode</strong><span>Gives Aura the broad tool catalog and longer multi-step runs. File changes remain recoverable; executable code, external network requests, and desktop launches still ask first.</span></div>
+        <label class="toggle-row wide"><input id="settingLearning" type="checkbox"><span>Learn clear, non-sensitive things I state in conversation</span></label>
+        <div class="settings-section wide"><strong>Presence</strong><span>Shape how Aura moves and how much detail the face renders.</span></div>
+        <label>Avatar motion<select id="settingAvatarMotion"><option value="calm">Calm</option><option value="natural">Natural</option><option value="expressive">Expressive</option></select></label>
+        <label>Avatar quality<select id="settingAvatarQuality"><option value="auto">Automatic</option><option value="high">High detail</option><option value="low">Lower detail</option></select></label>
+        <label class="wide">Motion intensity<input id="settingAvatarIntensity" type="range" min="0" max="100" step="5"><output id="avatarIntensityOutput"></output></label>
+        <div class="settings-section wide"><strong>Voice input</strong><span>Microphone capture and recognition remain on this computer.</span></div>
+        <label>Offline recognizer<select id="settingVoiceEngine"><option value="auto">Automatic</option><option value="pocketsphinx">PocketSphinx streaming</option><option value="whisper_cpp">Whisper.cpp</option></select></label>
+        <label>Language code<input id="settingVoiceLanguage" type="text" maxlength="12" placeholder="en"></label>
+        <label class="wide model-field">Microphone<select id="settingMicrophone"></select><button id="refreshMicrophones" type="button">Refresh microphones</button></label>
+        <label>Room calibration<input id="settingCalibration" type="range" min="200" max="2000" step="100"><output id="calibrationOutput"></output></label>
+        <label>End-of-speech pause<input id="settingSilence" type="range" min="500" max="3000" step="100"><output id="silenceOutput"></output></label>
+        <label>Maximum listening time<input id="settingVoiceMax" type="number" min="5" max="60"></label>
+        <div class="voice-setting-actions wide"><button id="calibrateMicrophone" type="button">Calibrate microphone</button><span id="microphoneStatus">Not checked yet.</span></div>
+        <details class="voice-advanced wide"><summary>Optional Whisper.cpp paths</summary><label>Whisper executable<input id="settingWhisperPath" type="text" placeholder="whisper-cli.exe"></label><label>Whisper model<input id="settingWhisperModel" type="text" placeholder="model.ggml"></label></details>
+        <div class="settings-section wide"><strong>Voice output</strong><span>Piper stays local and drives Aura’s mouth from generated audio.</span></div>
+        <label>Speech engine<select id="settingSpeechEngine"><option value="piper">Piper neural</option><option value="sapi">Windows SAPI</option></select></label>
+        <label class="wide model-field">SAPI fallback voice<select id="settingVoice"></select><button id="refreshVoices" type="button">Refresh voices</button></label>
+        <label>Speech rate<input id="settingRate" type="range" min="-10" max="10"><output id="rateOutput"></output></label>
+        <label>Speech volume<input id="settingVolume" type="range" min="0" max="100"><output id="volumeOutput"></output></label>
+        <label class="toggle-row wide"><input id="settingSpeak" type="checkbox"><span>Speak Aura’s replies locally</span></label>
+        <div class="voice-setting-actions wide"><button id="previewVoice" type="button">Preview Aura’s voice</button><span>Use this to check the selected output before saving.</span></div>
+      </div>
+      <div id="settingsStatus" class="modal-status">Ready.</div>
+      <footer><button class="ghost-button" data-close="settingsModal">Cancel</button><button id="saveSettings" class="primary-button">Save settings</button></footer>
+    </div>
+  </div>
+
+  <div id="tasksModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="tasksTitle">
+    <div class="modal-card tasks-card">
+      <header><div><h2 id="tasksTitle">Recent tasks</h2><p>Outcomes and recoverable workspace changes.</p></div><button class="modal-x" data-close="tasksModal">×</button></header>
+      <div id="taskList" class="task-list"></div>
+      <footer><button class="primary-button" data-close="tasksModal">Done</button></footer>
+    </div>
+  </div>
+
+  <div id="approvalModal" class="modal-backdrop hidden priority-modal" role="alertdialog" aria-modal="true" aria-labelledby="approvalTitle">
+    <div class="modal-card approval-card">
+      <div class="approval-icon">!</div>
+      <h2 id="approvalTitle">Command approval</h2>
+      <p>Aura wants to use a capability that needs your permission:</p>
+      <pre id="approvalCommand"></pre>
+      <small>“Allow identical for task” covers only this exact command or URL until the current task ends.</small>
+      <footer><button id="denyApproval" class="ghost-button">Deny</button><button id="allowTaskApproval" class="ghost-button">Allow identical for task</button><button id="allowApproval" class="danger-button">Allow once</button></footer>
+    </div>
+  </div>
+
+  <div id="promptModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="promptTitle">
+    <div class="modal-card prompt-card">
+      <header><div><h2 id="promptTitle">Name it</h2><p id="promptHint">Workspace-relative path</p></div><button class="modal-x" data-close="promptModal">×</button></header>
+      <form id="promptForm">
+        <input id="promptInput" type="text" maxlength="255" required autocomplete="off">
+        <div id="promptStatus" class="modal-status"></div>
+        <footer><button type="button" class="ghost-button" data-close="promptModal">Cancel</button><button type="submit" class="primary-button" id="promptConfirm">Confirm</button></footer>
+      </form>
+    </div>
+  </div>
+
+  <div id="historyModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="historyTitle">
+    <div class="modal-card history-card">
+      <header><div><h2 id="historyTitle">Workspace history</h2><p>Only the most recent change can be undone directly.</p></div><button class="modal-x" data-close="historyModal">×</button></header>
+      <div id="historyList" class="task-list"></div>
+      <footer><button class="primary-button" data-close="historyModal">Done</button></footer>
+    </div>
+  </div>
+
+  <div id="previewServerModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="previewServerTitle">
+    <div class="modal-card">
+      <header><div><h2 id="previewServerTitle">Live preview server</h2><p>Serves a workspace folder with real HTML/CSS/JS execution, separate from Aura's protected app. Starts only when you ask.</p></div><button class="modal-x" data-close="previewServerModal">×</button></header>
+      <form id="previewServerForm" class="prompt-card-form">
+        <input id="previewServerFolder" type="text" maxlength="255" placeholder="Workspace-relative folder to serve (blank = whole workspace)" autocomplete="off">
+        <button type="submit" class="primary-button" id="previewServerStart">Start preview</button>
+      </form>
+      <div id="previewServerStatus" class="modal-status">Not running.</div>
+      <div id="previewServerActions" class="preview-server-actions hidden">
+        <button id="previewServerOpen" type="button">Open in browser</button>
+        <button id="previewServerCheckAssets" type="button">Check assets</button>
+        <button id="previewServerStop" type="button" class="danger-button">Stop</button>
+      </div>
+      <pre id="previewServerLog" class="preview-server-log"></pre>
+      <footer><button class="primary-button" data-close="previewServerModal">Done</button></footer>
+    </div>
+  </div>
+
+  <div id="toastRegion" class="toast-region" aria-live="assertive"></div>
+  <div id="dropOverlay" class="drop-overlay hidden" aria-hidden="true"><div><span>＋</span><strong>Drop files into Aura</strong><small>They will be copied into the protected workspace.</small></div></div>
+  <script src="avatar-face.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
