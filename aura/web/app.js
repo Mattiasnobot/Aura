@@ -64,6 +64,7 @@ let selectedMindNode = null;
 let dragDepth = 0;
 let personalMemories = [];
 let memoryCategories = [];
+let memoryConflicts = [];
 let capabilityState = {};
 let avatarMotion = null;
 let voiceActive = false;
@@ -265,6 +266,25 @@ function attachTaskCard(article, task) {
   if ((task.tools || []).some(name => MUTATION_TOOLS.has(name))) action("Undo", () => rollbackTask(task));
   card.append(head, tools, actions);
   article.append(card);
+}
+
+function attachRecallNote(article, recalled) {
+  if (!article || !(recalled || []).length) return;
+  const note = document.createElement("details");
+  note.className = "memory-recall-note";
+  const summary = document.createElement("summary");
+  summary.textContent = `Used ${recalled.length} ${recalled.length === 1 ? "memory" : "memories"}`;
+  note.append(summary);
+  const list = document.createElement("ul");
+  for (const item of recalled.slice(0, 8)) {
+    const row = document.createElement("li");
+    const value = document.createElement("span"); value.textContent = item.value;
+    const reason = document.createElement("em"); reason.textContent = item.recall_reason;
+    row.append(value, document.createTextNode(" — "), reason);
+    list.append(row);
+  }
+  note.append(list);
+  article.append(note);
 }
 
 function setSuggestions(items) {
@@ -517,6 +537,7 @@ async function handleEvent(event) {
         completedMessage = addMessage("assistant", event.text);
       }
       attachTaskCard(completedMessage?.article, event.task);
+      attachRecallNote(completedMessage?.article, event.recalled);
       updateSuggestions(event.text, event.task);
       break;
     case "state": setState(event.value); break;
@@ -1179,6 +1200,70 @@ function populateMemoryCategories(select, selected = "personal") {
   setSelectValue(select, selected);
 }
 
+function buildMemoryCard(memory) {
+  const card = document.createElement("article"); card.className = `memory-item${memory.pinned ? " pinned" : ""}`;
+  const copy = document.createElement("div"); copy.className = "memory-item-copy";
+  const head = document.createElement("div"); head.className = "memory-item-head";
+  const category = document.createElement("span"); category.className = "memory-category"; category.textContent = memoryCategoryLabel(memory.category);
+  const confidence = document.createElement("span"); confidence.className = "memory-confidence";
+  confidence.textContent = memory.confirmed ? "User confirmed" : `${Math.round((Number(memory.confidence) || 0) * 100)}% confidence`;
+  head.append(category, confidence);
+  const value = document.createElement("p"); value.textContent = memory.value;
+  const source = document.createElement("small");
+  const updated = memory.updated ? new Date(memory.updated).toLocaleDateString() : "";
+  const lastUsed = memory.last_used ? new Date(memory.last_used).toLocaleDateString() : "";
+  source.textContent = `${memory.pinned ? "Pinned • " : ""}${memory.project ? `Project: ${memory.project} • ` : ""}${updated ? `Updated ${updated} • ` : ""}${lastUsed ? `Last used ${lastUsed} • ` : ""}Source: ${memory.source || "Aura chat"}`;
+  const related = memoryConflicts
+    .filter(pair => pair.a === memory.id || pair.b === memory.id)
+    .map(pair => ({ kind: pair.kind, other: personalMemories.find(item => item.id === (pair.a === memory.id ? pair.b : pair.a)) }))
+    .filter(entry => entry.other);
+  copy.append(head, value, source);
+  for (const entry of related) {
+    const warning = document.createElement("small");
+    warning.className = `memory-conflict ${entry.kind}`;
+    warning.textContent = `${entry.kind === "contradicts" ? "May contradict" : "Overlaps with"}: ${entry.other.value}`;
+    copy.append(warning);
+  }
+  const actions = document.createElement("div"); actions.className = "memory-actions";
+  const button = (label, handler, danger = false) => {
+    const control = document.createElement("button"); control.type = "button"; control.textContent = label; control.classList.toggle("danger", danger); control.addEventListener("click", handler); actions.append(control);
+  };
+  if (!memory.confirmed) {
+    button("Confirm", async () => {
+      const result = await callApi("update_personal_memory", memory.id, {});
+      if (!result.ok) return toast(result.error, true);
+      toast("Memory confirmed.");
+    });
+  }
+  button(memory.pinned ? "Unpin" : "Pin", async () => {
+    const result = await callApi("update_personal_memory", memory.id, { pinned: !memory.pinned });
+    if (!result.ok) return toast(result.error, true);
+    toast(memory.pinned ? "Memory unpinned." : "Memory pinned for stronger recall.");
+  });
+  button("Edit", () => {
+    const editor = document.createElement("div"); editor.className = "memory-editor";
+    const select = document.createElement("select"); populateMemoryCategories(select, memory.category);
+    const textarea = document.createElement("textarea"); textarea.maxLength = 240; textarea.value = memory.value;
+    editor.append(select, textarea); copy.replaceChildren(editor);
+    actions.replaceChildren();
+    button("Cancel", renderPersonalMemories);
+    button("Save", async () => {
+      const result = await callApi("update_personal_memory", memory.id, { category: select.value, value: textarea.value });
+      if (!result.ok) return toast(result.error, true);
+      toast("Aura's memory was corrected.");
+    });
+    textarea.focus(); textarea.select();
+  });
+  button("Forget", async () => {
+    if (!window.confirm(`Ask Aura to forget this?\n\n${memory.value}`)) return;
+    const result = await callApi("forget_personal_memory", memory.id);
+    if (!result.ok) return toast(result.error, true);
+    toast("Aura forgot that memory.");
+  }, true);
+  card.append(copy, actions);
+  return card;
+}
+
 function renderPersonalMemories() {
   const query = $("#memorySearch").value.trim().toLowerCase();
   const visible = personalMemories.filter(item => !query ||
@@ -1192,49 +1277,19 @@ function renderPersonalMemories() {
       : "Say things naturally, such as “I prefer concise answers” or teach Aura a fact above. Clear non-sensitive statements can be learned automatically.";
     empty.append(title, detail); elements.memoryList.append(empty); return;
   }
-  for (const memory of visible) {
-    const card = document.createElement("article"); card.className = `memory-item${memory.pinned ? " pinned" : ""}`;
-    const copy = document.createElement("div"); copy.className = "memory-item-copy";
-    const head = document.createElement("div"); head.className = "memory-item-head";
-    const category = document.createElement("span"); category.className = "memory-category"; category.textContent = memoryCategoryLabel(memory.category);
-    const confidence = document.createElement("span"); confidence.className = "memory-confidence";
-    confidence.textContent = memory.confirmed ? "User confirmed" : `${Math.round((Number(memory.confidence) || 0) * 100)}% confidence`;
-    head.append(category, confidence);
-    const value = document.createElement("p"); value.textContent = memory.value;
-    const source = document.createElement("small");
-    const updated = memory.updated ? new Date(memory.updated).toLocaleDateString() : "";
-    source.textContent = `${memory.pinned ? "Pinned • " : ""}${updated ? `Updated ${updated} • ` : ""}Source: ${memory.source || "Aura chat"}`;
-    copy.append(head, value, source);
-    const actions = document.createElement("div"); actions.className = "memory-actions";
-    const button = (label, handler, danger = false) => {
-      const control = document.createElement("button"); control.type = "button"; control.textContent = label; control.classList.toggle("danger", danger); control.addEventListener("click", handler); actions.append(control);
-    };
-    button(memory.pinned ? "Unpin" : "Pin", async () => {
-      const result = await callApi("update_personal_memory", memory.id, { pinned: !memory.pinned });
-      if (!result.ok) return toast(result.error, true);
-      toast(memory.pinned ? "Memory unpinned." : "Memory pinned for stronger recall.");
-    });
-    button("Edit", () => {
-      const editor = document.createElement("div"); editor.className = "memory-editor";
-      const select = document.createElement("select"); populateMemoryCategories(select, memory.category);
-      const textarea = document.createElement("textarea"); textarea.maxLength = 240; textarea.value = memory.value;
-      editor.append(select, textarea); copy.replaceChildren(editor);
-      actions.replaceChildren();
-      button("Cancel", renderPersonalMemories);
-      button("Save", async () => {
-        const result = await callApi("update_personal_memory", memory.id, { category: select.value, value: textarea.value });
-        if (!result.ok) return toast(result.error, true);
-        toast("Aura's memory was corrected.");
-      });
-      textarea.focus(); textarea.select();
-    });
-    button("Forget", async () => {
-      if (!window.confirm(`Ask Aura to forget this?\n\n${memory.value}`)) return;
-      const result = await callApi("forget_personal_memory", memory.id);
-      if (!result.ok) return toast(result.error, true);
-      toast("Aura forgot that memory.");
-    }, true);
-    card.append(copy, actions); elements.memoryList.append(card);
+  const needsReview = visible.filter(item => !item.confirmed);
+  const confirmedMemories = visible.filter(item => item.confirmed);
+  if (needsReview.length && confirmedMemories.length) {
+    const reviewLabel = document.createElement("div"); reviewLabel.className = "file-folder-label";
+    reviewLabel.textContent = `Needs review (${needsReview.length})`;
+    elements.memoryList.append(reviewLabel);
+    for (const memory of needsReview) elements.memoryList.append(buildMemoryCard(memory));
+    const confirmedLabel = document.createElement("div"); confirmedLabel.className = "file-folder-label";
+    confirmedLabel.textContent = "Confirmed";
+    elements.memoryList.append(confirmedLabel);
+    for (const memory of confirmedMemories) elements.memoryList.append(buildMemoryCard(memory));
+  } else {
+    for (const memory of visible) elements.memoryList.append(buildMemoryCard(memory));
   }
 }
 
@@ -1246,6 +1301,7 @@ async function openPersonalMemory(focus = true) {
     if (!result.ok) throw new Error(result.error);
     personalMemories = result.memories || [];
     memoryCategories = result.categories || [];
+    memoryConflicts = result.conflicts || [];
     $("#memoryName").textContent = result.name || "Not set";
     $("#memoryCount").textContent = String(result.count || 0);
     $("#memoryPrivacy").textContent = result.privacy;
@@ -1427,6 +1483,92 @@ async function saveSettings() {
   closeModal(elements.settingsModal);
 }
 
+const VERIFICATION_TOOLS = new Set([
+  "validate_project", "verify_final_state", "compare_files", "check_workspace_assets",
+]);
+
+function taskEvidence(task) {
+  const details = task.tool_details || [];
+  const files = [];
+  for (const detail of details) {
+    if (!MUTATION_TOOLS.has(detail.tool)) continue;
+    const path = detail.arguments?.path || detail.arguments?.destination;
+    if (path && !files.includes(path)) files.push(path);
+  }
+  let validated = false;
+  for (const detail of details) {
+    if (!VERIFICATION_TOOLS.has(detail.tool)) continue;
+    const result = detail.result || {};
+    if (result.ok === true || result.valid === true) validated = true;
+    else if (result.ok === false || result.valid === false) validated = false;
+  }
+  let duration = null;
+  if (task.started && task.finished) {
+    const ms = new Date(task.finished) - new Date(task.started);
+    if (Number.isFinite(ms) && ms >= 0) duration = ms;
+  }
+  return { files, validated, duration };
+}
+
+function formatDuration(ms) {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+function buildTaskCard(task) {
+  const card = document.createElement("div");
+  card.className = "task-card";
+  card.dataset.taskId = task.task_id;
+  const copy = document.createElement("div");
+  const title = document.createElement("strong");
+  const badge = document.createElement("span");
+  badge.className = `task-status ${task.status || "running"}`;
+  badge.textContent = task.status || "running";
+  title.append(badge, document.createTextNode(String(task.request || "Untitled task").slice(0, 160)));
+  const meta = document.createElement("p");
+  const finished = task.finished ? new Date(task.finished).toLocaleString()
+    : (task.status === "interrupted" ? "did not finish" : "in progress");
+  meta.textContent = `${task.task_id} • ${finished}`;
+  const summary = document.createElement("p");
+  summary.className = "task-summary";
+  summary.textContent = String(task.summary || "No final summary yet.").slice(0, 420);
+  const evidence = taskEvidence(task);
+  const evidenceParts = [];
+  if (evidence.duration !== null) evidenceParts.push(`Took ${formatDuration(evidence.duration)}`);
+  if (evidence.files.length) evidenceParts.push(`${evidence.files.length} file${evidence.files.length === 1 ? "" : "s"} changed`);
+  if (evidence.validated) evidenceParts.push("✓ validated");
+  const evidenceRow = document.createElement("p");
+  evidenceRow.textContent = evidenceParts.join(" • ");
+  const fileChips = document.createElement("div"); fileChips.className = "message-task-tools";
+  for (const path of evidence.files.slice(0, 6)) {
+    const chip = document.createElement("span"); chip.className = "tool-chip"; chip.title = path;
+    chip.textContent = path.split(/[\\/]/).pop(); fileChips.append(chip);
+  }
+  if (evidence.files.length > 6) {
+    const chip = document.createElement("span"); chip.className = "tool-chip";
+    chip.textContent = `+${evidence.files.length - 6} more`; fileChips.append(chip);
+  }
+  const chips = document.createElement("div"); chips.className = "message-task-tools";
+  for (const name of [...new Set(task.tools || [])]) {
+    const chip = document.createElement("span"); chip.className = "tool-chip"; chip.textContent = name; chips.append(chip);
+  }
+  copy.append(title, meta, summary);
+  if (evidenceParts.length) copy.append(evidenceRow);
+  if (evidence.files.length) copy.append(fileChips);
+  copy.append(chips);
+  const actions = document.createElement("div"); actions.className = "task-card-actions";
+  const addAction = (label, handler, danger = false) => {
+    const button = document.createElement("button"); button.textContent = label; button.classList.toggle("danger", danger); button.addEventListener("click", handler); actions.append(button);
+  };
+  const path = (task.tool_details || []).map(detail => detail.arguments?.path || detail.arguments?.destination).find(Boolean);
+  addAction(path ? "Open file" : "Workspace", () => openWorkspaceExplorer(path || null));
+  if (String(task.request || "").trim()) addAction("Repeat", () => { closeModal(elements.tasksModal); sendMessage(task.request); });
+  if ((task.tools || []).some(name => MUTATION_TOOLS.has(name))) addAction("Undo", () => rollbackTask(task), true);
+  card.append(copy, actions);
+  return card;
+}
+
 async function openTasks(focusTaskId = null) {
   openModal(elements.tasksModal);
   const list = $("#taskList");
@@ -1438,37 +1580,18 @@ async function openTasks(focusTaskId = null) {
       list.textContent = "No recorded tasks yet.";
       return;
     }
+    // Tasks arrive newest-first; grouping by first appearance keeps each
+    // project's most recently active task determining where its group sits.
+    const groups = new Map();
     for (const task of result.tasks) {
-      const card = document.createElement("div");
-      card.className = "task-card";
-      card.dataset.taskId = task.task_id;
-      const copy = document.createElement("div");
-      const title = document.createElement("strong");
-      const badge = document.createElement("span");
-      badge.className = `task-status ${task.status || "running"}`;
-      badge.textContent = task.status || "running";
-      title.append(badge, document.createTextNode(String(task.request || "Untitled task").slice(0, 160)));
-      const meta = document.createElement("p");
-      const finished = task.finished ? new Date(task.finished).toLocaleString() : "in progress";
-      meta.textContent = `${task.task_id} • ${finished}`;
-      const summary = document.createElement("p");
-      summary.className = "task-summary";
-      summary.textContent = String(task.summary || "No final summary yet.").slice(0, 420);
-      const chips = document.createElement("div"); chips.className = "message-task-tools";
-      for (const name of [...new Set(task.tools || [])]) {
-        const chip = document.createElement("span"); chip.className = "tool-chip"; chip.textContent = name; chips.append(chip);
-      }
-      copy.append(title, meta, summary, chips);
-      const actions = document.createElement("div"); actions.className = "task-card-actions";
-      const addAction = (label, handler, danger = false) => {
-        const button = document.createElement("button"); button.textContent = label; button.classList.toggle("danger", danger); button.addEventListener("click", handler); actions.append(button);
-      };
-      const path = (task.tool_details || []).map(detail => detail.arguments?.path || detail.arguments?.destination).find(Boolean);
-      addAction(path ? "Open file" : "Workspace", () => openWorkspaceExplorer(path || null));
-      if (String(task.request || "").trim()) addAction("Repeat", () => { closeModal(elements.tasksModal); sendMessage(task.request); });
-      if ((task.tools || []).some(name => MUTATION_TOOLS.has(name))) addAction("Undo", () => rollbackTask(task), true);
-      card.append(copy, actions);
-      list.append(card);
+      const key = task.project || "Workspace root";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(task);
+    }
+    for (const [project, tasks] of groups) {
+      const label = document.createElement("div"); label.className = "file-folder-label"; label.textContent = project;
+      list.append(label);
+      for (const task of tasks) list.append(buildTaskCard(task));
     }
     if (focusTaskId) {
       const focused = [...list.children].find(card => card.dataset.taskId === focusTaskId);

@@ -190,8 +190,11 @@ class AuraWebBridge:
                 token=on_token,
             )
             recent = self.agent.tasks.recent(1)
+            recalled = [{"value": item.get("value"), "category": item.get("category"),
+                         "recall_reason": item.get("recall_reason")}
+                        for item in self.agent.last_recalled if item.get("recall_reason")]
             self._push("reply", text=response, streamed=bool(streamed),
-                       task=recent[0] if recent else None)
+                       task=recent[0] if recent else None, recalled=recalled)
             if self.agent.last_learned:
                 self._push("memory_learned", memories=self.agent.last_learned)
             selected = getattr(self.agent.provider, "model", None)
@@ -835,7 +838,9 @@ class AuraWebBridge:
             return {"ok": False, "error": str(exc)}
 
     def recent_tasks(self, limit: int = 10) -> dict:
-        return {"ok": True, "tasks": self.agent.tasks.recent(max(1, min(int(limit), 20)))}
+        tasks = self.agent.tasks.recent(max(1, min(int(limit), 20)), only_actionable=True,
+                                        active_task_id=self.agent.current_task_id)
+        return {"ok": True, "tasks": tasks}
 
     def rollback_task(self, task_id: str) -> dict:
         with self._state_lock:
@@ -886,6 +891,7 @@ class AuraWebBridge:
                 "learning_enabled": bool(self.agent.config.data.get("learn_from_conversations", True)),
                 "memories": memories,
                 "count": len(memories),
+                "conflicts": self.agent.memory.conflicting_pairs(),
                 "categories": sorted(self.agent.memory.PROFILE_CATEGORIES),
                 "privacy": (("Automatic learning is on. " if self.agent.config.data.get("learn_from_conversations", True)
                              else "Automatic learning is off. ") +

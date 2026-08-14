@@ -26,6 +26,7 @@ from aura.preview_server import PreviewServer
 from aura.provider import (LMStudioProvider, MockProvider, ProviderContext, ProviderError,
                            ProviderReply, ToolCall)
 from aura.speech import SpeechOutput
+from aura.tasks import TaskJournal
 from aura.validation import check_broken_assets
 from aura.voice import VoiceInput
 from aura.safety import SandboxViolation, WorkspaceSandbox
@@ -348,6 +349,105 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(removed["value"], "HTML for interfaces")
         self.assertEqual(self.agent.memory.profile_memories(), [])
 
+    def test_relevant_memories_stamp_and_persist_last_used(self):
+        item = self.agent.memory.learn_fact(
+            "preference", "HTML interfaces", source="test", confidence=.9, explicit=True)
+        self.assertIsNone(item["last_used"])
+        recalled = self.agent.memory.relevant_memories("anything")
+        self.assertEqual(recalled[0]["id"], item["id"])
+        self.assertIsNotNone(recalled[0]["last_used"])
+        reloaded = self.agent.memory.__class__(self.agent.memory.path)
+        stored = next(m for m in reloaded.profile_memories() if m["id"] == item["id"])
+        self.assertIsNotNone(stored["last_used"])
+
+    def test_conflicting_pairs_flags_negation_and_restatement_only(self):
+        memory = self.agent.memory
+        concise = memory.learn_fact("preference", "Concise answers", source="t",
+                                    confidence=.9, explicit=True)
+        opposite = memory.learn_fact("preference", "Dislikes concise answers", source="t",
+                                     confidence=.9, explicit=True)
+        # Same category, unrelated subject — must never be flagged.
+        memory.learn_fact("preference", "Dark colour schemes", source="t",
+                          confidence=.9, explicit=True)
+        # Same words, different category — also not a conflict.
+        memory.learn_fact("goal", "Concise answers everywhere", source="t",
+                          confidence=.9, explicit=True)
+
+        pairs = memory.conflicting_pairs()
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0]["kind"], "contradicts")
+        self.assertEqual({pairs[0]["a"], pairs[0]["b"]}, {concise["id"], opposite["id"]})
+
+    def test_conflicting_pairs_reports_restatement_as_overlap(self):
+        memory = self.agent.memory
+        memory.learn_fact("tool", "Python for prototypes", source="t",
+                          confidence=.9, explicit=True)
+        memory.learn_fact("tool", "Python for quick prototypes at work", source="t",
+                          confidence=.9, explicit=True)
+        pairs = memory.conflicting_pairs()
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0]["kind"], "overlaps")
+
+    def test_forgetting_a_memory_clears_its_conflict(self):
+        memory = self.agent.memory
+        first = memory.learn_fact("preference", "Concise answers", source="t",
+                                  confidence=.9, explicit=True)
+        memory.learn_fact("preference", "Dislikes concise answers", source="t",
+                          confidence=.9, explicit=True)
+        self.assertTrue(memory.conflicting_pairs())
+        memory.forget_profile_memory(first["id"])
+        self.assertEqual(memory.conflicting_pairs(), [])
+
+    def test_recall_reason_explains_selection_without_being_persisted(self):
+        pinned = self.agent.memory.learn_fact(
+            "tool", "Rust for CLI work", source="test", confidence=.8, explicit=True)
+        self.agent.memory.update_profile_memory(pinned["id"], pinned=True)
+        self.agent.memory.learn_fact("preference", "Short replies", source="test",
+                                     confidence=.8, explicit=True, project="aura_craft")
+
+        recalled = self.agent.memory.relevant_memories("short replies please",
+                                                       project="aura_craft")
+        reasons = {item["value"]: item["recall_reason"] for item in recalled}
+        self.assertIn("Pinned for stronger recall", reasons["Rust for CLI work"])
+        self.assertIn("About the aura_craft project", reasons["Short replies"])
+        self.assertIn("Matches your wording", reasons["Short replies"])
+
+        # The reason is per-query context, not a stored property of the memory.
+        for stored in self.agent.memory.profile_memories():
+            self.assertNotIn("recall_reason", stored)
+
+    def test_recall_reason_is_never_sent_to_the_model(self):
+        provider = LMStudioProvider(model="local-model")
+        messages = provider.start_messages("hello", ProviderContext(
+            None, {}, [], [{"category": "preference", "value": "Short replies",
+                            "recall_reason": "Matches your wording", "id": "secret-id"}]))
+        blob = json.dumps(messages)
+        self.assertIn("Short replies", blob)
+        self.assertNotIn("recall_reason", blob)
+        self.assertNotIn("secret-id", blob)
+
+    def test_empty_update_confirms_a_memory_without_changing_it(self):
+        item = self.agent.memory.learn_fact(
+            "preference", "Concise answers", source="chat", confidence=.85)
+        self.assertFalse(item["confirmed"])
+        confirmed = self.agent.memory.update_profile_memory(item["id"])
+        self.assertTrue(confirmed["confirmed"])
+        self.assertEqual(confirmed["value"], "Concise answers")
+        self.assertEqual(confirmed["category"], "preference")
+
+    def test_relevant_memories_boosts_same_project_matches(self):
+        self.agent.memory.learn_fact("preference", "Use TypeScript here", source="test",
+                                     confidence=.8, explicit=True, project="aura_craft")
+        self.agent.memory.learn_fact("preference", "Use Python here", source="test",
+                                     confidence=.8, explicit=True, project="other_site")
+        relevant = self.agent.memory.relevant_memories("anything", project="aura_craft")
+        self.assertEqual(relevant[0]["value"], "Use TypeScript here")
+
+    def test_agent_tags_learned_memories_with_project_from_message(self):
+        self.agent.handle("I prefer TypeScript in the aura_craft project")
+        memories = self.agent.memory.profile_memories()
+        self.assertTrue(any(m.get("project") == "aura_craft" for m in memories))
+
     def test_hello_world_builder(self):
         reply = self.agent.handle("Aura, create a hello world Python app", approve=lambda _: True)
         self.assertIn("successfully", reply)
@@ -369,6 +469,58 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(result.blocked)
         self.assertFalse(result.succeeded)
         approve.assert_not_called()
+
+
+class TaskJournalTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.journal = TaskJournal(Path(self.temp.name) / "tasks.jsonl")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_only_actionable_filters_out_tool_free_tasks(self):
+        chat_id = self.journal.start("hello")
+        self.journal.finish(chat_id, "completed", "Hi!")
+        work_id = self.journal.start("create note.txt")
+        self.journal.record_tool(work_id, "write_file", {"path": "note.txt"}, {"ok": True})
+        self.journal.finish(work_id, "completed", "Created note.txt.")
+
+        all_tasks = self.journal.recent(10)
+        self.assertEqual({task["task_id"] for task in all_tasks}, {chat_id, work_id})
+
+        actionable = self.journal.recent(10, only_actionable=True)
+        self.assertEqual({task["task_id"] for task in actionable}, {work_id})
+
+    def test_recent_infers_project_from_first_mutated_path(self):
+        in_folder = self.journal.start("Build the aura_craft site")
+        self.journal.record_tool(in_folder, "write_file",
+                                 {"path": "aura_craft/index.html"}, {"ok": True})
+        self.journal.finish(in_folder, "completed", "Done.")
+        backslash = self.journal.start("Build the other site")
+        self.journal.record_tool(backslash, "write_file",
+                                 {"destination": "other_site\\style.css"}, {"ok": True})
+        self.journal.finish(backslash, "completed", "Done.")
+        at_root = self.journal.start("Create note.txt")
+        self.journal.record_tool(at_root, "write_file", {"path": "note.txt"}, {"ok": True})
+        self.journal.finish(at_root, "completed", "Done.")
+
+        by_id = {task["task_id"]: task for task in self.journal.recent(10)}
+        self.assertEqual(by_id[in_folder]["project"], "aura_craft")
+        self.assertEqual(by_id[backslash]["project"], "other_site")
+        self.assertIsNone(by_id[at_root]["project"])
+
+    def test_orphaned_running_task_becomes_interrupted_unless_active(self):
+        crashed_id = self.journal.start("build a website")
+        self.journal.record_tool(crashed_id, "write_file", {"path": "index.html"}, {"ok": True})
+        # No finish() call — simulates the process dying mid-task.
+
+        reported = self.journal.recent(10)[0]
+        self.assertEqual(reported["status"], "interrupted")
+        self.assertTrue(reported["summary"])
+
+        still_active = self.journal.recent(10, active_task_id=crashed_id)[0]
+        self.assertEqual(still_active["status"], "running")
 
 
 class LMStudioProviderTests(unittest.TestCase):
@@ -1113,6 +1265,20 @@ class WebBridgeTests(unittest.TestCase):
         self.assertEqual(reply["task"]["status"], "completed")
         self.assertEqual(reply["task"]["request"], "hello")
         self.assertFalse(hasattr(self.bridge, "run_command"))
+
+    def test_recent_tasks_excludes_chit_chat_but_keeps_real_work(self):
+        self.assertTrue(self.bridge.submit("hello")["ok"])
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and self.bridge._busy:
+            time.sleep(0.01)
+        task_id = self.bridge.agent.tasks.start("Create note.txt")
+        self.bridge.agent.tasks.record_tool(task_id, "write_file", {"path": "note.txt"}, {"ok": True})
+        self.bridge.agent.tasks.finish(task_id, "completed", "Created note.txt.")
+
+        result = self.bridge.recent_tasks(10)
+        requests = [task["request"] for task in result["tasks"]]
+        self.assertNotIn("hello", requests)
+        self.assertIn("Create note.txt", requests)
 
     def test_bridge_streams_local_speech_cues_to_the_avatar(self):
         class CueSpeech:

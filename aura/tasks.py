@@ -30,7 +30,8 @@ class TaskJournal:
         self._append({"event": "finished", "task_id": task_id, "time": self._now(),
                       "status": status, "summary": summary[:4000]})
 
-    def recent(self, limit: int = 10) -> list[dict]:
+    def recent(self, limit: int = 10, *, only_actionable: bool = False,
+               active_task_id: str | None = None) -> list[dict]:
         if not self.path.exists():
             return []
         tasks: dict[str, dict] = {}
@@ -64,7 +65,33 @@ class TaskJournal:
             elif event.get("event") == "finished":
                 task.update({"status": event.get("status"), "summary": event.get("summary", ""),
                              "finished": event.get("time")})
-        return [tasks[task_id] for task_id in reversed(order[-limit:])]
+        selected = [tasks[task_id] for task_id in reversed(order[-limit:])]
+        for task in selected:
+            # A "running" task with no active process behind it did not finish
+            # normally — the server was restarted or crashed mid-request. Say so
+            # instead of implying work is still happening.
+            if task["status"] == "running" and task["task_id"] != active_task_id:
+                task["status"] = "interrupted"
+                if not task.get("summary"):
+                    task["summary"] = ("Aura stopped or restarted before this task finished. "
+                                       "No further changes were made automatically.")
+            task["project"] = self._infer_project(task["tool_details"])
+        if only_actionable:
+            selected = [task for task in selected if task["tools"]]
+        return selected
+
+    @staticmethod
+    def _infer_project(tool_details: list[dict]) -> str | None:
+        """Group a task by the top-level workspace folder its first mutated path lands in."""
+        for detail in tool_details:
+            arguments = detail.get("arguments") or {}
+            path = arguments.get("path") or arguments.get("destination")
+            if not path:
+                continue
+            normalized = str(path).replace("\\", "/").strip("/")
+            if "/" in normalized:
+                return normalized.split("/", 1)[0]
+        return None
 
     def _append(self, event: dict) -> None:
         with self._lock:

@@ -19,6 +19,11 @@ class MemoryStore:
         "email address", "diagnosis", "medical", "medication", "religion", "political party",
         "sexual orientation",
     }
+    COMPARISON_STOPWORDS = {
+        "the", "and", "that", "this", "with", "from", "have", "what", "for", "you",
+        "your", "aura", "prefer", "prefers", "like", "likes", "want", "wants", "use",
+        "uses", "using", "always", "over", "previous", "when", "into", "more",
+    }
     TRANSIENT_ACTIONS = {
         "build", "create", "delete", "remove", "run", "open", "fix", "edit", "write",
         "move", "copy", "validate", "search", "inspect", "read", "rename", "download",
@@ -109,9 +114,48 @@ class MemoryStore:
         normalized = re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
         return f"{category}:{normalized}"
 
+    @classmethod
+    def _comparable_fact(cls, value: str) -> tuple[frozenset[str], bool]:
+        """Split a fact into its meaningful words and whether it is a negation."""
+        lowered = str(value).casefold().strip()
+        negated = lowered.startswith("dislikes ")
+        if negated:
+            lowered = lowered[len("dislikes "):]
+        words = frozenset(word for word in re.findall(r"[a-z0-9]{3,}", lowered)
+                          if word not in cls.COMPARISON_STOPWORDS)
+        return words, negated
+
+    def conflicting_pairs(self) -> list[dict]:
+        """Report memories in one category that may contradict or restate each other.
+
+        Deliberately conservative and computed on read: only word overlap and an
+        explicit negation marker are used, never a guess about meaning, and a
+        forgotten memory can never leave a stale flag behind.
+        """
+        prepared = [(item, *self._comparable_fact(item.get("value", "")))
+                    for item in self.profile_memories()]
+        pairs: list[dict] = []
+        for index, (first, first_words, first_negated) in enumerate(prepared):
+            for second, second_words, second_negated in prepared[index + 1:]:
+                if first.get("category") != second.get("category"):
+                    continue
+                if not first_words or not second_words:
+                    continue
+                shared = first_words & second_words
+                ratio = len(shared) / min(len(first_words), len(second_words))
+                opposed = first_negated != second_negated
+                strong_enough = len(shared) >= 2 or (opposed and shared)
+                if not shared or ratio < 0.5 or not strong_enough:
+                    continue
+                pairs.append({
+                    "a": first.get("id"), "b": second.get("id"),
+                    "kind": "contradicts" if opposed else "overlaps",
+                })
+        return pairs
+
     def learn_fact(self, category: str, value: str, *, source: str,
                    confidence: float = 0.8, explicit: bool = False,
-                   topic: str = "") -> dict | None:
+                   topic: str = "", project: str | None = None) -> dict | None:
         category = str(category).casefold().strip()
         cleaned = self._clean_fact(value)
         if category not in self.PROFILE_CATEGORIES:
@@ -132,6 +176,8 @@ class MemoryStore:
                 existing["confidence"] = max(float(existing.get("confidence", 0)), float(confidence))
                 if explicit:
                     existing["confirmed"] = True
+                if project and not existing.get("project"):
+                    existing["project"] = project
                 self.save()
                 return {**existing, "learning_status": "confirmed"}
             item = {
@@ -144,16 +190,18 @@ class MemoryStore:
                 "confidence": max(0.0, min(float(confidence), 1.0)),
                 "confirmed": bool(explicit),
                 "pinned": False,
+                "project": project,
                 "created": now,
                 "updated": now,
                 "last_confirmed": now,
+                "last_used": None,
             }
             memories.append(item)
             self.data["profile_memories"] = memories[-250:]
             self.save()
             return {**item, "learning_status": "learned"}
 
-    def learn_from_message(self, message: str) -> list[dict]:
+    def learn_from_message(self, message: str, project: str | None = None) -> list[dict]:
         """Learn only explicit, non-sensitive first-person statements."""
         text = " ".join(str(message).split())
         if not 3 <= len(text) <= 1200:
@@ -169,7 +217,7 @@ class MemoryStore:
                 continue
             if "dislike|hate" in pattern or "do not|don't" in pattern:
                 value = "Dislikes " + value
-            item = self.learn_fact(category, value, source=text, confidence=confidence)
+            item = self.learn_fact(category, value, source=text, confidence=confidence, project=project)
             if item and item.get("learning_status") == "learned":
                 learned.append(item)
         return learned
@@ -178,20 +226,45 @@ class MemoryStore:
         with self._lock:
             return [dict(item) for item in self.data.get("profile_memories", [])]
 
-    def relevant_memories(self, query: str, limit: int = 12) -> list[dict]:
+    def relevant_memories(self, query: str, limit: int = 12,
+                          project: str | None = None) -> list[dict]:
         words = {word for word in re.findall(r"[a-z0-9]{3,}", query.casefold())
                  if word not in {"the", "and", "that", "this", "with", "from", "have", "what"}}
-        scored = []
-        for item in self.profile_memories():
-            haystack = f"{item.get('category', '')} {item.get('topic', '')} {item.get('value', '')}".casefold()
-            overlap = sum(1 for word in words if word in haystack)
-            general = item.get("category") in {"preference", "work_style"}
-            score = overlap * 5 + (8 if item.get("pinned") else 0) + (2 if general else 0)
-            score += float(item.get("confidence", 0))
-            if overlap or general or item.get("pinned"):
-                scored.append((score, item))
-        scored.sort(key=lambda pair: (pair[0], pair[1].get("updated", "")), reverse=True)
-        return [item for _, item in scored[:max(1, min(int(limit), 30))]]
+        with self._lock:
+            scored = []
+            for item in self.data.get("profile_memories", []):
+                haystack = f"{item.get('category', '')} {item.get('topic', '')} {item.get('value', '')}".casefold()
+                overlap = sum(1 for word in words if word in haystack)
+                general = item.get("category") in {"preference", "work_style"}
+                same_project = bool(project) and item.get("project") == project
+                score = overlap * 5 + (8 if item.get("pinned") else 0) + (2 if general else 0)
+                score += (6 if same_project else 0)
+                score += float(item.get("confidence", 0))
+                if overlap or general or item.get("pinned") or same_project:
+                    # Keep the rationale next to the score so the UI can explain the
+                    # recall instead of the reason being recomputed or guessed later.
+                    reasons = []
+                    if item.get("pinned"):
+                        reasons.append("Pinned for stronger recall")
+                    if same_project:
+                        reasons.append(f"About the {project} project")
+                    if overlap:
+                        reasons.append("Matches your wording")
+                    if general and not reasons:
+                        reasons.append("General preference Aura always considers")
+                    scored.append((score, ", ".join(reasons), item))
+            scored.sort(key=lambda entry: (entry[0], entry[2].get("updated", "")), reverse=True)
+            chosen = scored[:max(1, min(int(limit), 30))]
+            if chosen:
+                # A memory actually pulled into the model's context just got used —
+                # distinct from "updated" (when its content last changed).
+                now = self._now()
+                for _, _, item in chosen:
+                    item["last_used"] = now
+                self.save()
+            # recall_reason is per-query, so it is attached to the returned copies
+            # only and never written back to the stored memory.
+            return [{**item, "recall_reason": reason} for _, reason, item in chosen]
 
     def update_profile_memory(self, memory_id: str, *, value: str | None = None,
                               category: str | None = None, pinned: bool | None = None) -> dict:

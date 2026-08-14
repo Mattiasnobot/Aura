@@ -56,6 +56,7 @@ class AuraAgent:
         self.cancel_event = threading.Event()
         self.current_task_id: str | None = None
         self.last_learned: list[dict] = []
+        self.last_recalled: list[dict] = []
 
     def _bind_provider_recovery(self, provider: Provider) -> None:
         if isinstance(provider, LMStudioProvider):
@@ -69,9 +70,12 @@ class AuraAgent:
         self._bind_provider_recovery(provider)
 
     def _context(self, query: str = "") -> ProviderContext:
+        project = self._extract_artifact_contract(query)[0] if query else None
+        recalled = self.memory.relevant_memories(query, 12, project=project)
+        # Remember what was recalled so the interface can explain the choice.
+        self.last_recalled = recalled
         return ProviderContext(self.memory.data.get("name"), self.memory.data.get("preferences", {}),
-                               self.memory.data.get("conversation", []),
-                               self.memory.relevant_memories(query, 12))
+                               self.memory.data.get("conversation", []), recalled)
 
     def handle(self, message: str, approve: Callable[[list[str]], bool] | None = None,
                state: Callable[[str], None] | None = None,
@@ -82,8 +86,10 @@ class AuraAgent:
         self.current_task_id = task_id
         self.sandbox.active_task_id = task_id
         self.memory.remember_message("user", message)
-        self.last_learned = (self.memory.learn_from_message(message)
-                             if bool(self.config.data.get("learn_from_conversations", True)) else [])
+        self.last_recalled = []
+        self.last_learned = (
+            self.memory.learn_from_message(message, project=self._extract_artifact_contract(message)[0])
+            if bool(self.config.data.get("learn_from_conversations", True)) else [])
         for item in self.last_learned:
             self.log.record("learn_profile", "ok", memory_id=item["id"],
                             category=item["category"], value=item["value"])

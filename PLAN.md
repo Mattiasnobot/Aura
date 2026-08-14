@@ -70,22 +70,128 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
    - Add voice preview in Settings, interruption/barge-in support, and reliable speech cancellation.
    - **Gate passed:** click-to-talk and hold/release both use a cancelable local streaming session; the UI shows calibration, live PCM level, partial words, local processing, recognized text, retry, and cancel states; microphone selection/calibration and voice preview are available in Settings; beginning to talk interrupts Aura’s output; PocketSphinx is the working fallback and Whisper.cpp is an optional stronger engine; all 90 tests and the live browser settings/listening/error visual checks pass with a clean console.
 
-42. **Project workspace v2 — Planned (P1)**
-   - Add new file/folder, rename, move, copy, delete-to-trash, restore, diff, and history controls directly to the workspace UI.
-   - Add a managed local preview server, start/stop/status/log controls, and visual checks for responsive layouts, console errors, and broken assets.
-   - Keep every operation scoped, recoverable, and clearly attributed in the activity history.
-   - **Gate:** Aura can build, launch, inspect, visually validate, revise, and restore a small site entirely within one project flow.
+42. **Project workspace v2 — Mostly complete (P1)**
+   - New file/folder, rename, move, copy, delete-to-trash, restore, diff, and history controls exist directly in the workspace UI. **Verified live in browser 2026-08-14.**
+   - A managed local preview server with start/stop/status/log controls exists (`aura/preview_server.py`, the "Live preview server" modal). **Verified live in browser 2026-08-14.**
+   - Every operation is scoped, recoverable, and attributed via task-scoped rollback plus the trash/history controls.
+   - **Remaining:** `check_workspace_assets` only crawls HTML statically for broken local references (`aura/validation.py`); there is no automated check for responsive layouts or captured browser console errors. This gap is carried forward into phase 43.
+   - **Gate:** partially met — Aura can build, launch, inspect, revise, and restore a small site; visual/responsive/console validation is not yet automated.
 
-43. **Durable goals and task engine — Planned (P1)**
-   - Distinguish ordinary conversation from actionable tasks; group tasks by project instead of logging every greeting as a task.
-   - Show the plan, current step, checkpoints, retries, duration, files changed, validation status, and final evidence.
-   - Persist pause/resume/cancel state across restarts and support continuing a project without losing its working context.
-   - **Gate:** an interrupted multi-step build resumes from the correct checkpoint and its history explains what changed and why.
+43. **Durable goals and task engine — In progress (P1)**
+   - **Step 1 complete 2026-08-14:** `TaskJournal.recent()` (`aura/tasks.py`) now takes
+     `only_actionable` (drops tool-free tasks — chit-chat no longer shows up as a task)
+     and `active_task_id` (a task left "running" by a crash or restart, other than the
+     one this process is actually working on, is reclassified as `interrupted` with an
+     explanatory summary instead of appearing stuck forever). `web_bridge.recent_tasks()`
+     — the "Recent tasks" panel — uses both; the internal per-reply task lookup does not,
+     so inline chat-bubble task cards keep their existing correlation behavior. Verified
+     live: chit-chat ("cool you", "Hello", "Who are you?") no longer appears in Recent
+     tasks, and a real build (create a file) still shows up there with full detail and
+     working Undo. Covered by new `TaskJournalTests` and a `WebBridgeTests` case.
+   - **Step 2 complete 2026-08-14:** `TaskJournal.recent()` now sets `task["project"]`,
+     inferred from the top-level workspace folder of the first mutated file/folder path
+     recorded in that task's `tool_details` (handles both `/` and `\` separators; a task
+     that only touched the workspace root gets `project: null`). The "Recent tasks"
+     modal (`openTasks()` in `aura/web/app.js`) groups cards under a project header,
+     reusing the same `.file-folder-label` style the workspace explorer already uses for
+     its own folder groups, so a task built inside e.g. `aura_craft/` is grouped under
+     an "aura_craft" heading instead of a flat list. Covered by a new `TaskJournalTests`
+     case (posix path, backslash path, root-level file); verified live after a restart —
+     no console errors, existing task renders under a "Workspace root" header correctly.
+   - **Step 3 complete 2026-08-14:** Recent-tasks cards now show duration (from
+     `started`/`finished`), a "files changed" count with per-file chips, and a
+     "✓ validated" mark — all computed client-side in `buildTaskCard()`/`taskEvidence()`
+     (`aura/web/app.js`) purely from data the journal already records
+     (`tool_details[].arguments.path/destination` against the existing `MUTATION_TOOLS`
+     set, and `result.ok`/`result.valid` against a new `VERIFICATION_TOOLS` set covering
+     `validate_project`, `verify_final_state`, `compare_files`, `check_workspace_assets`).
+     No backend or journal-format change was needed. Verified live: a completed task
+     shows "Took 3m 23s • 1 file changed • ✓ validated" plus a file chip, no console
+     errors.
+   - **Still planned:** "current step" while a task is actively running (would need
+     live per-step event streaming, not just post-hoc journal review), retry tracking,
+     and true cross-restart resumption that re-enters an interrupted multi-step build
+     with its prior context rather than just reporting that it was interrupted. None of
+     these have an existing data model to build on yet; resumption in particular
+     (safely replaying/continuing an LM Studio tool loop without duplicate side effects
+     or stale approvals) is significant enough to warrant its own dedicated
+     implementation pass rather than being folded into this one.
+   - **Gate:** an interrupted multi-step build resumes from the correct checkpoint and its history explains what changed and why. *(Not yet met — Steps 1–3 make task history honest, visible, organized by project, and evidence-backed; nothing yet resumes an interrupted build.)*
 
-44. **Memory v2 — Planned (P2)**
-   - Add project-scoped memory and a local semantic workspace index alongside the existing explicit personal memories.
-   - Add a review queue for inferred memories, conflict detection, merge/history controls, confidence, last-used time, and “why Aura recalled this.”
-   - Keep sensitive information opt-in, editable, exportable, and fully forgettable.
+44. **Memory v2 — In progress (P2)**
+   - **Step 1 complete 2026-08-14:** `MemoryStore.relevant_memories()` (`aura/memory.py`)
+     now stamps and persists `last_used` on every memory it actually selects into a
+     request's context (distinct from `updated`, which only changes when the memory's
+     content is edited), under the existing lock so it's safe alongside concurrent
+     writes. New memories start with `last_used: None`. The "What Aura knows" card
+     (`aura/web/app.js`) shows it next to Updated/Source. No new bridge plumbing was
+     needed — `get_personal_memory` already returns full memory dicts. Verified live: a
+     real chat turn stamped `last_used` on the two general-category memories that
+     matched and left the other two untouched, both in `memory.json` on disk and in the
+     "What Aura knows" panel; covered by a new `AgentTests` case.
+   - **Step 2 complete 2026-08-14:** `learn_fact()`/`learn_from_message()`
+     (`aura/memory.py`) accept an optional `project`, stored on the memory item
+     (existing memories without one just read as `project: None` — no migration
+     needed). `AuraAgent._context()`/`handle()` (`aura/agent.py`) derive it from the
+     message text via the already-existing `_extract_artifact_contract()` (the same
+     folder-name heuristic phase 43 already relies on elsewhere) and pass it through
+     automatically. `relevant_memories()` gives a same-project memory a score boost so
+     it's preferred when relevant. The "What Aura knows" card shows `Project: x` when
+     set. Verified live: "I prefer TypeScript in the aura_craft project" was learned
+     and tagged `project: aura_craft` in `memory.json` and in the UI, with no console
+     errors; covered by two new `AgentTests` cases (direct store-level boost, and
+     agent-level tagging from a real message).
+   - **Step 3 complete 2026-08-15:** "What Aura knows" now separates auto-learned
+     memories awaiting review from confirmed ones. `renderPersonalMemories()`
+     (`aura/web/app.js`) was split so each card is built by `buildMemoryCard()`, and the
+     list groups into "Needs review (n)" / "Confirmed" headers — reusing the same
+     `.file-folder-label` style already used by the workspace explorer and phase 43's
+     task grouping — but only when both kinds are present, so a uniform list stays
+     flat. Unconfirmed cards get a one-click **Confirm** action that reuses the
+     existing `update_personal_memory` bridge method with an empty payload;
+     `update_profile_memory()` already sets `confirmed: True` while preserving the
+     existing value and category, so no backend change was needed. That contract is
+     now locked by a new `AgentTests` case. Verified live: an auto-learned memory
+     appeared under "Needs review (1)" at 92% confidence, Confirm moved it into
+     "Confirmed" with its text unchanged and the headers correctly disappearing once
+     nothing needed review, with no console errors.
+   - **Step 4 complete 2026-08-15:** "why Aura recalled this" is now shown per reply.
+     `relevant_memories()` keeps the rationale it already computes while scoring
+     (pinned / same project / keyword match / general preference) and returns it as
+     `recall_reason`. Because the reason is per-query rather than a property of the
+     memory, it is attached only to the returned copies and never written back by the
+     `last_used` save — locked by a test that asserts no stored memory ever gains the
+     field. `AuraAgent._context()` records the selection as `last_recalled`, and
+     `web_bridge._work()` sends a value/category/reason triple on the existing `reply`
+     event (carried on the reply itself rather than as a separate event, so there is no
+     ordering dependency). `attachRecallNote()` (`aura/web/app.js`) renders a collapsed
+     "Used n memories" disclosure under the reply. The model context is unaffected:
+     `LMStudioProvider.start_messages()` already allow-lists only `category` and
+     `value`, which a second new test now pins down so neither `recall_reason` nor
+     internal ids can ever leak into a prompt. Verified live: a preference question
+     produced "Used 3 memories" listing two "Matches your wording" and one "General
+     preference Aura always considers" — matching exactly the facts the reply used —
+     with no console errors.
+   - **Step 5 complete 2026-08-15:** `MemoryStore.conflicting_pairs()`
+     (`aura/memory.py`) reports memories in the same category that may contradict
+     (`kind: "contradicts"`) or restate (`kind: "overlaps"`) each other, and
+     `get_personal_memory` returns them so each affected card in "What Aura knows"
+     shows "May contradict:" / "Overlaps with:" naming the other memory. The check is
+     deliberately conservative — it uses only significant-word overlap (≥50% of the
+     smaller fact, at least two shared words) plus the explicit `Dislikes ` negation
+     marker that `learn_from_message()` already produces, and never guesses at meaning.
+     Like `recall_reason`, it is computed on read rather than stored, so forgetting one
+     side clears the other's flag with no stale state — verified both by test and live
+     in the browser. Three tests cover it, including the negative cases that matter
+     most: unrelated facts in the same category and identical wording in different
+     categories are never flagged.
+   - **Still planned:** a local semantic workspace index (would need an embedding or
+     TF-IDF-style approach — a real dependency/architecture decision, not yet made);
+     merge/history controls (conflicts are now detected and shown, but resolving one
+     still means editing or forgetting a memory by hand); export.
+   - Sensitive-info opt-in, editing, and forgetting already existed before this phase
+     (`_is_sensitive`, `update_profile_memory`, `forget_profile_memory`) — only export
+     is still missing from that bullet.
    - **Gate:** relevant preferences and project decisions are recalled with visible provenance while unrelated or sensitive details are not guessed.
 
 45. **Multimodal and visual reasoning — Planned (P2)**
