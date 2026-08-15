@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 from aura.action_log import ActionLog
 from aura.agent import AuraAgent
 from aura.config import ConfigStore
-from aura.commands import CommandAgent, CommandResult
+from aura.commands import CommandResult
 from aura.http_app import create_server, existing_aura_url
 from aura.graph_model import build_mind_graph
 from aura.image_diff import UnsupportedImage, compare_images, decode_png
@@ -530,6 +530,11 @@ class VisionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.agent = AuraAgent(Path(self.temp.name) / "workspace",
                                provider=LMStudioProvider(model="qwen3-vl-8b-instruct"))
+        # Seed the probe cache: without it every vision_enabled() call in these
+        # tests would hit a real LM Studio server, which is both slow and rude —
+        # it makes the user's machine load a model. Probe behaviour itself is
+        # covered by dedicated tests with a mocked prober.
+        self.agent.config.update(vision_probe={"qwen3-vl-8b-instruct": True})
 
     def tearDown(self):
         self.temp.cleanup()
@@ -546,6 +551,35 @@ class VisionTests(unittest.TestCase):
         self.agent.provider.model = "qwen3-coder-30b"
         self.agent.config.update(vision_mode="on")
         self.assertTrue(self.agent.vision_enabled())
+
+    def test_vision_is_decided_by_probing_the_server_not_the_model_name(self):
+        # qwen/qwen3.5-9b reads images despite having no vision marker in its
+        # name, so guessing from the name alone gets it wrong.
+        self.agent.provider.model = "qwen/qwen3.5-9b"
+        self.assertFalse(LMStudioProvider.model_may_support_vision("qwen/qwen3.5-9b"))
+        probe = unittest.mock.Mock(return_value=True)
+        self.agent.provider.probe_vision_support = probe
+        self.assertTrue(self.agent.vision_enabled())
+        # The answer is cached per model, so the server is asked only once.
+        self.assertTrue(self.agent.vision_enabled())
+        self.assertEqual(probe.call_count, 1)
+        self.assertIs(self.agent.config.data["vision_probe"]["qwen/qwen3.5-9b"], True)
+
+    def test_a_refused_probe_disables_images_and_the_override_still_wins(self):
+        self.agent.provider.model = "text-only-model"
+        self.agent.provider.probe_vision_support = unittest.mock.Mock(return_value=False)
+        self.assertFalse(self.agent.vision_enabled())
+        self.agent.config.update(vision_mode="on")
+        self.assertTrue(self.agent.vision_enabled())
+
+    def test_an_unreachable_probe_falls_back_to_the_name_heuristic(self):
+        self.agent.provider.model = "some-other-vl-model"
+        self.agent.provider.probe_vision_support = unittest.mock.Mock(
+            side_effect=RuntimeError("server down"))
+        self.assertTrue(self.agent.vision_enabled())
+        # A failed probe must not be cached as an answer.
+        self.assertNotIn("some-other-vl-model",
+                         self.agent.config.data.get("vision_probe", {}))
 
     def test_image_is_encoded_under_a_journal_stripped_key(self):
         self.agent.sandbox.import_file("shot.png", self.PIXEL_PNG)
@@ -1162,6 +1196,50 @@ class WorkspaceIndexTests(unittest.TestCase):
         self.assertEqual(self.index.refresh(), 1)
 
 
+class LogGrowthTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_action_log_reads_only_the_tail_of_a_large_file(self):
+        log = ActionLog(self.root / "action-log.jsonl")
+        line = json.dumps({"time": "2026-08-15T00:00:00+00:00", "action": "write_file",
+                           "status": "ok"}) + "\n"
+        log.path.write_text(line * 40_000, encoding="utf-8")
+        log.path.write_text(log.path.read_text(encoding="utf-8")
+                            + json.dumps({"time": "2026-08-15T00:00:01+00:00",
+                                          "action": "last_one", "status": "ok"}) + "\n",
+                            encoding="utf-8")
+        events = log.recent(5)
+        self.assertEqual(events[-1]["action"], "last_one")
+        # Every returned line must be complete JSON, never a fragment.
+        self.assertTrue(all(isinstance(event, dict) for event in events))
+
+    def test_action_log_is_capped_and_cut_on_a_line_boundary(self):
+        log = ActionLog(self.root / "action-log.jsonl")
+        log.MAX_BYTES, log.KEEP_BYTES = 20_000, 8_000
+        for index in range(2_000):
+            log.record("write_file", path=f"file{index}.py", filler="x" * 40)
+        self.assertLess(log.path.stat().st_size, 40_000)
+        first = log.path.read_text(encoding="utf-8").splitlines()[0]
+        json.loads(first)  # a truncated first line would raise here
+
+    def test_task_journal_trim_keeps_every_remaining_line_valid(self):
+        journal = TaskJournal(self.root / "tasks.jsonl")
+        journal.path.write_text("".join(
+            json.dumps({"event": "tool", "task_id": f"t{i}", "tool": "write_file",
+                        "arguments": {}, "result": {"ok": True}, "filler": "y" * 200}) + "\n"
+            for i in range(4_000)), encoding="utf-8")
+        journal._trim_if_large(max_bytes=50_000, keep_bytes=20_000)
+        lines = journal.path.read_text(encoding="utf-8").splitlines()
+        self.assertLess(journal.path.stat().st_size, 60_000)
+        for line in lines:
+            json.loads(line)
+
+
 class TaskJournalTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1267,6 +1345,39 @@ class LMStudioProviderTests(unittest.TestCase):
         with patch.object(provider, "available_models", return_value=[]):
             with self.assertRaises(ProviderError):
                 provider.selected_model()
+
+    def test_system_messages_are_merged_into_one_leading_message(self):
+        # Strict chat templates (qwen3.5-9b among them) raise an error unless a
+        # system message is first and alone, and Aura adds several.
+        merged = LMStudioProvider.merge_system_messages([
+            {"role": "system", "content": "base rules"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "host notes"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "system", "content": "   "},
+            {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+        ])
+        self.assertEqual(merged[0]["role"], "system")
+        self.assertEqual(merged[0]["content"], "base rules\n\nhost notes")
+        self.assertEqual([m["role"] for m in merged[1:]], ["user", "assistant", "tool"])
+        self.assertEqual(LMStudioProvider.merge_system_messages(
+            [{"role": "user", "content": "hi"}]), [{"role": "user", "content": "hi"}])
+
+    def test_reasoning_only_answers_are_used_instead_of_failing(self):
+        # Reasoning models leave content empty and put the answer in
+        # reasoning_content; treating that as nothing reported a completed job
+        # as "the model returned neither text nor a tool request".
+        reply = LMStudioProvider._parse_completion({"choices": [{"message": {
+            "role": "assistant", "content": "",
+            "reasoning_content": "The file was written successfully.",
+            "tool_calls": []}}]})
+        self.assertEqual(reply.content, "The file was written successfully.")
+        self.assertEqual(reply.tool_calls, [])
+        # Real content still wins over the thinking transcript.
+        preferred = LMStudioProvider._parse_completion({"choices": [{"message": {
+            "role": "assistant", "content": "Done.",
+            "reasoning_content": "thinking out loud"}}]})
+        self.assertEqual(preferred.content, "Done.")
 
     def test_parses_tool_call(self):
         provider = LMStudioProvider(model="local-model")

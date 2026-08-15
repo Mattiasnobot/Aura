@@ -100,11 +100,21 @@ class TaskJournal:
                 handle.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     def _trim_if_large(self, max_bytes: int = 2_000_000, keep_bytes: int = 1_000_000) -> None:
-        """Keep the journal from growing without bound; recent() only ever needs the tail."""
+        """Keep the journal from growing without bound; recent() only ever needs the tail.
+
+        Trimming cuts on a line boundary: slicing by character count left a
+        half-written JSON object as the first line, which was then silently
+        discarded on every read.
+        """
         try:
-            if self.path.exists() and self.path.stat().st_size > max_bytes:
-                trimmed = self.path.read_text(encoding="utf-8", errors="replace")[-keep_bytes:]
-                self.path.write_text(trimmed, encoding="utf-8")
+            size = self.path.stat().st_size if self.path.exists() else 0
+            if size <= max_bytes:
+                return
+            with self.path.open("rb") as handle:
+                handle.seek(size - keep_bytes)
+                handle.readline()  # drop the partial line
+                kept = handle.read()
+            self.path.write_bytes(kept)
         except OSError:
             pass
 

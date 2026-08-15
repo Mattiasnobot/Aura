@@ -15,6 +15,7 @@ DEFAULTS = {
     "autonomy_mode": "powerful",
     "learn_from_conversations": True,
     "vision_mode": "auto",
+    "vision_probe": {},
     "speak_responses": False,
     "speech_engine": "piper",
     "speech_model": "aura-voices/en_US-lessac-medium.onnx",

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .action_log import ActionLog
 from .commands import CommandAgent
@@ -98,16 +98,33 @@ class AuraAgent:
     def vision_enabled(self) -> bool:
         """Whether Aura may send images to the configured model.
 
-        `auto` guesses from the model name because LM Studio exposes no
-        capability data; `on`/`off` are the user's explicit override.
+        `on`/`off` are the user's explicit override. `auto` asks the server once
+        per model and remembers the answer, because the model name is an
+        unreliable guide — `qwen/qwen3.5-9b` reads images with no vision marker
+        in its id. The name heuristic remains only as a fallback for when the
+        probe cannot run.
         """
         mode = str(self.config.data.get("vision_mode", "auto")).casefold()
         if mode == "on":
             return True
         if mode == "off":
             return False
-        return LMStudioProvider.model_may_support_vision(
-            getattr(self.provider, "model", None))
+        model = str(getattr(self.provider, "model", None) or "")
+        probed = self.config.data.get("vision_probe")
+        if isinstance(probed, dict) and model in probed:
+            return bool(probed[model])
+        prober = getattr(self.provider, "probe_vision_support", None)
+        if model and callable(prober):
+            try:
+                supported = bool(prober())
+            except Exception:
+                return LMStudioProvider.model_may_support_vision(model)
+            cache = dict(probed) if isinstance(probed, dict) else {}
+            cache[model] = supported
+            self.config.update(vision_probe=cache)
+            self.log.record("vision_probe", "ok", model=model, supported=supported)
+            return supported
+        return LMStudioProvider.model_may_support_vision(model)
 
     def _capture_page(self, relative: str, approve: Callable[[list[str]], bool] | None,
                       width: int = 1200, height: int = 800) -> dict:

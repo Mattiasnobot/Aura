@@ -1235,7 +1235,8 @@ async function openPermissions(focus = true) {
       const scope = document.createElement("span"); scope.className = "memory-confidence";
       scope.textContent = grant.capability === "write_folder" ? "read and write" : "read only";
       head.append(kind, scope);
-      const value = document.createElement("p"); value.textContent = grant.root;
+      const value = document.createElement("p");
+      value.textContent = grant.root;
       const meta = document.createElement("small");
       const when = grant.granted_at ? new Date(grant.granted_at).toLocaleString() : "";
       meta.textContent = `Granted ${when}${grant.project ? ` • project ${grant.project}` : ""}`;

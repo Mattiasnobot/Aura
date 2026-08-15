@@ -250,13 +250,23 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
      `TaskJournal.record_tool()` already strips that key — so a base64 blob never
      enters the durable history; a test asserts this, and the live journal was checked
      afterwards and contains no base64.
-   - **Capability detection is a name-based guess, not a fact.** LM Studio's
-     `/v1/models` returns only an id — no capability metadata whatsoever (verified
-     directly against the running server) — so `model_may_support_vision()` matches
-     known markers (`-vl`, `llava`, `pixtral`, `gemma-3`, …). A new `vision_mode`
-     setting (`auto`/`on`/`off`) lets the user override the guess, and when vision is
-     off the tool is stripped from the offered set rather than being advertised and
-     failing.
+   - **Capability detection: the name guess was replaced by an actual probe
+     (2026-08-15).** LM Studio's `/v1/models` returns only an id — no capability
+     metadata whatsoever — so this started as a name heuristic. That heuristic was then
+     proven wrong in practice: `qwen/qwen3.5-9b` reads images correctly despite having
+     no vision marker in its name. `auto` mode now sends a 1x1 PNG to the server once
+     per model and caches the answer in `vision_probe`, falling back to the name
+     heuristic only when the probe cannot reach the server. **Honest limit:** the probe
+     shows whether the server *accepts* image content, not whether the model
+     understands pictures well. `vision_mode` (`auto`/`on`/`off`) still overrides
+     everything, and when vision is off the tool is stripped from the offered set
+     rather than advertised and failing.
+     **Test-hygiene bug this introduced and fixed:** with a live probe in
+     `vision_enabled()`, the vision tests began calling the real LM Studio server —
+     making the suite take 131 s instead of 19 s and causing the user's machine to
+     start loading a model. `VisionTests` now seeds the probe cache, and probe
+     behaviour is covered by dedicated tests with a mocked prober. A test suite must
+     never reach out to a live service.
    - **Verified live against `qwen3-vl-8b-instruct`,** including a control image whose
      filename revealed nothing about its contents: Aura described `asset-01.png` as
      split horizontally into two equal halves, yellow above black — exactly the
@@ -417,9 +427,45 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
         round after the first, so no current or future retry path can omit it, and
         that silent branch also gained a visible line. The final answer is always
         re-rendered from the `reply` event, so clearing partial text can never lose it.
-   - **Still planned for this phase:** clipboard, notifications, app launch, screen
-     capture of other windows, and managed process controls. Each must go through this
-     same grant registry.
+   - **Two provider-compatibility bugs found when switching model (2026-08-15).**
+     Moving from `qwen3-vl-8b-instruct` to `qwen/qwen3.5-9b` failed instantly, and the
+     cause was Aura's, not the model's:
+     1. **Multiple system messages.** Aura adds system guidance in several places (base
+        prompt, host notes, recalled memories, mid-run corrections), and strict chat
+        templates reject a system message that is not first and alone — LM Studio
+        returned HTTP 400 from the template's own `raise_exception`.
+        `LMStudioProvider.merge_system_messages()` now folds them all into one leading
+        message before every request, which keeps the same instructions and works with
+        permissive templates too.
+     2. **Reasoning models.** `qwen3.5-9b` puts its answer in `reasoning_content` and
+        leaves `content` empty, so a turn that had genuinely done the work was reported
+        as *"the model returned neither text nor a tool request"*. Both the streaming
+        and non-streaming parsers now fall back to `reasoning_content` when there is no
+        content and no tool call. The thinking is never streamed to the chat — it is a
+        last-resort answer, not narration.
+     Verified end to end on the new model: file created, validation passed, task
+     completed, one clean answer. Two tests cover the merge and the fallback.
+   - **Settings gained the missing `vision_mode` control.** The override existed in
+     config and was documented, but had no interface control, so the documented way to
+     force images on or off was not actually reachable. Now a "Images" selector
+     (automatic / always / never) sits next to Autonomy, with a test covering save,
+     read-back, and the fallback for an unknown value.
+   - **Clipboard support was built and then deliberately removed (2026-08-15).** It
+     worked, was permission-gated, and passed its tests, but Mattias judged it
+     unnecessary and it was reverted at his request. Two things are worth keeping from
+     it: a real bug it exposed, and a reason not to add capabilities speculatively.
+     The bug: the first `ctypes` clipboard reader **segfaulted the whole process**,
+     because an undeclared `restype` truncated the 64-bit clipboard HANDLE to 32 bits.
+     No unit test would have caught that — only running it did. The reason: today's
+     sessions showed the local model choosing tools *worse* as the catalogue grew, so
+     unused tools are not free. The catalogue is back to 48.
+     The permission registry keeps its small generalisation — `PATH_CAPABILITIES`
+     separates folder-scoped grants from capability-only ones — as a documented
+     extension point, though nothing uses the non-path branch today.
+   - **Still planned for this phase:** notifications, app launch, screen capture of
+     other windows, and managed process controls. Each must go through this same grant
+     registry — and each should be added only when there is a real use for it, not to
+     complete the list.
    - Add revocable, user-selected folder mounts beyond `aura-workspace`, plus opt-in clipboard, notifications, app launch, screen capture, and managed process controls.
    - Introduce a permissions center with one-time, session, project, and persistent grants plus a readable audit trail and emergency stop.
    - Preserve the safe workspace as the default and require narrow approval for broader access.
@@ -456,3 +502,40 @@ Complete phase 39 first. Then develop phases 40–43 as the next cohesive releas
 - Memory and action logs persist locally.
 - The localhost service rejects unauthenticated browser API calls and is not exposed to the network.
 - Final validation covers the requested project scope and cannot be invalidated by a later unverified mutation.
+
+## Whole-project review — 2026-08-15
+
+A deliberate hunt for defects across the project, not tied to one phase.
+
+**Fixed**
+
+- **`ActionLog.recent()` read the entire log on every call.** The activity panel
+  refreshes through it, so cost grew linearly with a file that never shrank:
+  measured 147 ms at 22 MB. It now seeks to the tail and discards the partial first
+  line — 14 ms at the same size, and effectively flat as the file grows.
+- **The action log had no size cap at all.** Now capped at 4 MB, trimmed to 2 MB, and
+  always cut on a line boundary.
+- **`TaskJournal._trim_if_large` cut mid-line.** Slicing by character count left a
+  half-written JSON object as the first record, which every later read silently
+  discarded. It now trims on a line boundary. Three tests cover both logs, including
+  asserting that every surviving line still parses.
+- Removed two genuinely unused imports (`urlopen`, `CommandAgent`).
+
+**Found, deliberately not fixed — needs a retention decision**
+
+- **`.aura/changes.jsonl` and `.aura/history/*.bak` grow without bound,** as does
+  `external-changes.jsonl`. Capping them is not a free win like the audit log: those
+  files *are* the undo history, so trimming silently reduces how far
+  `undo_last_change` and `rollback_task` can reach, and would orphan backup blobs in
+  `history/`. That is a policy choice (how many days or changes stay recoverable, and
+  deleting the matching `.bak` files with them), so it is recorded here rather than
+  decided unilaterally. Current sizes are small — the concern is months of daily use.
+
+**Checked and sound**
+
+- `pyflakes` clean apart from an intentional `# noqa` availability check in `speech.py`.
+- Config, memory, and permissions all save atomically via temp-file + replace, and all
+  four persistent stores survive a corrupted file without crashing (verified by test).
+- Every `subprocess.run` passes a timeout; the one `Popen` is terminated in a `finally`.
+- Worker threads are daemons; both HTTP servers are closed on shutdown.
+- `aura_diagnostics.py` runs clean against the live setup.

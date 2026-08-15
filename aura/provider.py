@@ -134,6 +134,36 @@ class LMStudioProvider(Provider):
         name = str(model or "").casefold()
         return any(marker in name for marker in cls.VISION_MARKERS)
 
+    # A 1x1 transparent PNG: enough to see whether the server accepts image
+    # content at all, without spending real tokens on it.
+    PROBE_IMAGE = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )
+
+    def probe_vision_support(self) -> bool:
+        """Ask the server directly whether this model accepts an image.
+
+        Names are a poor guide — `qwen/qwen3.5-9b` reads images despite having
+        no vision marker in its id. This answers the only question Aura can
+        actually decide: does the model accept image content without the server
+        or chat template rejecting it. It cannot tell whether the model
+        understands the picture well.
+        """
+        payload = {
+            "model": self.selected_model(),
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "ok"},
+                {"type": "image_url", "image_url": {"url": self.PROBE_IMAGE}},
+            ]}],
+        }
+        try:
+            self._request("/chat/completions", payload)
+            return True
+        except ProviderError:
+            return False
+
     def available_models(self) -> list[str]:
         data = self._request("/models")
         return [item["id"] for item in data.get("data", [])
@@ -179,10 +209,33 @@ class LMStudioProvider(Provider):
         messages.append({"role": "user", "content": current_message})
         return messages
 
+    @staticmethod
+    def merge_system_messages(messages: list[dict]) -> list[dict]:
+        """Fold every system message into one leading message.
+
+        Aura adds system guidance in several places — the base prompt, host
+        notes, recalled memories, and mid-run corrections — but many chat
+        templates raise an error unless a system message is first and alone.
+        Merging keeps the same instructions while staying compatible with
+        strict templates.
+        """
+        system_parts: list[str] = []
+        rest: list[dict] = []
+        for message in messages:
+            if message.get("role") == "system":
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    system_parts.append(content.strip())
+            else:
+                rest.append(message)
+        if not system_parts:
+            return rest
+        return [{"role": "system", "content": "\n\n".join(system_parts)}] + rest
+
     def complete(self, messages: list[dict], tools: list[dict] | None = None,
                  on_token: Callable[[str], None] | None = None) -> ProviderReply:
         payload: dict = {
-            "model": self.selected_model(), "messages": messages,
+            "model": self.selected_model(), "messages": self.merge_system_messages(messages),
             "temperature": self.temperature, "max_tokens": self.max_tokens, "stream": bool(on_token),
         }
         if tools:
@@ -235,6 +288,11 @@ class LMStudioProvider(Provider):
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderError("LM Studio returned no assistant message.") from exc
         content = message.get("content") or ""
+        if not content.strip():
+            # Reasoning models put their visible answer in reasoning_content and
+            # leave content empty. Falling back is far better than telling the
+            # user nothing happened when the work actually succeeded.
+            content = str(message.get("reasoning_content") or "")
         calls: list[ToolCall] = []
         for index, raw_call in enumerate(message.get("tool_calls") or []):
             try:
@@ -256,6 +314,7 @@ class LMStudioProvider(Provider):
             method="POST",
         )
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_parts: dict[int, dict[str, str]] = {}
         try:
             with urlopen(request, timeout=self.timeout) as response:
@@ -278,6 +337,11 @@ class LMStudioProvider(Provider):
                     if isinstance(content, str) and content:
                         content_parts.append(content)
                         on_token(content)
+                    reasoning = delta.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        # Kept, but never streamed: private thinking is not an
+                        # answer, and showing it raw would be noise.
+                        reasoning_parts.append(reasoning)
                     for raw_call in delta.get("tool_calls") or []:
                         index = int(raw_call.get("index", 0))
                         part = tool_parts.setdefault(index, {"id": "", "name": "", "arguments": ""})
@@ -323,7 +387,12 @@ class LMStudioProvider(Provider):
                 self._notify_recovery("incomplete_streamed_tool_call", "ok", mode="streaming")
                 return reply
             calls.append(ToolCall(part["id"] or f"call_{index}", part["name"], arguments))
-        return ProviderReply("".join(content_parts).strip(), calls)
+        streamed = "".join(content_parts).strip()
+        if not streamed and not calls:
+            # A reasoning model can finish a turn having emitted only its private
+            # thinking. Using that is better than reporting that nothing came back.
+            streamed = "".join(reasoning_parts).strip()
+        return ProviderReply(streamed, calls)
 
     def reply(self, message: str, context: ProviderContext) -> str:
         response = self.complete(self.start_messages(message, context))

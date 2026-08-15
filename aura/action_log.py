@@ -22,17 +22,46 @@ class ActionLog:
             **details,
         }
         with self._lock:
+            self._trim_if_large()
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, ensure_ascii=False) + "\n")
         if self.on_event:
             self.on_event(event)
         return event
 
+    # The audit log only ever grows, and `recent` runs on every panel refresh,
+    # so it reads the tail instead of the whole file and the file is capped.
+    MAX_BYTES = 4_000_000
+    KEEP_BYTES = 2_000_000
+    TAIL_BYTES = 200_000
+
+    def _tail(self) -> list[str]:
+        size = self.path.stat().st_size
+        with self.path.open("rb") as handle:
+            if size > self.TAIL_BYTES:
+                handle.seek(size - self.TAIL_BYTES)
+                handle.readline()  # discard the partial first line
+            data = handle.read()
+        return data.decode("utf-8", errors="replace").splitlines()
+
+    def _trim_if_large(self) -> None:
+        """Cap the log, always cutting on a line boundary."""
+        try:
+            if self.path.stat().st_size <= self.MAX_BYTES:
+                return
+            with self.path.open("rb") as handle:
+                handle.seek(self.path.stat().st_size - self.KEEP_BYTES)
+                handle.readline()
+                kept = handle.read()
+            self.path.write_bytes(kept)
+        except OSError:
+            pass
+
     def recent(self, limit: int = 60) -> list[dict]:
         if not self.path.exists():
             return []
         with self._lock:
-            lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = self._tail()
         events: list[dict] = []
         for line in lines[-max(1, min(int(limit), 250)):]:
             try:

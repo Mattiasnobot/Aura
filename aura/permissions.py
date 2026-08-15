@@ -10,6 +10,8 @@ from uuid import uuid4
 
 
 CAPABILITIES = {"read_folder", "write_folder"}
+# Only these are scoped to a folder; the rest grant the capability itself.
+PATH_CAPABILITIES = {"read_folder", "write_folder"}
 MODES = {"once", "session", "project", "persistent"}
 
 
@@ -104,7 +106,7 @@ class PermissionStore:
                 raise PermissionRefused(
                     f"{resolved} overlaps a protected system or credential location.")
 
-    def grant(self, capability: str, target: str | Path, mode: str = "once",
+    def grant(self, capability: str, target: str | Path = "", mode: str = "once",
               *, project: str | None = None) -> dict:
         capability = str(capability).strip()
         mode = str(mode).strip().casefold()
@@ -112,14 +114,21 @@ class PermissionStore:
             raise PermissionRefused(f"Unknown capability: {capability}")
         if mode not in MODES:
             raise PermissionRefused(f"Unknown grant mode: {mode}")
-        resolved = self._resolve(target)
-        if not resolved.is_dir():
-            raise PermissionRefused(f"{resolved} is not an existing folder.")
-        self._reject_unsafe_root(resolved)
+        if capability in PATH_CAPABILITIES:
+            resolved = self._resolve(target)
+            if not resolved.is_dir():
+                raise PermissionRefused(f"{resolved} is not an existing folder.")
+            self._reject_unsafe_root(resolved)
+            root = str(resolved)
+        else:
+            # Extension point: a capability with nothing to scope by path is
+            # granted as itself. None exist today; every current capability is
+            # folder-scoped.
+            root = ""
         record = {
             "id": uuid4().hex[:12],
             "capability": capability,
-            "root": str(resolved),
+            "root": root,
             "mode": mode,
             "project": project,
             "session": self.session_id if mode in {"once", "session"} else None,
@@ -145,25 +154,28 @@ class PermissionStore:
             return False
         return True
 
-    def check(self, capability: str, target: str | Path,
+    def check(self, capability: str, target: str | Path = "",
               *, project: str | None = None, consume: bool = True) -> dict:
         """Return the grant permitting this access, or raise PermissionDenied."""
-        resolved = self._resolve(target)
+        scoped = capability in PATH_CAPABILITIES
+        resolved = self._resolve(target) if scoped else None
         with self._lock:
             for grant in self._grants:
                 if grant.get("capability") != capability or not self._live(grant):
                     continue
                 if grant.get("mode") == "project" and grant.get("project") not in (None, project):
                     continue
-                root = Path(str(grant.get("root", "")))
-                if resolved != root and root not in resolved.parents:
-                    continue
+                if scoped:
+                    root = Path(str(grant.get("root", "")))
+                    if resolved != root and root not in resolved.parents:
+                        continue
                 if consume and grant.get("mode") == "once":
                     grant["used"] = int(grant.get("used", 0)) + 1
                     self.save()
                 return dict(grant)
+        where = f" at {resolved}" if scoped else ""
         raise PermissionDenied(
-            f"Aura has no active permission to {capability} at {resolved}.")
+            f"Aura has no active permission to {capability}{where}.")
 
     def revoke(self, grant_id: str) -> dict:
         with self._lock:

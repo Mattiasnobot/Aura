@@ -147,7 +147,7 @@ This checks Python, the local HTML service and assets, the LM Studio server, and
 python -m unittest discover -v
 ```
 
-The suite currently contains 181 checks, including real PCM level metering, streaming partial/final voice sessions, hold/release, speech interruption, optional Whisper.cpp parsing, voice preview, audio-envelope/phoneme cues, and an isolated Chrome/Edge launch that captures a styled preview. If neither browser is installed, only that optional browser smoke check is skipped.
+The suite currently contains 187 checks, including real PCM level metering, streaming partial/final voice sessions, hold/release, speech interruption, optional Whisper.cpp parsing, voice preview, audio-envelope/phoneme cues, and an isolated Chrome/Edge launch that captures a styled preview. If neither browser is installed, only that optional browser smoke check is skipped.
 
 ## Project map
 
