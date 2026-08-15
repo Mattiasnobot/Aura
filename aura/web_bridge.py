@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from .agent import AuraAgent
 from .graph_model import build_mind_graph
+from .permissions import PermissionRefused
 from .preview_server import PreviewServer
 from .provider import LMStudioProvider
 from .speech import SpeechOutput
@@ -175,6 +176,19 @@ class AuraWebBridge:
         threading.Thread(target=self._work, args=(text,), daemon=True, name="aura-agent").start()
         return {"ok": True}
 
+    def _on_agent_state(self, name: str) -> None:
+        """Forward agent states, translating the retry signal for the interface.
+
+        "retry" is not a mood: it means the reply streamed so far is being
+        thrown away, so the browser must clear it rather than append the next
+        attempt underneath.
+        """
+        if name == "retry":
+            self._push("stream_reset")
+            self._push("state", value="working")
+            return
+        self._push("state", value=name)
+
     def _work(self, text: str) -> None:
         streamed: list[str] = []
 
@@ -186,7 +200,7 @@ class AuraWebBridge:
             response = self.agent.handle(
                 text,
                 approve=self._approve_command,
-                state=lambda name: self._push("state", value=name),
+                state=self._on_agent_state,
                 token=on_token,
             )
             recent = self.agent.tasks.recent(1)
@@ -292,7 +306,7 @@ class AuraWebBridge:
         config = self.agent.config.data
         return {key: config[key] for key in (
             "lm_studio_url", "model", "timeout", "temperature", "max_tokens",
-            "reasoning_depth", "autonomy_mode", "learn_from_conversations",
+            "reasoning_depth", "autonomy_mode", "learn_from_conversations", "vision_mode",
             "speak_responses", "speech_engine", "speech_voice", "speech_rate", "speech_volume",
             "voice_engine", "voice_device", "voice_language", "voice_calibration_ms",
             "voice_silence_ms", "voice_max_seconds", "voice_noise_floor",
@@ -325,6 +339,9 @@ class AuraWebBridge:
             avatar_quality = str(values.get("avatar_quality", "auto"))
             reasoning_depth = str(values.get("reasoning_depth", "deep"))
             autonomy_mode = str(values.get("autonomy_mode", "powerful"))
+            vision_mode = str(values.get("vision_mode", "auto")).casefold()
+            if vision_mode not in {"auto", "on", "off"}:
+                vision_mode = "auto"
             learn_from_conversations = bool(values.get("learn_from_conversations", True))
             if not 5 <= timeout <= 900:
                 raise ValueError("Timeout must be between 5 and 900 seconds.")
@@ -376,7 +393,7 @@ class AuraWebBridge:
                 lm_studio_url=provider.base_url, model=provider.model, timeout=timeout,
                 temperature=temperature, max_tokens=max_tokens,
                 reasoning_depth=reasoning_depth, autonomy_mode=autonomy_mode,
-                learn_from_conversations=learn_from_conversations,
+                learn_from_conversations=learn_from_conversations, vision_mode=vision_mode,
                 speak_responses=enabled, speech_engine=engine, speech_voice=voice,
                 speech_rate=speech_rate, speech_volume=speech_volume,
                 voice_engine=voice_engine, voice_device=voice_device,
@@ -909,6 +926,96 @@ class AuraWebBridge:
             self.agent.log.record("remember_personal_fact", "ok", memory_id=item["id"],
                                   category=item["category"], value=item["value"])
             self._push("memory_changed", action="added", memory=item)
+            return {"ok": True, "memory": item}
+        except (KeyError, TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def list_permissions(self) -> dict:
+        store = self.agent.permissions
+        return {"ok": True, "active": store.active(), "history": store.history(30),
+                "note": ("Aura can only read folders you grant here. It cannot grant "
+                         "itself access, and nothing outside the workspace is readable "
+                         "by default.")}
+
+    def grant_folder_access(self, path: str, mode: str = "session",
+                            project: str | None = None, writable: bool = False) -> dict:
+        """Grant access to one folder. Only ever called by the user.
+
+        Write access is a separate grant rather than something a read grant
+        quietly implies, so the Permissions list always shows it explicitly.
+        """
+        try:
+            grants = [self.agent.permissions.grant("read_folder", str(path), str(mode),
+                                                   project=project or None)]
+            if writable:
+                grants.append(self.agent.permissions.grant(
+                    "write_folder", str(path), str(mode), project=project or None))
+            for grant in grants:
+                self.agent.log.record("grant_folder_access", "ok", path=grant["root"],
+                                      capability=grant["capability"],
+                                      mode=grant["mode"], grant_id=grant["id"])
+                self._push("permissions_changed", action="granted", grant=grant)
+            return {"ok": True, "grant": grants[0], "grants": grants}
+        except (PermissionRefused, OSError, ValueError) as exc:
+            self.agent.log.record("grant_folder_access", "error", path=str(path),
+                                  error=str(exc))
+            return {"ok": False, "error": str(exc)}
+
+    def external_changes(self, limit: int = 20) -> dict:
+        return {"ok": True, "changes": self.agent.external_writer.changes(int(limit))}
+
+    def undo_external_change(self) -> dict:
+        try:
+            result = self.agent.external_writer.undo_last()
+            self.agent.log.record("undo_external_change", "ok", path=result["path"],
+                                  action=result["action"])
+            return {"ok": True, **result}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def revoke_folder_access(self, grant_id: str) -> dict:
+        try:
+            grant = self.agent.permissions.revoke(str(grant_id))
+            self.agent.log.record("revoke_folder_access", "ok", path=grant["root"],
+                                  grant_id=grant["id"])
+            self._push("permissions_changed", action="revoked", grant=grant)
+            return {"ok": True, "grant": grant}
+        except KeyError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def revoke_all_permissions(self) -> dict:
+        count = self.agent.permissions.revoke_all()
+        self.agent.log.record("revoke_all_permissions", "ok", revoked=count)
+        self._push("permissions_changed", action="revoked_all", revoked=count)
+        return {"ok": True, "revoked": count}
+
+    def export_personal_memory(self) -> dict:
+        """Write every stored memory into the workspace as readable JSON."""
+        try:
+            memories = self.agent.memory.profile_memories()
+            payload = {
+                "exported": datetime.now(timezone.utc).isoformat(),
+                "name": self.agent.memory.data.get("name"),
+                "count": len(memories),
+                "memories": memories,
+            }
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            target = self.agent.sandbox.write_file(
+                f"aura-memory-export-{stamp}.json",
+                json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+            path = target.relative_to(self.agent.sandbox.root).as_posix()
+            self.agent.log.record("export_personal_memory", "ok",
+                                  path=path, count=len(memories))
+            return {"ok": True, "path": path, "count": len(memories)}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def revert_personal_memory(self, memory_id: str) -> dict:
+        try:
+            item = self.agent.memory.revert_profile_memory(str(memory_id))
+            self.agent.log.record("revert_personal_fact", "ok", memory_id=item["id"],
+                                  category=item["category"], value=item["value"])
+            self._push("memory_changed", action="reverted", memory=item)
             return {"ok": True, "memory": item}
         except (KeyError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}

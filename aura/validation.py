@@ -261,6 +261,20 @@ def _is_local_asset_reference(value: str) -> bool:
     return not lowered.startswith(("http://", "https://", "//", "data:", "mailto:", "tel:", "javascript:", "#"))
 
 
+def _html_files(sandbox: WorkspaceSandbox, relative: str) -> list[str]:
+    """HTML pages under `relative`, which may name a folder or a single page.
+
+    Without the single-file case, pointing a check at one page silently scans
+    nothing and an empty issue list reads as a clean result.
+    """
+    base = sandbox.path(relative)
+    if base.is_file():
+        name = base.relative_to(sandbox.root).as_posix()
+        return [name] if Path(name).suffix.casefold() in {".html", ".htm"} else []
+    return [name for name in sandbox.list_files(relative)
+            if Path(name).suffix.casefold() in {".html", ".htm"}]
+
+
 def check_broken_assets(sandbox: WorkspaceSandbox, relative: str = ".") -> dict:
     """Crawl HTML files for local link/script/img references that do not resolve."""
     base = sandbox.path(relative)
@@ -268,9 +282,7 @@ def check_broken_assets(sandbox: WorkspaceSandbox, relative: str = ".") -> dict:
         return {"ok": False, "error": "Project path does not exist", "checked": 0, "broken": []}
     checked = 0
     broken: list[dict[str, str]] = []
-    for name in sandbox.list_files(relative):
-        if Path(name).suffix.casefold() not in {".html", ".htm"}:
-            continue
+    for name in _html_files(sandbox, relative):
         try:
             content = sandbox.read_file(name)
         except (OSError, UnicodeDecodeError):
@@ -299,3 +311,154 @@ def check_broken_assets(sandbox: WorkspaceSandbox, relative: str = ".") -> dict:
             if not target.is_file():
                 broken.append({"file": name, "reference": reference})
     return {"ok": True, "checked": checked, "broken": broken}
+
+
+class _AccessibilityCollector(HTMLParser):
+    """Collect accessibility problems that are decidable from markup alone.
+
+    Deliberately limited: it never guesses at colour contrast, because that
+    needs the resolved CSS cascade and a wrong answer there would be worse
+    than no answer.
+    """
+
+    LABELLABLE = {"input", "select", "textarea"}
+    NO_LABEL_NEEDED = {"submit", "reset", "button", "hidden", "image"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.issues: list[dict[str, str]] = []
+        self.has_html_lang = False
+        self.saw_html = False
+        self.title_text = ""
+        self._in_title = False
+        self._label_targets: set[str] = set()
+        self._pending_controls: list[dict] = []
+        self._open_labels = 0
+        self._last_heading = 0
+        # Elements whose accessible name comes from their own text.
+        self._named_stack: list[dict] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        name = tag.casefold()
+        values = {key.casefold(): (value or "") for key, value in attrs}
+        line = self.getpos()[0]
+
+        if name == "html":
+            self.saw_html = True
+            self.has_html_lang = bool(values.get("lang", "").strip())
+        elif name == "title":
+            self._in_title = True
+        elif name == "img":
+            if "alt" not in values:
+                self.issues.append({
+                    "rule": "img-alt", "line": line,
+                    "detail": f"<img src=\"{values.get('src', '')[:60]}\"> has no alt attribute",
+                })
+        elif name == "label":
+            self._open_labels += 1
+            target = values.get("for", "").strip()
+            if target:
+                self._label_targets.add(target)
+        elif name in self.LABELLABLE:
+            if values.get("type", "").casefold() not in self.NO_LABEL_NEEDED:
+                self._pending_controls.append({
+                    "line": line, "tag": name,
+                    "id": values.get("id", "").strip(),
+                    "wrapped": self._open_labels > 0,
+                    "aria": bool(values.get("aria-label", "").strip()
+                                 or values.get("aria-labelledby", "").strip()),
+                })
+        elif name in {"a", "button"}:
+            self._named_stack.append({
+                "tag": name, "line": line, "text": "",
+                "aria": bool(values.get("aria-label", "").strip()
+                             or values.get("aria-labelledby", "").strip()),
+                "has_img": False,
+            })
+        elif re.fullmatch(r"h[1-6]", name):
+            level = int(name[1])
+            if self._last_heading and level > self._last_heading + 1:
+                self.issues.append({
+                    "rule": "heading-order", "line": line,
+                    "detail": f"<{name}> follows <h{self._last_heading}>, skipping a level",
+                })
+            self._last_heading = level
+
+        if name == "img" and self._named_stack:
+            self._named_stack[-1]["has_img"] = True
+
+    def handle_endtag(self, tag: str) -> None:
+        name = tag.casefold()
+        if name == "title":
+            self._in_title = False
+        elif name == "label":
+            self._open_labels = max(0, self._open_labels - 1)
+        elif name in {"a", "button"} and self._named_stack:
+            entry = self._named_stack.pop()
+            if not entry["text"].strip() and not entry["aria"] and not entry["has_img"]:
+                label = "link" if entry["tag"] == "a" else "button"
+                self.issues.append({
+                    "rule": f"empty-{label}", "line": entry["line"],
+                    "detail": f"<{entry['tag']}> has no text or aria-label",
+                })
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self.title_text += data
+        for entry in self._named_stack:
+            entry["text"] += data
+
+    def finish(self) -> list[dict]:
+        for control in self._pending_controls:
+            labelled = (control["wrapped"] or control["aria"]
+                        or (control["id"] and control["id"] in self._label_targets))
+            if not labelled:
+                self.issues.append({
+                    "rule": "control-label", "line": control["line"],
+                    "detail": f"<{control['tag']}> has no label, aria-label, or wrapping <label>",
+                })
+        if self.saw_html and not self.has_html_lang:
+            self.issues.append({"rule": "html-lang", "line": 1,
+                                "detail": "<html> has no lang attribute"})
+        if not self.title_text.strip():
+            self.issues.append({"rule": "document-title", "line": 1,
+                                "detail": "the page has no non-empty <title>"})
+        return sorted(self.issues, key=lambda item: (item["line"], item["rule"]))
+
+
+def check_accessibility(sandbox: WorkspaceSandbox, relative: str = ".") -> dict:
+    """Report markup-level accessibility problems in workspace HTML pages.
+
+    Structural only. Colour contrast is intentionally not evaluated: deciding
+    it correctly needs the resolved CSS cascade, and a confident wrong answer
+    would be more harmful than reporting nothing.
+    """
+    base = sandbox.path(relative)
+    if not base.exists():
+        return {"ok": False, "error": "Path does not exist", "checked": 0, "issues": []}
+    checked = 0
+    issues: list[dict] = []
+    for name in _html_files(sandbox, relative):
+        try:
+            content = sandbox.read_file(name)
+        except (OSError, UnicodeDecodeError):
+            continue
+        checked += 1
+        parser = _AccessibilityCollector()
+        parser.feed(content)
+        parser.close()
+        for issue in parser.finish():
+            issues.append({"file": name, **issue})
+    note = ("Structural checks only - colour contrast is not evaluated, "
+            "because it cannot be decided from markup alone.")
+    if not checked:
+        # An empty issue list must never be readable as a clean result when
+        # nothing was actually examined.
+        return {"ok": False, "checked": 0, "issues": [], "contrast_checked": False,
+                "error": f"No HTML page was found at '{relative}', so nothing was checked.",
+                "note": note}
+    return {"ok": True, "checked": checked, "issues": issues,
+            "contrast_checked": False,
+            "summary": (f"{len(issues)} issue(s) across {checked} page(s)."
+                        if issues else f"No structural issues in {checked} page(s)."),
+            "note": note}

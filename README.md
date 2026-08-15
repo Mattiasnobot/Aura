@@ -54,7 +54,7 @@ Try:
 - `Create a ZIP backup of the calculator folder.`
 - `Check the response from http://127.0.0.1:3000 and diagnose the page.`
 
-LM Studio can now select 38 local tools. The expanded catalog includes batch file reads and writes, code outlines, bounded diffs, safe arithmetic, non-sensitive system information, local/external HTTP inspection, recoverable ZIP creation and guarded extraction, validation, transparent personal learning, memory correction/forgetting, and command execution. For a build request Aura silently plans, inspects, creates files, validates, runs approved checks, repairs errors, and reports confirmed results across as many as 48 tool rounds in Deep mode.
+LM Studio can now select 48 local tools. The expanded catalog includes batch file reads and writes, code outlines, bounded diffs, relevance-ranked file discovery, looking at workspace images with a vision-capable model, approval-gated page screenshots, deterministic image comparison, structural accessibility checks, reading and recoverably writing user-granted folders outside the workspace, safe arithmetic, non-sensitive system information, local/external HTTP inspection, recoverable ZIP creation and guarded extraction, validation, transparent personal learning, memory correction/forgetting, and command execution. For a build request Aura silently plans, inspects, creates files, validates, runs approved checks, repairs errors, and reports confirmed results across as many as 48 tool rounds in Deep mode.
 
 The approval dialog offers **Allow once** and **Allow identical for task**. The latter remembers only the exact same command or URL until that one task ends; a changed argument or destination asks again.
 
@@ -97,7 +97,7 @@ Aura deliberately refuses to learn credentials and filters health, exact contact
 
 ## Advanced agent behavior
 
-- Aura routes each request to a focused subset of 38 tools. Deep + Powerful mode adds the broader inspection, batch, comparison, validation, and personal-memory set to complex requests without loading every irrelevant schema.
+- Aura routes each request to a focused subset of 48 tools. Deep + Powerful mode adds the broader inspection, batch, comparison, validation, and personal-memory set to complex requests without loading every irrelevant schema.
 - Thinking depth controls the multi-step ceiling: Fast 16 rounds, Balanced 30, Deep 48.
 - Actionable requests cannot be marked complete until at least one relevant tool succeeds.
 - File mutations trigger a verification requirement: Aura must read back the final state or run a successful validation command.
@@ -147,7 +147,7 @@ This checks Python, the local HTML service and assets, the LM Studio server, and
 python -m unittest discover -v
 ```
 
-The suite currently contains 90 checks, including real PCM level metering, streaming partial/final voice sessions, hold/release, speech interruption, optional Whisper.cpp parsing, voice preview, audio-envelope/phoneme cues, and an isolated Chrome/Edge launch that captures a styled preview. If neither browser is installed, only that optional browser smoke check is skipped.
+The suite currently contains 181 checks, including real PCM level metering, streaming partial/final voice sessions, hold/release, speech interruption, optional Whisper.cpp parsing, voice preview, audio-envelope/phoneme cues, and an isolated Chrome/Edge launch that captures a styled preview. If neither browser is installed, only that optional browser smoke check is skipped.
 
 ## Project map
 
@@ -156,6 +156,10 @@ The suite currently contains 90 checks, including real PCM level metering, strea
 - `aura/web_bridge.py` — structured events and UI-facing operations
 - `aura/graph_model.py` — dependency-free local Aura Mind data model
 - `aura/validation.py` — safe multi-format project validation
+- `aura/search_index.py` — dependency-free BM25 ranking for workspace file discovery
+- `aura/screenshot.py` — headless Chromium page capture, no extra packages
+- `aura/image_diff.py` — standard-library PNG decoding and pixel comparison
+- `aura/permissions.py` — revocable grants for folders outside the safe workspace
 - `aura/agent.py` — LM Studio tool loop, request routing, and project builder
 - `aura/safety.py` — sandboxed file agent and recoverable deletion
 - `aura/commands.py` — command policy, execution, capture, timeout

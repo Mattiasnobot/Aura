@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import hashlib
 import json
 import math
@@ -10,6 +11,7 @@ import posixpath
 import re
 import shutil
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import Callable
@@ -22,9 +24,21 @@ from .commands import CommandAgent
 from .config import ConfigStore
 from .memory import MemoryStore
 from .provider import LMStudioProvider, MockProvider, Provider, ProviderContext, ToolCall
+from .image_diff import compare_images
+from .permissions import ExternalReader, ExternalWriter, PermissionStore
+from .preview_server import PreviewServer
 from .safety import WorkspaceSandbox
+from .screenshot import (ScreenshotUnavailable, browser_command_preview, capture,
+                         find_browser)
+from .search_index import WorkspaceIndex
 from .tasks import TaskJournal
-from .validation import validate_project
+from .validation import check_accessibility, validate_project
+
+
+EXTERNAL_TOOLS = {
+    "list_granted_folders", "list_external_folder", "read_external_file",
+    "write_external_file", "undo_external_change",
+}
 
 
 class TaskCancelled(RuntimeError):
@@ -52,6 +66,12 @@ class AuraAgent:
         )
         self._bind_provider_recovery(self.provider)
         self.commands = CommandAgent(self.sandbox, self.log)
+        self.index = WorkspaceIndex(self.sandbox)
+        self.permissions = PermissionStore(self.sandbox.meta / "permissions.json")
+        self.external = ExternalReader(self.permissions)
+        self.external_writer = ExternalWriter(
+            self.permissions, self.sandbox.history,
+            self.sandbox.meta / "external-changes.jsonl")
         self.tasks = TaskJournal(self.sandbox.meta / "tasks.jsonl")
         self.cancel_event = threading.Event()
         self.current_task_id: str | None = None
@@ -68,6 +88,94 @@ class AuraAgent:
     def set_provider(self, provider: Provider) -> None:
         self.provider = provider
         self._bind_provider_recovery(provider)
+
+    IMAGE_MEDIA_TYPES = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    }
+    MAX_IMAGE_BYTES = 4_000_000
+
+    def vision_enabled(self) -> bool:
+        """Whether Aura may send images to the configured model.
+
+        `auto` guesses from the model name because LM Studio exposes no
+        capability data; `on`/`off` are the user's explicit override.
+        """
+        mode = str(self.config.data.get("vision_mode", "auto")).casefold()
+        if mode == "on":
+            return True
+        if mode == "off":
+            return False
+        return LMStudioProvider.model_may_support_vision(
+            getattr(self.provider, "model", None))
+
+    def _capture_page(self, relative: str, approve: Callable[[list[str]], bool] | None,
+                      width: int = 1200, height: int = 800) -> dict:
+        """Render a workspace HTML page with a headless browser and save a PNG.
+
+        The page is served from a short-lived local preview server, so the
+        capture can only ever target this machine's workspace — the model
+        cannot point it at an outside address.
+        """
+        page = self._normalize_path(relative)
+        if Path(page).suffix.casefold() not in {".html", ".htm"}:
+            raise ValueError(f"{relative} is not an HTML page")
+        target = self.sandbox.path(page)
+        if not target.is_file():
+            raise FileNotFoundError(relative)
+        folder = posixpath.dirname(page) or "."
+        url_path = posixpath.basename(page)
+
+        browser = find_browser()
+        if browser is None:
+            raise ScreenshotUnavailable(
+                "Screenshots need Google Chrome, Microsoft Edge, or Chromium installed.")
+        # Launching a browser process is a visible action, so it is approved the
+        # same way a command is, showing exactly what will run.
+        if approve is not None and not approve(browser_command_preview(page, browser)):
+            return {"approved": False,
+                    "note": "Screenshot was not approved, so no browser was launched."}
+
+        server = PreviewServer(self.sandbox, self.log)
+        try:
+            status = server.start(folder)
+            url = f"{status['url']}{url_path}"
+            with tempfile.TemporaryDirectory(prefix="aura-capture-") as staging:
+                staged = Path(staging) / "page.png"
+                capture(url, staged, width=width, height=height, browser=browser)
+                data = staged.read_bytes()
+        finally:
+            server.stop_if_running()
+
+        stem = posixpath.splitext(url_path)[0] or "page"
+        destination = posixpath.join(folder, f"{stem}-screenshot.png") if folder != "." \
+            else f"{stem}-screenshot.png"
+        saved = self.sandbox.import_file(destination, data)
+        return {"approved": True, "path": saved.relative_to(self.sandbox.root).as_posix(),
+                "bytes": len(data), "width": int(width), "height": int(height),
+                "source": page}
+
+    def _read_image_attachment(self, relative: str) -> dict:
+        suffix = Path(relative).suffix.casefold()
+        media_type = self.IMAGE_MEDIA_TYPES.get(suffix)
+        if not media_type:
+            raise ValueError(
+                f"{relative} is not a supported image "
+                f"({', '.join(sorted(self.IMAGE_MEDIA_TYPES))})")
+        target = self.sandbox.path(relative)
+        if not target.is_file():
+            raise FileNotFoundError(relative)
+        size = target.stat().st_size
+        if size > self.MAX_IMAGE_BYTES:
+            raise ValueError(f"{relative} is larger than Aura's 4 MB image limit")
+        encoded = base64.b64encode(target.read_bytes()).decode("ascii")
+        return {
+            "path": self._normalize_path(relative), "media_type": media_type,
+            "bytes": size,
+            # Stored under "content" so the task journal strips it: a base64
+            # image must never be duplicated into the durable history.
+            "content": f"data:{media_type};base64,{encoded}",
+        }
 
     def _context(self, query: str = "") -> ProviderContext:
         project = self._extract_artifact_contract(query)[0] if query else None
@@ -157,7 +265,18 @@ class AuraAgent:
         autonomy = str(self.config.data.get("autonomy_mode", "balanced"))
         reasoning_depth = str(self.config.data.get("reasoning_depth", "balanced"))
         selected_tools = self.select_tool_definitions(routing_request, autonomy, reasoning_depth)
+        if not self.vision_enabled():
+            # Do not advertise a capability the loaded model cannot honour.
+            selected_tools = [definition for definition in selected_tools
+                              if definition["function"]["name"] != "look_at_image"]
         expected_base, expected_paths = self._extract_artifact_contract(routing_request)
+        if not self._requires_mutation(routing_request):
+            # Naming a file in a read-only request ("read notes.txt", "screenshot
+            # index.html") is a reference, not a promise to create it. Demanding
+            # it exist afterwards fails tasks that in fact succeeded — and an
+            # external file can never be inside the workspace at all. The folder
+            # itself stays, because it still scopes validation reporting.
+            expected_paths = []
         host = "Windows" if os.name == "nt" else "a POSIX operating system"
         messages.insert(1, {"role": "system", "content":
             f"Host platform: {host}. run_command executes an argument array directly without a shell. "
@@ -187,6 +306,9 @@ class AuraAgent:
         artifact_nudges = 0
         validation_nudges = 0
         successful_tools = 0
+        external_written: set[str] = set()
+        external_activity = False
+        workspace_mutation = False
         mutation_performed = False
         validation_succeeded = False
         validation_evidence: dict | None = None
@@ -217,8 +339,14 @@ class AuraAgent:
             if token:
                 token(piece)
         round_limit = self.ROUND_LIMITS.get(reasoning_depth, self.ROUND_LIMITS["balanced"])
-        for _ in range(round_limit):
+        for round_index in range(round_limit):
             self._check_cancelled()
+            if round_index:
+                # Any second or later round replaces whatever was streamed
+                # before it. Clearing here — rather than at each individual
+                # retry — means no future retry path can reintroduce the
+                # duplicated-answer bug by forgetting to signal.
+                state("retry")
             response = self.provider.complete(messages, selected_tools, on_token=emit if token else None)
             assistant: dict = {"role": "assistant", "content": response.content or None}
             if response.tool_calls:
@@ -232,11 +360,21 @@ class AuraAgent:
                     raise RuntimeError("the model returned neither text nor a tool request")
                 missing_action = action_expected and successful_tools == 0
                 missing_mutation = requires_mutation and not mutation_performed
-                missing_artifacts = [path for path in expected_paths if not self.sandbox.path(path).is_file()]
+                # A file written into a granted folder outside the workspace
+                # satisfies the request even though it can never appear inside
+                # the sandbox; without this the contract nags forever.
+                # Work done in a granted folder can never satisfy a workspace
+                # artifact contract, so demanding one here nags forever and the
+                # user sees the same answer repeated. Drop it once the task has
+                # genuinely operated outside the workspace.
+                missing_artifacts = [] if external_activity else [
+                    path for path in expected_paths
+                    if not self.sandbox.path(path).is_file()
+                    and posixpath.basename(self._normalize_path(path)) not in external_written]
                 if missing_artifacts and artifact_nudges < 3:
                     artifact_nudges += 1
                     if token:
-                        token("\n\nAura is checking the requested deliverables and continuing…\n\n")
+                        token("Aura is checking the requested deliverables and continuing…\n\n")
                     messages.append({"role": "system", "content":
                         "The artifact contract is not satisfied. Create these exact missing paths now: " +
                         json.dumps(missing_artifacts) + ". Then validate and inspect them before reporting completion."})
@@ -244,10 +382,14 @@ class AuraAgent:
                 if missing_artifacts:
                     raise RuntimeError("required artifacts are still missing: " + ", ".join(missing_artifacts))
                 validation_path = expected_base or self._validation_root(pending_verifications)
+                # Validating the workspace proves nothing about a file written
+                # into a granted folder, so do not nag for it there.
+                if external_activity and not workspace_mutation:
+                    validation_required = False
                 if validation_required and not validation_succeeded and validation_nudges < 2:
                     validation_nudges += 1
                     if token:
-                        token("\n\nAura is validating the completed project…\n\n")
+                        token("Aura is validating the completed project…\n\n")
                     messages.append({"role": "system", "content":
                         "The requested project has not passed validate_project at the required path. "
                         f"Run validate_project with path {validation_path!r}, fix every issue, and validate again."})
@@ -277,7 +419,7 @@ class AuraAgent:
                 if (missing_action or missing_mutation) and action_nudges < 2:
                     action_nudges += 1
                     if token:
-                        token("\n\nAura noticed the requested action was not completed and is correcting it…\n\n")
+                        token("Aura noticed the requested action was not completed and is correcting it…\n\n")
                     requirement = "perform the requested workspace mutation" if missing_mutation else "use the relevant tool"
                     messages.append({"role": "system", "content":
                         f"The user requested an actionable operation, but no successful tool has fulfilled it. "
@@ -303,7 +445,7 @@ class AuraAgent:
                 if verification_needed and verification_nudges < 2:
                     verification_nudges += 1
                     if token:
-                        token("\n\n")
+                        token("Aura is verifying the files it just changed…\n\n")
                     messages.append({"role": "system", "content":
                         "A workspace mutation occurred after the last verification. Do not finish yet. "
                         "Use read_file/file_info, validate_project, or a successful validation command to verify the final state, "
@@ -333,12 +475,30 @@ class AuraAgent:
             for call in response.tool_calls:
                 self._check_cancelled()
                 result = self._execute_tool(call, approve)
+                # An attached image cannot travel inside a tool result, which is
+                # plain text. Lift it out and send it as a real multimodal turn.
+                attachment = result.pop("content", None) if call.name == "look_at_image" else None
                 messages.append({"role": "tool", "tool_call_id": call.id,
                                  "content": json.dumps(result, ensure_ascii=False)})
+                if attachment:
+                    messages.append({"role": "user", "content": [
+                        {"type": "text",
+                         "text": f"Here is the image {result.get('path')} you asked to look at."},
+                        {"type": "image_url", "image_url": {"url": attachment}},
+                    ]})
                 if result.get("ok"):
                     successful_tools += 1
+                    if call.name in EXTERNAL_TOOLS:
+                        external_activity = True
+                    if call.name in {"write_external_file", "undo_external_change"}:
+                        # Counts as fulfilling the request even though the file
+                        # lives outside the sandbox entirely.
+                        if result.get("path"):
+                            external_written.add(Path(str(result["path"])).name)
+                        mutation_performed = True
                     if call.name in mutation_tools:
                         mutation_performed = True
+                        workspace_mutation = True
                         pending_verifications.update(self._mutation_expectations(call, result))
                         validation_succeeded = False
                         validation_evidence = None
@@ -393,7 +553,8 @@ class AuraAgent:
                           "write_files", "inspect_code", "compare_files", "run_command"})
         if includes("read", "inspect", "show", "find", "search", "look", "summar", "analy"):
             names.update({"list_files", "read_file", "file_info", "search_files", "search_text",
-                          "read_many_files", "workspace_summary", "inspect_code"})
+                          "read_many_files", "workspace_summary", "inspect_code",
+                          "find_relevant_files"})
         if includes("list", "files", "folder contents", "directory contents"):
             names.add("list_files")
         if includes("copy", "duplicate"):
@@ -422,6 +583,23 @@ class AuraAgent:
             names.update({"open_workspace_item", "list_files"})
         if includes("what can you do", "your tools", "capabilities", "tool check"):
             names.add("capability_summary")
+        if includes("image", "screenshot", "picture", "photo", "logo", "mockup",
+                    "look at", "what does it look like", "icon", "design"):
+            names.update({"look_at_image", "list_files"})
+        if includes("screenshot", "how does it look", "what does it look like", "render",
+                    "capture", "preview", "visual", "layout", "appearance"):
+            names.update({"capture_page", "look_at_image", "list_files"})
+        if includes("compare", "difference", "differ", "regression", "changed visually",
+                    "reference", "before and after", "same as"):
+            names.update({"compare_images", "look_at_image", "list_files"})
+        if includes("accessib", "a11y", "screen reader", "alt text", "wcag", "aria",
+                    "usable for everyone"):
+            names.update({"check_accessibility", "read_file", "list_files"})
+        if includes("outside the workspace", "external", "granted", "permission",
+                    "my documents", "another folder", "downloads folder"):
+            names.update({"list_granted_folders", "list_external_folder",
+                          "read_external_file", "write_external_file",
+                          "undo_external_change"})
         if includes("undo", "revert", "rollback", "history", "change history"):
             names.update({"change_history", "undo_last_change", "rollback_task", "read_file"})
         if includes("remember", "preference", "call me", "my name", "learn about me",
@@ -437,6 +615,12 @@ class AuraAgent:
         if autonomy == "powerful" and names and reasoning_depth == "deep":
             names.update({"workspace_summary", "file_info", "read_many_files"})
         definitions = cls.tool_definitions()
+        # If the request names a tool outright, always offer it. Keyword routing
+        # cannot anticipate every phrasing, and silently withholding a tool the
+        # user asked for by name looks like the model refusing to work.
+        lowered = message.casefold()
+        names.update(definition["function"]["name"] for definition in definitions
+                     if definition["function"]["name"] in lowered)
         return [definition for definition in definitions if definition["function"]["name"] in names]
 
     def _routing_request(self, message: str) -> str:
@@ -514,7 +698,11 @@ class AuraAgent:
     def _extract_artifact_contract(message: str) -> tuple[str | None, list[str]]:
         filenames = []
         for match in re.finditer(
-                r"(?i)(?<![\w.-])([\w.-]+\.(?:py|json|toml|md|txt|html|css|js|ts|tsx|jsx|yaml|yml))(?![\w-])",
+                # Keep any folder the user actually typed: "aura_craft/index.html"
+                # must not collapse to "index.html", or the completion check looks
+                # for the file in the wrong place and calls a finished job failed.
+                r"(?i)(?<![\w./\\-])((?:[\w.-]+[/\\])*[\w.-]+"
+                r"\.(?:py|json|toml|md|txt|html|css|js|ts|tsx|jsx|yaml|yml))(?![\w-])",
                 message):
             name = match.group(1)
             if name not in filenames:
@@ -744,6 +932,67 @@ class AuraAgent:
             tool("search_text", "Return matching lines with file names and line numbers.",
                  {"query": {"type": "string"}, "path": {**path, "default": "."},
                   "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}}, ["query"]),
+            tool("list_granted_folders",
+                 "List folders outside the workspace that the user has granted Aura "
+                 "permission to read. Aura cannot grant itself access; only the user "
+                 "can, from the Permissions panel.", {}, []),
+            tool("list_external_folder",
+                 "List files inside a folder the user has already granted. Fails if "
+                 "there is no active permission for that folder.",
+                 {"path": {"type": "string"},
+                  "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200}},
+                 ["path"]),
+            tool("read_external_file",
+                 "Read a UTF-8 text file inside a folder the user has already granted. "
+                 "Fails if there is no active permission for that file's folder.",
+                 {"path": {"type": "string"}}, ["path"]),
+            tool("write_external_file",
+                 "Write a UTF-8 text file inside a folder the user granted for writing. "
+                 "The previous version is saved first, so the change can be undone. "
+                 "A read grant is not enough; writing needs its own permission.",
+                 {"path": {"type": "string"}, "content": {"type": "string"}},
+                 ["path", "content"]),
+            tool("undo_external_change",
+                 "Undo Aura's most recent write outside the workspace, restoring the "
+                 "previous version or removing a file it created.", {}, []),
+            tool("check_accessibility",
+                 "Report accessibility problems in workspace HTML: images without alt "
+                 "text, form controls without labels, empty links or buttons, a missing "
+                 "lang or title, and skipped heading levels. Structural checks only — "
+                 "it does not evaluate colour contrast.",
+                 {"path": {**path, "default": "."}}, []),
+            tool("compare_images",
+                 "Measure exactly how two workspace PNG images differ: percentage of "
+                 "changed pixels and the region that changed. Use it to check a render "
+                 "against a reference or to detect a layout regression between two "
+                 "screenshots. This is a real pixel measurement, not an impression.",
+                 {"first": path, "second": path,
+                  "tolerance": {"type": "integer", "minimum": 0, "maximum": 128,
+                                "default": 8}},
+                 ["first", "second"]),
+            tool("capture_page",
+                 "Render a workspace HTML page in a local headless browser and save a "
+                 "PNG screenshot of it into the workspace. Use this to see how a page "
+                 "actually looks, then call look_at_image on the saved screenshot. "
+                 "Needs the user's approval because it launches a browser.",
+                 {"path": path,
+                  "width": {"type": "integer", "minimum": 320, "maximum": 2560, "default": 1200},
+                  "height": {"type": "integer", "minimum": 240, "maximum": 2000, "default": 800}},
+                 ["path"]),
+            tool("look_at_image",
+                 "Actually look at a workspace image (PNG/JPEG/GIF/WebP/BMP). The image "
+                 "is attached to the conversation so you can describe or compare what it "
+                 "shows. Call this whenever the user asks what an image contains or looks "
+                 "like — listing or reading the file cannot answer that, because its "
+                 "pixels are only visible through this tool.",
+                 {"path": path}, ["path"]),
+            tool("find_relevant_files",
+                 "Rank workspace files by relevance to a described topic or question. "
+                 "Use this when you do not know the exact wording to search for; use "
+                 "search_files or search_text when you need an exact string. Matches "
+                 "words, not synonyms.",
+                 {"query": {"type": "string"}, "path": {**path, "default": "."},
+                  "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}, ["query"]),
             tool("copy_file", "Copy a workspace file.",
                  {"source": path, "destination": path}, ["source", "destination"]),
             tool("move_file", "Move or rename a workspace file.",
@@ -929,6 +1178,47 @@ class AuraAgent:
                 limit = max(1, min(int(args.get("limit", 100)), 500))
                 result = {"matches": self.sandbox.search_text(
                     str(args["query"]), str(args.get("path", ".")), limit)}
+            elif name == "list_granted_folders":
+                result = {"folders": [
+                    {"path": grant["root"], "mode": grant["mode"],
+                     "project": grant.get("project")}
+                    for grant in self.permissions.active()
+                    if grant.get("capability") == "read_folder"]}
+            elif name == "list_external_folder":
+                result = {"path": str(args["path"]),
+                          "files": self.external.list_files(
+                              str(args["path"]), limit=int(args.get("limit", 200)))}
+            elif name == "read_external_file":
+                result = {"path": str(args["path"]),
+                          "content": self.external.read_file(str(args["path"]))}
+            elif name == "write_external_file":
+                result = self.external_writer.write_file(
+                    str(args["path"]), str(args["content"]),
+                    task_id=self.current_task_id)
+            elif name == "undo_external_change":
+                result = self.external_writer.undo_last()
+            elif name == "check_accessibility":
+                result = check_accessibility(self.sandbox, str(args.get("path", ".")))
+            elif name == "compare_images":
+                result = compare_images(
+                    self.sandbox.path(str(args["first"])),
+                    self.sandbox.path(str(args["second"])),
+                    tolerance=int(args.get("tolerance", 8)))
+            elif name == "capture_page":
+                result = self._capture_page(
+                    str(args["path"]), approve,
+                    int(args.get("width", 1200)), int(args.get("height", 800)))
+                tool_ok = bool(result.get("approved"))
+            elif name == "look_at_image":
+                if not self.vision_enabled():
+                    raise ValueError(
+                        "The loaded model does not accept images. Turn vision on in "
+                        "Settings if you know it does.")
+                result = self._read_image_attachment(str(args["path"]))
+            elif name == "find_relevant_files":
+                result = {"matches": self.index.search(
+                    str(args["query"]), int(args.get("limit", 10)),
+                    str(args.get("path", ".")))}
             elif name == "copy_file":
                 target = self.sandbox.copy_file(str(args["source"]), str(args["destination"]))
                 result = {"path": target.relative_to(self.sandbox.root).as_posix()}

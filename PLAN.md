@@ -118,7 +118,7 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
      implementation pass rather than being folded into this one.
    - **Gate:** an interrupted multi-step build resumes from the correct checkpoint and its history explains what changed and why. *(Not yet met — Steps 1–3 make task history honest, visible, organized by project, and evidence-backed; nothing yet resumes an interrupted build.)*
 
-44. **Memory v2 — In progress (P2)**
+44. **Memory v2 — Complete (P2)**
    - **Step 1 complete 2026-08-14:** `MemoryStore.relevant_memories()` (`aura/memory.py`)
      now stamps and persists `last_used` on every memory it actually selects into a
      request's context (distinct from `updated`, which only changes when the memory's
@@ -185,22 +185,241 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
      in the browser. Three tests cover it, including the negative cases that matter
      most: unrelated facts in the same category and identical wording in different
      categories are never flagged.
-   - **Still planned:** a local semantic workspace index (would need an embedding or
-     TF-IDF-style approach — a real dependency/architecture decision, not yet made);
-     merge/history controls (conflicts are now detected and shown, but resolving one
-     still means editing or forgetting a memory by hand); export.
+   - **Step 6 complete 2026-08-15:** the local workspace index is in, as
+     `aura/search_index.py` — a dependency-free BM25 ranker, chosen deliberately over
+     an embedding model so the project stays dependency-light (Mattias's call). Its
+     tokenizer splits camelCase and snake_case alike so `avatarFace`, `avatar_face`
+     and a plain "avatar face" query all meet, and the file path is indexed alongside
+     the content so filename matches still rank. Documents are cached per file and
+     re-read only when size or `st_mtime_ns` moves — nanosecond precision
+     specifically so a same-length edit inside one coarse timestamp tick cannot go
+     unnoticed, which a test pins down using before/after content of identical length.
+     Binary/oversized files are skipped. Exposed to the model as a new
+     `find_relevant_files` tool (39 total now, routed on read/find/search-style
+     requests) and described so the model prefers it when it does not know the exact
+     wording, and `search_files`/`search_text` when it needs an exact string.
+     **Honest limitation:** this matches words, not meaning — it will not find
+     synonyms the way embeddings would, and the tool description says so. Five tests
+     cover it, including one asserting a multi-word query that `search_files` returns
+     nothing for. Verified live: the model chose the tool unprompted, ranked the right
+     files, and explained each match; no console errors.
+   - **Step 7 complete 2026-08-15:** memories now keep an edit history.
+     `update_profile_memory()` records the previous value/category (capped at
+     `MAX_HISTORY = 5`) but only when something actually changed, so the one-click
+     Confirm from step 3 and a plain pin/unpin leave no misleading history entry —
+     covered by its own test. `revert_profile_memory()` restores the most recent
+     earlier wording and *consumes* that entry, so repeated reverts walk further back
+     rather than toggling between two versions, and it recomputes the dedup `key` so
+     re-learning the restored fact still matches the existing memory instead of
+     creating a duplicate (also its own test — this was the subtle failure mode worth
+     pinning down). Exposed via a new `revert_personal_memory` bridge method and
+     `/api/call` entry; the card shows `Previously “…”` with a **Revert** action, and
+     only when history exists. Verified live end to end: edit → history line and Revert
+     appear → revert restores the original wording and both disappear, no console
+     errors.
+   - **Step 8 complete 2026-08-15:** export and one-click conflict resolution finish
+     the phase. `export_personal_memory()` writes every stored memory as readable JSON
+     into the workspace (`aura-memory-export-<timestamp>.json`) through the normal
+     sandbox, so the export is snapshotted and recoverable like any other file; the
+     **Export** button then opens the workspace explorer on the new file. Writing
+     server-side rather than triggering a browser download was chosen so the result is
+     inspectable and actually verifiable. On a conflicted card a **Keep this** action
+     forgets the other memory behind a confirmation naming both sides. Two bridge
+     tests cover the export contents and a revert round trip including the clean
+     failure when nothing is left to restore.
+     **Verification note:** the accept path of *Keep this* could not be exercised in
+     the automated browser, which blocks native dialogs — what was verified is that
+     the dialog names the right pair and that declining deletes nothing. The delete
+     itself reuses `forget_personal_memory`, already covered by existing tests.
+   - Phase 44 goal met: preferences and project decisions are recalled with visible
+     provenance (recall reasons, project tags, last-used), reviewable before they are
+     trusted, contradiction-aware, revertible, exportable, and searchable across the
+     workspace — all without adding a dependency.
+   - **Gate:** relevant preferences and project decisions are recalled with visible provenance while unrelated or sensitive details are not guessed. *(Met.)*
    - Sensitive-info opt-in, editing, and forgetting already existed before this phase
      (`_is_sensitive`, `update_profile_memory`, `forget_profile_memory`) — only export
      is still missing from that bullet.
    - **Gate:** relevant preferences and project decisions are recalled with visible provenance while unrelated or sensitive details are not guessed.
 
-45. **Multimodal and visual reasoning — Planned (P2)**
-   - Allow images and screenshots to be attached to LM Studio vision-capable models instead of only storing them in the workspace.
-   - Let Aura compare references with rendered output, inspect screenshots, detect layout regressions, and run basic responsive/accessibility checks.
-   - Detect model capabilities automatically and hide unsupported controls.
+45. **Multimodal and visual reasoning — Complete (P2)**
+   - **Step 1 complete 2026-08-15:** Aura can genuinely see workspace images. A new
+     `look_at_image` tool base64-encodes a workspace image (PNG/JPEG/GIF/WebP/BMP,
+     4 MB cap) and the tool loop then appends a real OpenAI-format multimodal `user`
+     turn carrying `image_url`, because a tool result is plain text and cannot carry an
+     image. The payload is returned under the `content` key specifically because
+     `TaskJournal.record_tool()` already strips that key — so a base64 blob never
+     enters the durable history; a test asserts this, and the live journal was checked
+     afterwards and contains no base64.
+   - **Capability detection is a name-based guess, not a fact.** LM Studio's
+     `/v1/models` returns only an id — no capability metadata whatsoever (verified
+     directly against the running server) — so `model_may_support_vision()` matches
+     known markers (`-vl`, `llava`, `pixtral`, `gemma-3`, …). A new `vision_mode`
+     setting (`auto`/`on`/`off`) lets the user override the guess, and when vision is
+     off the tool is stripped from the offered set rather than being advertised and
+     failing.
+   - **Verified live against `qwen3-vl-8b-instruct`,** including a control image whose
+     filename revealed nothing about its contents: Aura described `asset-01.png` as
+     split horizontally into two equal halves, yellow above black — exactly the
+     generated image. A first test with a three-bar red/green/blue image was also
+     described correctly in order.
+   - **Observed limitation:** the local model does not always choose the tool. In one
+     run it answered a "look at X.png" question by calling `list_files` instead, even
+     though `look_at_image` was correctly offered (confirmed by inspecting the routed
+     tool set). The tool description was strengthened to say that pixels are only
+     visible through this tool, but reliable selection still depends on the model.
+   - **Step 2 complete 2026-08-15:** Aura can now see her *own* rendered output. A new
+     dependency-free `aura/screenshot.py` drives an installed Chromium-based browser
+     (Chrome/Edge/Chromium) in headless mode — the same recipe the phase-39 smoke test
+     already used, promoted into a real module — and a `capture_page` tool renders a
+     workspace HTML page and imports the PNG back into the workspace through the normal
+     sandbox, so it is snapshotted and recoverable.
+     **Safety:** the page is served from a short-lived local `PreviewServer`, so a
+     capture can only ever target this machine's workspace — the model cannot aim it at
+     an outside address — and launching the browser goes through the ordinary approval
+     dialog, which shows the exact command. A test asserts that denying approval both
+     blocks the launch and writes no file. If no browser is installed the tool fails
+     with a clear message and the real-capture test skips.
+   - **Verified live:** `capture_page` → screenshot saved → `look_at_image` → Aura
+     described `aura_craft/index.html` as a modern landing page, having earlier
+     described its bright blue navigation bar from the same pipeline. **This meets the
+     "inspect its own rendered result" half of the gate.** One honest caveat: the
+     model's description length varies between runs — one run was detailed and
+     accurate, a repeat was terse — which is model output variance, not a pipeline
+     fault; both runs ran the full tool chain.
+   - **Bug found and fixed while verifying (pre-existing, phase 41):** the artifact
+     contract stripped the folder from a path the user typed, so
+     "screenshot aura_craft/index.html" became a requirement for `index.html` at the
+     workspace root, which does not exist — and a fully successful task was reported as
+     *"required artifacts are still missing"*. `_extract_artifact_contract()` now keeps
+     the folder for both `/` and `\` paths, with a regression test. The same request
+     that previously failed now completes and confirms
+     `aura_craft/index.html` as present.
+   - **Step 3 complete 2026-08-15:** visual differences are now *measured*, not
+     guessed. `aura/image_diff.py` contains a standard-library PNG decoder (8-bit
+     grey/RGB/RGBA, non-interlaced, all five row filters including Paeth) and a
+     `compare_images` tool reporting changed-pixel count, percentage, and the exact
+     bounding box of the change — deliberately deterministic, so the answer is evidence
+     rather than a model's impression of two pictures. Differing dimensions are
+     reported as their own kind of layout difference. Unsupported PNG variants raise a
+     clear error instead of guessing.
+     **Performance:** rows are first compared as raw bytes and only differing rows are
+     walked pixel by pixel, which keeps a real 1200x800 Chrome screenshot at ~0.3 s to
+     decode and ~0.6 s to compare.
+   - **Verified live and arithmetically:** two 400x300 images with a button shifted by
+     (30, 20) were compared through the UI. The tool reported 7 000 changed pixels,
+     5.833%, in a 130x90 region at (50, 40) — which matches hand calculation exactly
+     (two 100x70 boxes overlapping in 70x50 gives 7 000 differing pixels), and Aura
+     relayed those measured numbers faithfully. An integration test additionally
+     captures a page, edits its CSS, re-captures, and asserts the diff is localised to
+     the recoloured element.
+   - **Gate:** Aura can use a supplied visual reference, inspect its own rendered result, and explain evidence-based differences before finishing. *(Met — reference comparison and self-capture both verified live, with the explanation backed by pixel measurements.)*
+   - **Step 4 complete 2026-08-15:** `check_accessibility` (`aura/validation.py`) reports
+     markup-level problems using the standard-library `HTMLParser` already used for
+     asset checking: images without `alt`, form controls with no label / `aria-label` /
+     wrapping `<label>`, empty links and buttons, a missing `lang` or `<title>`, and
+     skipped heading levels. Alternative labelling methods (wrapping label, aria, hidden
+     and submit inputs, a link whose content is an `alt`-bearing image) are accepted, so
+     the report stays trustworthy instead of noisy.
+     **Colour contrast is deliberately not evaluated** — deciding it needs the resolved
+     CSS cascade, and a confident wrong answer would be worse than none. The result says
+     so explicitly via `contrast_checked: false`, and a test pins that down.
+     Verified against the real workspace: 3 true findings, 0 false positives — the
+     `aura_craft` contact form uses `placeholder` as a substitute for labels.
+   - **Bug found and fixed while verifying:** pointing the check at a single page
+     (`aura_craft/index.html`) scanned *nothing*, because `list_files()` on a file
+     yields no entries — and the empty issue list was then reported to the user as
+     "No structural accessibility issues found". A false all-clear is worse than an
+     error, so a shared `_html_files()` helper now accepts a file or a folder, and a
+     zero-page run returns `ok: false` with an explicit "nothing was checked" message.
+     The same helper removes the identical latent trap from `check_broken_assets`.
+     Two regression tests cover it.
+   - **Model reliability caveat (same pattern as step 1):** on two attempts the local
+     model answered an accessibility question *without calling the tool*, once
+     asserting "No critical accessibility issues found" that it had never measured —
+     Aura's own missing-action guard caught that and retried. The tool was confirmed to
+     be in the offered set both times, so this is model tool-selection behaviour, not
+     routing. With an explicit instruction it ran correctly and reported all three real
+     issues with their line numbers.
+   - Responsive checks are possible by composition — `capture_page` takes explicit
+     width and height, so two captures at different widths can be compared — but there
+     is no dedicated single-call tool for it.
    - **Gate:** Aura can use a supplied visual reference, inspect its own rendered result, and explain evidence-based differences before finishing.
 
-46. **Scoped autonomy and OS bridge — Planned (P2)**
+46. **Scoped autonomy and OS bridge — In progress (P2)**
+   - **Step 1 complete 2026-08-15:** the permission foundation, built before any
+     capability that needs it. `aura/permissions.py` holds a durable, revocable grant
+     registry (`once` / `session` / `project` / `persistent`) stored in
+     `.aura/permissions.json`, plus a read-only `ExternalReader`. Nothing outside
+     `aura-workspace` is reachable without a grant.
+   - **The model cannot widen its own access — this is the design, not a setting.**
+     There is deliberately no `grant_folder_access` *tool*; granting exists only as a
+     bridge method driven by the new **Permissions** panel, so the user chooses the
+     folder. The model only gets `list_granted_folders`, `list_external_folder`, and
+     `read_external_file`. A test asserts the granting tool is absent from the agent's
+     catalogue.
+   - **Containment properties, each with an adversarial test:** grants store an
+     absolute, resolved root and cover only that folder and its descendants (siblings
+     and the parent stay unreachable); `..` cannot escape; a symlink planted inside a
+     granted folder cannot widen it, because the path is re-resolved *after* the grant
+     check; `once` grants are spent on use; `session` grants are bound to the process
+     id and die on restart; filesystem roots and system/credential locations
+     (`SystemRoot`, `ProgramFiles`, `~/.ssh`, `~/.aws`, credential stores, `/etc`, …)
+     are refused outright rather than left to a confirmation click. Revoking takes
+     effect immediately and **Revoke all** is the emergency stop.
+   - **Verified live:** granting a folder, `list_granted_folders` and
+     `read_external_file` returning its contents, a restart correctly dropping a
+     session grant, and revoke-all closing access again. Every grant and revocation is
+     written to the action log.
+   - **Audit nuance worth knowing:** the tool record itself does not store what was
+     read (the payload uses the `content` key that `record_tool` strips), so the
+     durable tool history shows *which* external path was accessed, not its bytes. If
+     Aura then quotes that content in her reply, the reply is stored like any other
+     answer — so external content can still appear in history by that route.
+   - **Second pre-existing bug found and fixed:** the artifact contract also treated
+     files named in *read-only* requests as required deliverables, so "read notes.txt
+     from the granted folder" failed with "required artifacts are still missing" even
+     though the read succeeded — and an external file can never be inside the
+     workspace. The contract is now skipped entirely when the request needs no
+     mutation, reusing the existing `_requires_mutation()` judgement; the folder scope
+     is kept, because validation reporting still uses it. Narrowing that fix was
+     necessary: clearing the folder too broke an existing validation-scope test.
+   - **Step 2 complete 2026-08-15:** write access to granted folders, kept recoverable.
+     `ExternalWriter` snapshots the previous version into Aura's history before every
+     write and journals each change to `.aura/external-changes.jsonl`, so
+     `undo_external_change` can restore it — a write outside the workspace loses the
+     sandbox, so it must not lose undo as well. Nothing here deletes anything.
+     **`write_folder` is a separate grant:** a read grant never implies writing, and
+     choosing "Read and write" in the Permissions panel creates two visible, separately
+     revocable entries. Four more adversarial tests cover it (read grant cannot write,
+     writes cannot escape the folder, revocation stops writes immediately, undo walks
+     back correctly). Verified live: granting, overwriting `report.txt` through the
+     model, and rolling it back.
+   - **Three bugs surfaced by real use, all fixed and pinned by tests:**
+     1. **Tools named in a request were not always offered.** "the granted *write*
+        folder" missed the `granted folder` keyword, so `write_external_file` was never
+        in the toolset and Aura looked like it was refusing. Routing now always offers
+        any tool the user names outright, which helps every tool, not just this one.
+     2. **The workspace artifact contract can never be satisfied by external work,**
+        so it nagged forever. It is now skipped once a task has genuinely operated
+        outside the workspace, and the workspace validation nudge is skipped too when
+        no workspace file was touched — validating the workspace proves nothing about
+        a file written into a granted folder.
+     3. **Retries visibly repeated the whole answer.** Every retry re-streamed a full
+        reply and the browser appended it, so the user saw the same text two or three
+        times. The agent now emits a `retry` state, the bridge turns it into a
+        `stream_reset`, and the interface clears the abandoned reply first. **This was
+        not specific to external folders — it affected ordinary workspace work and
+        plain questions too, and it was reported from real use, not found by a test.**
+        The first attempt at this fix was wrong in an instructive way: signalling at
+        each individual retry site missed a fourth path — the post-mutation
+        verification retry, which emitted only blank lines and so repeated the answer
+        with nothing to explain why. The signal now fires once at the top of every
+        round after the first, so no current or future retry path can omit it, and
+        that silent branch also gained a visible line. The final answer is always
+        re-rendered from the `reply` event, so clearing partial text can never lose it.
+   - **Still planned for this phase:** clipboard, notifications, app launch, screen
+     capture of other windows, and managed process controls. Each must go through this
+     same grant registry.
    - Add revocable, user-selected folder mounts beyond `aura-workspace`, plus opt-in clipboard, notifications, app launch, screen capture, and managed process controls.
    - Introduce a permissions center with one-time, session, project, and persistent grants plus a readable audit trail and emergency stop.
    - Preserve the safe workspace as the default and require narrow approval for broader access.

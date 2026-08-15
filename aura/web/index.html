@@ -40,6 +40,7 @@
         </div>
         <button id="mindButton" class="side-button accent"><span class="button-icon">✦</span> Aura Mind <kbd>Ctrl M</kbd></button>
         <button id="memoryButton" class="side-button"><span class="button-icon">◇</span> What Aura knows</button>
+        <button id="permissionsButton" class="side-button"><span class="button-icon">⚿</span> Permissions</button>
         <button id="settingsButton" class="side-button"><span class="button-icon">⚙</span> Settings</button>
         <button id="workspaceButton" class="side-button"><span class="button-icon">↗</span> Open workspace</button>
         <button id="tasksButton" class="side-button"><span class="button-icon">✓</span> Recent tasks</button>
@@ -162,7 +163,28 @@
         <button class="primary-button" type="submit">Teach Aura</button>
       </form>
       <div id="memoryList" class="memory-list"></div>
-      <footer><span>Credentials and sensitive personal details are never learned automatically.</span><button class="primary-button" data-close="memoryModal">Done</button></footer>
+      <footer><span>Credentials and sensitive personal details are never learned automatically.</span><button id="memoryExport" type="button">Export</button><button class="primary-button" data-close="memoryModal">Done</button></footer>
+    </div>
+  </div>
+
+  <div id="permissionsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="permissionsTitle">
+    <div class="modal-card memory-card">
+      <header><div><h2 id="permissionsTitle">Permissions</h2><p id="permissionsNote">Folders outside the workspace that Aura may read.</p></div><button class="modal-x" data-close="permissionsModal">×</button></header>
+      <form id="permissionGrant" class="memory-teach">
+        <select id="permissionAccess" aria-label="Access level">
+          <option value="read">Read only</option>
+          <option value="write">Read and write</option>
+        </select>
+        <select id="permissionMode" aria-label="Grant duration">
+          <option value="session">This session</option>
+          <option value="once">Once</option>
+          <option value="persistent">Until revoked</option>
+        </select>
+        <input id="permissionPath" placeholder="Full path to a folder Aura may use" aria-label="Folder path">
+        <button class="primary-button" type="submit">Grant</button>
+      </form>
+      <div id="permissionList" class="memory-list"></div>
+      <footer><span>Aura cannot grant itself access. Nothing outside the workspace is readable by default.</span><button id="permissionRevokeAll" type="button" class="danger">Revoke all</button><button class="primary-button" data-close="permissionsModal">Done</button></footer>
     </div>
   </div>
 
@@ -177,6 +199,7 @@
         <label>Maximum tokens<input id="settingTokens" type="number" min="256" max="32768"></label>
         <label>Thinking depth<select id="settingReasoning"><option value="fast">Fast</option><option value="balanced">Balanced</option><option value="deep">Deep</option></select></label>
         <label>Autonomy<select id="settingAutonomy"><option value="careful">Careful</option><option value="balanced">Balanced</option><option value="powerful">Powerful</option></select></label>
+        <label>Images<select id="settingVision"><option value="auto">Automatic (guess from model name)</option><option value="on">Always send images</option><option value="off">Never send images</option></select></label>
         <div class="power-note wide"><strong>Powerful mode</strong><span>Gives Aura the broad tool catalog and longer multi-step runs. File changes remain recoverable; executable code, external network requests, and desktop launches still ask first.</span></div>
         <label class="toggle-row wide"><input id="settingLearning" type="checkbox"><span>Learn clear, non-sensitive things I state in conversation</span></label>
         <div class="settings-section wide"><strong>Presence</strong><span>Shape how Aura moves and how much detail the face renders.</span></div>

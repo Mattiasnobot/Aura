@@ -23,6 +23,7 @@ const elements = {
   workspacePreview: $("#workspacePreview"), previewPath: $("#previewPath"), previewMeta: $("#previewMeta"),
   previewAsk: $("#previewAsk"), previewOpen: $("#previewOpen"), previewCompare: $("#previewCompare"),
   settingsModal: $("#settingsModal"), tasksModal: $("#tasksModal"), memoryModal: $("#memoryModal"),
+  permissionsModal: $("#permissionsModal"),
   memoryList: $("#memoryList"),
   promptModal: $("#promptModal"), promptForm: $("#promptForm"), promptTitle: $("#promptTitle"),
   promptHint: $("#promptHint"), promptInput: $("#promptInput"), promptStatus: $("#promptStatus"),
@@ -519,6 +520,14 @@ async function handleEvent(event) {
   switch (event.type) {
     case "user_message":
       addMessage("user", event.text);
+      break;
+    case "stream_reset":
+      // Aura is retrying, so the half-written reply is void. Clear it instead
+      // of letting the next attempt pile up underneath the abandoned one.
+      if (streamMessage) {
+        streamMessage.raw = "";
+        streamMessage.body.textContent = "";
+      }
       break;
     case "stream_token":
       if (!streamMessage) streamMessage = addMessage("assistant", "", true);
@@ -1200,6 +1209,82 @@ function populateMemoryCategories(select, selected = "personal") {
   setSelectValue(select, selected);
 }
 
+async function openPermissions(focus = true) {
+  if (focus) openModal(elements.permissionsModal);
+  const list = $("#permissionList");
+  list.textContent = "Reading local permissions…";
+  try {
+    const result = await callApi("list_permissions");
+    if (!result.ok) throw new Error(result.error);
+    $("#permissionsNote").textContent = result.note;
+    list.replaceChildren();
+    if (!result.active.length) {
+      const empty = document.createElement("div"); empty.className = "memory-empty";
+      const title = document.createElement("strong"); title.textContent = "No folders granted";
+      const detail = document.createElement("p");
+      detail.textContent = "Aura can only reach its own workspace until you grant a folder above.";
+      empty.append(title, detail); list.append(empty); return;
+    }
+    for (const grant of result.active) {
+      const card = document.createElement("article"); card.className = "memory-item";
+      const copy = document.createElement("div"); copy.className = "memory-item-copy";
+      const head = document.createElement("div"); head.className = "memory-item-head";
+      const kind = document.createElement("span"); kind.className = "memory-category";
+      kind.textContent = grant.mode === "persistent" ? "Until revoked"
+        : grant.mode === "once" ? "Once" : grant.mode === "project" ? "Project" : "This session";
+      const scope = document.createElement("span"); scope.className = "memory-confidence";
+      scope.textContent = grant.capability === "write_folder" ? "read and write" : "read only";
+      head.append(kind, scope);
+      const value = document.createElement("p"); value.textContent = grant.root;
+      const meta = document.createElement("small");
+      const when = grant.granted_at ? new Date(grant.granted_at).toLocaleString() : "";
+      meta.textContent = `Granted ${when}${grant.project ? ` • project ${grant.project}` : ""}`;
+      copy.append(head, value, meta);
+      const actions = document.createElement("div"); actions.className = "memory-actions";
+      const revoke = document.createElement("button");
+      revoke.type = "button"; revoke.textContent = "Revoke"; revoke.classList.add("danger");
+      revoke.addEventListener("click", async () => {
+        const outcome = await callApi("revoke_folder_access", grant.id);
+        if (!outcome.ok) return toast(outcome.error, true);
+        toast("Access revoked.");
+        await openPermissions(false);
+      });
+      actions.append(revoke);
+      card.append(copy, actions); list.append(card);
+    }
+  } catch (error) {
+    list.textContent = String(error);
+  }
+}
+
+async function grantFolderAccess(event) {
+  event.preventDefault();
+  const path = $("#permissionPath").value.trim();
+  if (!path) return toast("Enter a folder path first.", true);
+  const writable = $("#permissionAccess").value === "write";
+  const result = await callApi("grant_folder_access", path, $("#permissionMode").value, null, writable);
+  if (!result.ok) return toast(result.error, true);
+  $("#permissionPath").value = "";
+  toast(`Aura may now read ${result.grant.root}`);
+  await openPermissions(false);
+}
+
+async function revokeAllPermissions() {
+  if (!window.confirm("Revoke every folder permission outside the workspace?")) return;
+  const result = await callApi("revoke_all_permissions");
+  if (!result.ok) return toast(result.error, true);
+  toast(result.revoked ? `Revoked ${result.revoked} permission(s).` : "Nothing to revoke.");
+  await openPermissions(false);
+}
+
+async function exportPersonalMemory() {
+  const result = await callApi("export_personal_memory");
+  if (!result.ok) return toast(result.error, true);
+  toast(`Exported ${result.count} ${result.count === 1 ? "memory" : "memories"} to ${result.path}`);
+  closeModal(elements.memoryModal);
+  openWorkspaceExplorer(result.path);
+}
+
 function buildMemoryCard(memory) {
   const card = document.createElement("article"); card.className = `memory-item${memory.pinned ? " pinned" : ""}`;
   const copy = document.createElement("div"); copy.className = "memory-item-copy";
@@ -1235,6 +1320,15 @@ function buildMemoryCard(memory) {
       toast("Memory confirmed.");
     });
   }
+  if (related.length === 1) {
+    button("Keep this", async () => {
+      const other = related[0].other;
+      if (!window.confirm(`Keep this memory and forget the other one?\n\nKeeping: ${memory.value}\nForgetting: ${other.value}`)) return;
+      const result = await callApi("forget_personal_memory", other.id);
+      if (!result.ok) return toast(result.error, true);
+      toast("Kept this memory and forgot the other.");
+    });
+  }
   button(memory.pinned ? "Unpin" : "Pin", async () => {
     const result = await callApi("update_personal_memory", memory.id, { pinned: !memory.pinned });
     if (!result.ok) return toast(result.error, true);
@@ -1254,6 +1348,20 @@ function buildMemoryCard(memory) {
     });
     textarea.focus(); textarea.select();
   });
+  const history = memory.history || [];
+  if (history.length) {
+    const previous = history[history.length - 1];
+    const note = document.createElement("small");
+    note.className = "memory-history";
+    const when = previous.replaced ? new Date(previous.replaced).toLocaleDateString() : "";
+    note.textContent = `Previously “${previous.value}”${when ? ` until ${when}` : ""}${history.length > 1 ? ` (+${history.length - 1} earlier)` : ""}`;
+    copy.append(note);
+    button("Revert", async () => {
+      const result = await callApi("revert_personal_memory", memory.id);
+      if (!result.ok) return toast(result.error, true);
+      toast("Restored the earlier wording.");
+    });
+  }
   button("Forget", async () => {
     if (!window.confirm(`Ask Aura to forget this?\n\n${memory.value}`)) return;
     const result = await callApi("forget_personal_memory", memory.id);
@@ -1338,6 +1446,7 @@ async function openSettings() {
     $("#settingTokens").value = settings.max_tokens;
     $("#settingReasoning").value = settings.reasoning_depth;
     $("#settingAutonomy").value = settings.autonomy_mode;
+    $("#settingVision").value = settings.vision_mode || "auto";
     $("#settingLearning").checked = settings.learn_from_conversations;
     $("#settingSpeechEngine").value = settings.speech_engine;
     setSelectValue($("#settingVoice"), settings.speech_voice || "");
@@ -1450,6 +1559,7 @@ async function saveSettings() {
     max_tokens: $("#settingTokens").value,
     reasoning_depth: $("#settingReasoning").value,
     autonomy_mode: $("#settingAutonomy").value,
+    vision_mode: $("#settingVision").value,
     learn_from_conversations: $("#settingLearning").checked,
     speech_engine: $("#settingSpeechEngine").value,
     speech_voice: $("#settingVoice").value,
@@ -2115,6 +2225,9 @@ function bindControls() {
   elements.voiceRetry.addEventListener("click", () => beginVoice("toggle"));
   $("#mindButton").addEventListener("click", openMind);
   $("#memoryButton").addEventListener("click", () => openPersonalMemory());
+  $("#permissionsButton").addEventListener("click", () => openPermissions());
+  $("#permissionGrant").addEventListener("submit", grantFolderAccess);
+  $("#permissionRevokeAll").addEventListener("click", revokeAllPermissions);
   $("#settingsButton").addEventListener("click", openSettings);
   $("#workspaceButton").addEventListener("click", async () => {
     const result = await callApi("open_workspace"); if (!result.ok) toast(result.error, true);
@@ -2148,6 +2261,7 @@ function bindControls() {
   $("#denyApproval").addEventListener("click", () => resolveApproval(false));
   $("#memoryTeach").addEventListener("submit", teachAura);
   $("#memorySearch").addEventListener("input", renderPersonalMemories);
+  $("#memoryExport").addEventListener("click", exportPersonalMemory);
   $("#mindClose").addEventListener("click", closeMind);
   $("#mindFit").addEventListener("click", () => mindGraph.fit());
   $("#mindReset").addEventListener("click", () => mindGraph.reset());

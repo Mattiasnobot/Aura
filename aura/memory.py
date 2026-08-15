@@ -10,6 +10,7 @@ from uuid import uuid4
 
 class MemoryStore:
     PROFILE_VERSION = 1
+    MAX_HISTORY = 5
     PROFILE_CATEGORIES = {
         "preference", "interest", "goal", "project", "tool", "work_style", "personal",
     }
@@ -281,12 +282,45 @@ class MemoryStore:
                 raise ValueError("Memory is too short")
             if self._is_sensitive(next_value):
                 raise ValueError("Aura will not store credentials or sensitive personal details in learned memory")
+            changed = (next_value != item.get("value")
+                       or next_category != item.get("category"))
+            if changed:
+                # Keep what it said before so a correction can be walked back.
+                history = list(item.get("history") or [])
+                history.append({"value": item.get("value"),
+                                "category": item.get("category"),
+                                "replaced": self._now()})
+                item["history"] = history[-self.MAX_HISTORY:]
             item.update({"category": next_category, "value": next_value,
                          "key": self._fact_key(next_category, next_value),
                          "confirmed": True, "updated": self._now(),
                          "last_confirmed": self._now()})
             if pinned is not None:
                 item["pinned"] = bool(pinned)
+            self.save()
+            return dict(item)
+
+    def revert_profile_memory(self, memory_id: str) -> dict:
+        """Restore the most recent previous wording, walking back one step."""
+        with self._lock:
+            item = next((entry for entry in self.data["profile_memories"]
+                         if entry.get("id") == str(memory_id)), None)
+            if item is None:
+                raise KeyError("Memory not found")
+            history = list(item.get("history") or [])
+            if not history:
+                raise ValueError("This memory has no earlier version to restore")
+            previous = history.pop()
+            category = str(previous.get("category") or item.get("category"))
+            value = str(previous.get("value") or "")
+            if category not in self.PROFILE_CATEGORIES or len(value) < 3:
+                raise ValueError("The earlier version can no longer be restored safely")
+            # The restored step is consumed rather than re-recorded, so repeated
+            # reverts walk further back instead of toggling between two versions.
+            item.update({"category": category, "value": value,
+                         "key": self._fact_key(category, value),
+                         "history": history, "confirmed": True,
+                         "updated": self._now(), "last_confirmed": self._now()})
             self.save()
             return dict(item)
 

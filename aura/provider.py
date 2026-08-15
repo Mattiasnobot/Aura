@@ -120,6 +120,20 @@ class LMStudioProvider(Provider):
         except (TimeoutError, json.JSONDecodeError) as exc:
             raise ProviderError(f"LM Studio did not return a valid response: {exc}") from exc
 
+    # LM Studio's /v1/models reports only an id — no capability metadata at all —
+    # so vision support can only be guessed from the name. Treat this as a hint,
+    # never as a fact, and let the user override it in Settings.
+    VISION_MARKERS = (
+        "-vl", "vl-", "vision", "llava", "pixtral", "moondream", "internvl",
+        "minicpm-v", "bakllava", "cogvlm", "gemma-3", "idefics", "qwen-vl",
+        "phi-3.5-vision", "phi-4-multimodal", "smolvlm",
+    )
+
+    @classmethod
+    def model_may_support_vision(cls, model: str | None) -> bool:
+        name = str(model or "").casefold()
+        return any(marker in name for marker in cls.VISION_MARKERS)
+
     def available_models(self) -> list[str]:
         data = self._request("/models")
         return [item["id"] for item in data.get("data", [])

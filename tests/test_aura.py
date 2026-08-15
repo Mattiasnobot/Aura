@@ -3,12 +3,14 @@ import io
 import json
 import math
 import os
+import struct
 import subprocess
 import tempfile
 import threading
 import time
 import unittest
 import wave
+import zlib
 import zipfile
 from array import array
 from pathlib import Path
@@ -22,14 +24,20 @@ from aura.config import ConfigStore
 from aura.commands import CommandAgent, CommandResult
 from aura.http_app import create_server, existing_aura_url
 from aura.graph_model import build_mind_graph
+from aura.image_diff import UnsupportedImage, compare_images, decode_png
+from aura.permissions import (ExternalReader, ExternalWriter, PermissionDenied,
+                              PermissionRefused,
+                              PermissionStore)
 from aura.preview_server import PreviewServer
 from aura.provider import (LMStudioProvider, MockProvider, ProviderContext, ProviderError,
                            ProviderReply, ToolCall)
 from aura.speech import SpeechOutput
 from aura.tasks import TaskJournal
-from aura.validation import check_broken_assets
+from aura.validation import check_accessibility, check_broken_assets
 from aura.voice import VoiceInput
 from aura.safety import SandboxViolation, WorkspaceSandbox
+from aura.screenshot import find_browser
+from aura.search_index import WorkspaceIndex, tokenize
 from aura.web_bridge import AuraWebBridge
 
 
@@ -360,6 +368,48 @@ class AgentTests(unittest.TestCase):
         stored = next(m for m in reloaded.profile_memories() if m["id"] == item["id"])
         self.assertIsNotNone(stored["last_used"])
 
+    def test_edits_record_history_and_revert_walks_back_one_step(self):
+        memory = self.agent.memory
+        item = memory.learn_fact("tool", "Python for prototypes", source="t",
+                                 confidence=.8, explicit=True)
+        memory.update_profile_memory(item["id"], value="Rust for prototypes")
+        memory.update_profile_memory(item["id"], value="Go for prototypes")
+
+        current = next(m for m in memory.profile_memories() if m["id"] == item["id"])
+        self.assertEqual(current["value"], "Go for prototypes")
+        self.assertEqual([entry["value"] for entry in current["history"]],
+                         ["Python for prototypes", "Rust for prototypes"])
+
+        once = memory.revert_profile_memory(item["id"])
+        self.assertEqual(once["value"], "Rust for prototypes")
+        twice = memory.revert_profile_memory(item["id"])
+        self.assertEqual(twice["value"], "Python for prototypes")
+        # History is consumed, so reverting cannot ping-pong forever.
+        self.assertEqual(twice["history"], [])
+        with self.assertRaises(ValueError):
+            memory.revert_profile_memory(item["id"])
+
+    def test_confirming_without_changes_records_no_history(self):
+        memory = self.agent.memory
+        item = memory.learn_fact("preference", "Concise answers", source="chat",
+                                 confidence=.85)
+        memory.update_profile_memory(item["id"])
+        memory.update_profile_memory(item["id"], pinned=True)
+        stored = next(m for m in memory.profile_memories() if m["id"] == item["id"])
+        self.assertEqual(stored.get("history", []), [])
+        self.assertTrue(stored["pinned"])
+
+    def test_reverting_restores_lookup_key_so_relearning_is_deduplicated(self):
+        memory = self.agent.memory
+        item = memory.learn_fact("tool", "Python for prototypes", source="t",
+                                 confidence=.8, explicit=True)
+        memory.update_profile_memory(item["id"], value="Rust for prototypes")
+        memory.revert_profile_memory(item["id"])
+        again = memory.learn_fact("tool", "Python for prototypes", source="t",
+                                  confidence=.8, explicit=True)
+        self.assertEqual(again["id"], item["id"])
+        self.assertEqual(len(memory.profile_memories()), 1)
+
     def test_conflicting_pairs_flags_negation_and_restatement_only(self):
         memory = self.agent.memory
         concise = memory.learn_fact("preference", "Concise answers", source="t",
@@ -469,6 +519,647 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(result.blocked)
         self.assertFalse(result.succeeded)
         approve.assert_not_called()
+
+
+class VisionTests(unittest.TestCase):
+    PIXEL_PNG = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmM"
+        "IQAAAABJRU5ErkJggg==")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace",
+                               provider=LMStudioProvider(model="qwen3-vl-8b-instruct"))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_vision_guess_follows_model_name_and_user_override(self):
+        self.assertTrue(LMStudioProvider.model_may_support_vision("qwen3-vl-8b-instruct"))
+        self.assertTrue(LMStudioProvider.model_may_support_vision("llava-1.6"))
+        self.assertFalse(LMStudioProvider.model_may_support_vision("qwen3-coder-30b"))
+        self.assertFalse(LMStudioProvider.model_may_support_vision(None))
+
+        self.assertTrue(self.agent.vision_enabled())
+        self.agent.config.update(vision_mode="off")
+        self.assertFalse(self.agent.vision_enabled())
+        self.agent.provider.model = "qwen3-coder-30b"
+        self.agent.config.update(vision_mode="on")
+        self.assertTrue(self.agent.vision_enabled())
+
+    def test_image_is_encoded_under_a_journal_stripped_key(self):
+        self.agent.sandbox.import_file("shot.png", self.PIXEL_PNG)
+        attachment = self.agent._read_image_attachment("shot.png")
+        self.assertEqual(attachment["media_type"], "image/png")
+        self.assertTrue(attachment["content"].startswith("data:image/png;base64,"))
+        # "content" is the key TaskJournal.record_tool drops, so the base64 blob
+        # never lands in the durable task history.
+        journal = TaskJournal(Path(self.temp.name) / "tasks.jsonl")
+        task = journal.start("look")
+        journal.record_tool(task, "look_at_image", {"path": "shot.png"}, attachment)
+        self.assertNotIn("content", journal.recent(1)[0]["tool_details"][0]["result"])
+        self.assertNotIn("base64", journal.path.read_text(encoding="utf-8"))
+
+    def test_non_image_and_oversized_files_are_refused(self):
+        self.agent.sandbox.write_file("notes.txt", "not an image")
+        with self.assertRaises(ValueError):
+            self.agent._read_image_attachment("notes.txt")
+        with self.assertRaises(FileNotFoundError):
+            self.agent._read_image_attachment("missing.png")
+
+    def test_capture_page_requires_approval_before_launching_a_browser(self):
+        self.agent.sandbox.write_file(
+            "site/index.html", "<!doctype html><html><body><h1>Hi</h1></body></html>")
+        seen: list[list[str]] = []
+
+        def deny(command):
+            seen.append(command)
+            return False
+
+        call = ToolCall("call_1", "capture_page", {"path": "site/index.html"})
+        result = self.agent._execute_tool(call, deny)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["approved"])
+        self.assertTrue(seen, "the user must be asked before a browser starts")
+        self.assertIn("--headless", seen[0])
+        self.assertFalse((self.agent.sandbox.root / "site" / "index-screenshot.png").exists())
+
+    def test_every_extra_round_clears_the_previous_partial_reply(self):
+        # The verification nudge used to stream only blank lines and then repeat
+        # the whole answer, so the reply appeared two or three times. The reset
+        # is emitted once per extra round, so no retry path can miss it.
+        provider = LMStudioProvider(model="local-model")
+        agent = AuraAgent(Path(self.temp.name) / "rounds", provider=provider)
+        states: list[str] = []
+        replies = [
+            ProviderReply("", [ToolCall("c1", "create_file", {
+                "path": "loop.txt", "content": "no repeats"})]),
+            ProviderReply("Created loop.txt.", []),          # triggers verification nudge
+            ProviderReply("", [ToolCall("c2", "read_file", {"path": "loop.txt"})]),
+            ProviderReply("Created and verified loop.txt.", []),
+        ]
+        provider.complete = unittest.mock.Mock(side_effect=replies)
+        agent.handle("Create loop.txt in the workspace and validate it",
+                     state=states.append)
+        # One reset for each round after the first.
+        self.assertEqual(states.count("retry"), provider.complete.call_count - 1)
+
+    def test_a_retry_tells_the_interface_to_discard_the_abandoned_reply(self):
+        # The user saw the same answer two or three times whenever Aura retried,
+        # because each attempt streamed a full reply and the browser appended
+        # them. A retry must clear what was already streamed.
+        provider = LMStudioProvider(model="local-model")
+        agent = AuraAgent(Path(self.temp.name) / "retrystate", provider=provider)
+        states: list[str] = []
+        replies = [
+            ProviderReply("I have created report.txt for you.", []),
+            ProviderReply("", [ToolCall("c1", "create_file", {
+                "path": "report.txt", "content": "real"})]),
+            ProviderReply("Created report.txt.", []),
+        ]
+        provider.complete = unittest.mock.Mock(side_effect=replies)
+        agent.handle("Create report.txt in the workspace", state=states.append)
+        self.assertIn("retry", states)
+        self.assertTrue((agent.sandbox.root / "report.txt").is_file())
+
+    def test_external_only_work_never_triggers_a_repeat_nudge_loop(self):
+        # Regression: undoing an external write re-ran the whole answer several
+        # times, because the workspace artifact contract and the workspace
+        # validation nudge can never be satisfied by work done outside it.
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "granted"
+            target.mkdir()
+            (target / "report.txt").write_text("before", encoding="utf-8")
+            provider = LMStudioProvider(model="local-model")
+            agent = AuraAgent(Path(self.temp.name) / "noloop", provider=provider)
+            agent.permissions.grant("write_folder", target, "persistent")
+            agent.external_writer.write_file(target / "report.txt", "after")
+
+            replies = [
+                ProviderReply("", [ToolCall("u1", "undo_external_change", {})]),
+                ProviderReply("Rolled report.txt back and validated the result.", []),
+            ]
+            provider.complete = unittest.mock.Mock(side_effect=replies)
+            answer = agent.handle("Undo that change to report.txt and validate it")
+
+            self.assertNotIn("still missing", answer)
+            self.assertEqual(agent.tasks.recent(1)[0]["status"], "completed")
+            self.assertEqual(provider.complete.call_count, 2)
+            self.assertEqual((target / "report.txt").read_text(encoding="utf-8"), "before")
+
+    def test_naming_a_tool_in_the_request_always_offers_it(self):
+        # Regression: "the granted write folder" missed the "granted folder"
+        # keyword, so write_external_file was never offered and Aura appeared to
+        # refuse a request that named the tool explicitly.
+        request = ('Use write_external_file to replace report.txt in the granted '
+                   'write folder with new text')
+        offered = {d["function"]["name"] for d in
+                   AuraAgent.select_tool_definitions(request, "powerful", "deep")}
+        self.assertIn("write_external_file", offered)
+        obscure = {d["function"]["name"] for d in
+                   AuraAgent.select_tool_definitions("please run capture_page for me",
+                                                     "balanced", "fast")}
+        self.assertIn("capture_page", obscure)
+
+    def test_an_external_write_satisfies_the_artifact_contract(self):
+        # Regression: "replace report.txt" in a granted outside folder kept
+        # failing with "required artifacts are still missing", because the
+        # contract only looked inside the workspace, so Aura retried in a loop.
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "granted"
+            target.mkdir()
+            (target / "report.txt").write_text("before", encoding="utf-8")
+            provider = LMStudioProvider(model="local-model")
+            agent = AuraAgent(Path(self.temp.name) / "extwrite", provider=provider)
+            agent.permissions.grant("write_folder", target, "persistent")
+
+            replies = [
+                ProviderReply("", [ToolCall("c1", "write_external_file", {
+                    "path": str(target / "report.txt"), "content": "after"})]),
+                ProviderReply("Replaced report.txt in the granted folder.", []),
+            ]
+            provider.complete = unittest.mock.Mock(side_effect=replies)
+            answer = agent.handle("Replace report.txt in the granted folder with new text")
+
+            self.assertNotIn("still missing", answer)
+            self.assertEqual(agent.tasks.recent(1)[0]["status"], "completed")
+            self.assertEqual((target / "report.txt").read_text(encoding="utf-8"), "after")
+            # Exactly two model turns: no nagging retry loop.
+            self.assertEqual(provider.complete.call_count, 2)
+
+    def test_read_only_requests_do_not_demand_the_named_file_be_created(self):
+        # Regression: "read notes.txt" made notes.txt a required deliverable, so a
+        # successful read of an external or missing-in-workspace file was reported
+        # as "required artifacts are still missing".
+        provider = LMStudioProvider(model="local-model")
+        agent = AuraAgent(Path(self.temp.name) / "readonly", provider=provider)
+        provider.complete = unittest.mock.Mock(
+            return_value=ProviderReply("Here is what notes.txt said.", []))
+        answer = agent.handle("Read notes.txt from the granted folder and summarise it")
+        self.assertNotIn("still missing", answer)
+        self.assertEqual(agent.tasks.recent(1)[0]["status"], "completed")
+
+    def test_artifact_contract_keeps_the_folder_the_user_typed(self):
+        # Regression: "aura_craft/index.html" used to collapse to "index.html",
+        # so the completion check looked in the workspace root, did not find it,
+        # and reported a finished task as a failure.
+        _, paths = AuraAgent._extract_artifact_contract(
+            "Take a screenshot of aura_craft/index.html with capture_page")
+        self.assertEqual(paths, ["aura_craft/index.html"])
+        _, windows = AuraAgent._extract_artifact_contract(r"Fix src\app\main.py please")
+        self.assertEqual(windows, [r"src\app\main.py"])
+        target, combined = AuraAgent._extract_artifact_contract(
+            "Create hello.py in the demo folder")
+        self.assertEqual((target, combined), ("demo", ["demo/hello.py"]))
+
+    def test_capture_page_rejects_non_html_and_missing_pages(self):
+        self.agent.sandbox.write_file("notes.txt", "plain text")
+        with self.assertRaises(ValueError):
+            self.agent._capture_page("notes.txt", lambda _: True)
+        with self.assertRaises(FileNotFoundError):
+            self.agent._capture_page("missing.html", lambda _: True)
+
+    def test_capture_page_renders_a_real_screenshot_when_a_browser_exists(self):
+        if find_browser() is None:
+            self.skipTest("Chrome, Edge, or Chromium is not installed")
+        self.agent.sandbox.write_file(
+            "site/index.html",
+            '<!doctype html><html><head><link rel="stylesheet" href="style.css"></head>'
+            "<body><h1>Screenshot check</h1></body></html>")
+        self.agent.sandbox.write_file(
+            "site/style.css", "body { background: #123; } h1 { color: #fff; }")
+        result = self.agent._capture_page("site/index.html", lambda _: True,
+                                          width=640, height=400)
+        self.assertTrue(result["approved"])
+        self.assertEqual(result["path"], "site/index-screenshot.png")
+        saved = self.agent.sandbox.path(result["path"])
+        self.assertTrue(saved.is_file())
+        self.assertGreater(saved.stat().st_size, 1_000)
+        self.assertEqual(saved.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_a_css_change_shows_up_as_a_measured_layout_regression(self):
+        if find_browser() is None:
+            self.skipTest("Chrome, Edge, or Chromium is not installed")
+        self.agent.sandbox.write_file(
+            "site/index.html",
+            '<!doctype html><html><head><link rel="stylesheet" href="style.css"></head>'
+            '<body><h1>Title</h1><div class="box"></div></body></html>')
+        self.agent.sandbox.write_file(
+            "site/style.css", "body{background:#fff;margin:0}"
+            ".box{width:200px;height:120px;background:#3366ff}")
+        before = self.agent._capture_page("site/index.html", lambda _: True,
+                                          width=800, height=600)
+        self.agent.sandbox.move_file(before["path"], "site/before.png")
+
+        self.agent.sandbox.write_file(
+            "site/style.css", "body{background:#fff;margin:0}"
+            ".box{width:200px;height:120px;background:#ff3333}")
+        after = self.agent._capture_page("site/index.html", lambda _: True,
+                                         width=800, height=600)
+
+        result = compare_images(self.agent.sandbox.path("site/before.png"),
+                                self.agent.sandbox.path(after["path"]))
+        self.assertFalse(result["identical"])
+        self.assertGreater(result["changed_pixels"], 0)
+        # Only the recoloured box should move, so the changed area must be far
+        # smaller than the page and must not span the whole canvas.
+        self.assertLess(result["changed_percent"], 20)
+        self.assertLessEqual(result["changed_region"]["width"], 260)
+        self.assertLessEqual(result["changed_region"]["height"], 180)
+
+    def test_look_at_image_tool_is_hidden_when_vision_is_off(self):
+        request = "look at the screenshot image and describe it"
+        with_vision = self.agent.select_tool_definitions(request, "powerful", "deep")
+        self.assertIn("look_at_image",
+                      [d["function"]["name"] for d in with_vision])
+        self.agent.config.update(vision_mode="off")
+        call = ToolCall("call_1", "look_at_image", {"path": "shot.png"})
+        self.assertFalse(self.agent._execute_tool(call, None)["ok"])
+
+
+class PermissionStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.allowed = self.base / "allowed"
+        self.secret = self.base / "secret"
+        for folder in (self.allowed, self.secret):
+            (folder / "sub").mkdir(parents=True)
+        (self.allowed / "note.txt").write_text("inside", encoding="utf-8")
+        (self.allowed / "sub" / "deep.txt").write_text("deeper", encoding="utf-8")
+        (self.secret / "keys.txt").write_text("do not read", encoding="utf-8")
+        self.store = PermissionStore(self.base / "permissions.json", session_id="s1")
+        self.reader = ExternalReader(self.store)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_nothing_outside_the_workspace_is_readable_without_a_grant(self):
+        with self.assertRaises(PermissionDenied):
+            self.reader.list_files(self.allowed)
+        with self.assertRaises(PermissionDenied):
+            self.reader.read_file(self.allowed / "note.txt")
+
+    def test_a_grant_covers_its_folder_and_descendants_only(self):
+        self.store.grant("read_folder", self.allowed, "persistent")
+        self.assertEqual(sorted(self.reader.list_files(self.allowed)),
+                         ["note.txt", "sub/deep.txt"])
+        self.assertEqual(self.reader.read_file(self.allowed / "sub" / "deep.txt"), "deeper")
+        # A sibling folder and the parent must stay unreachable.
+        with self.assertRaises(PermissionDenied):
+            self.reader.read_file(self.secret / "keys.txt")
+        with self.assertRaises(PermissionDenied):
+            self.reader.list_files(self.base)
+
+    def test_parent_traversal_cannot_escape_a_grant(self):
+        self.store.grant("read_folder", self.allowed, "persistent")
+        with self.assertRaises(PermissionDenied):
+            self.reader.read_file(self.allowed / ".." / "secret" / "keys.txt")
+
+    def test_a_symlink_inside_a_granted_folder_cannot_widen_it(self):
+        link = self.allowed / "escape"
+        try:
+            link.symlink_to(self.secret, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("creating symlinks is not permitted on this machine")
+        self.store.grant("read_folder", self.allowed, "persistent")
+        with self.assertRaises(PermissionDenied):
+            self.reader.read_file(link / "keys.txt")
+
+    def test_once_grants_are_spent_and_session_grants_die_with_the_session(self):
+        self.store.grant("read_folder", self.allowed, "once")
+        self.store.check("read_folder", self.allowed)
+        with self.assertRaises(PermissionDenied):
+            self.store.check("read_folder", self.allowed)
+
+        self.store.grant("read_folder", self.allowed, "session")
+        self.assertTrue(self.store.check("read_folder", self.allowed))
+        restarted = PermissionStore(self.base / "permissions.json", session_id="s2")
+        with self.assertRaises(PermissionDenied):
+            restarted.check("read_folder", self.allowed)
+
+    def test_persistent_grants_survive_a_restart(self):
+        self.store.grant("read_folder", self.allowed, "persistent")
+        restarted = PermissionStore(self.base / "permissions.json", session_id="s2")
+        self.assertTrue(restarted.check("read_folder", self.allowed))
+
+    def test_project_grants_apply_only_to_their_project(self):
+        self.store.grant("read_folder", self.allowed, "project", project="alpha")
+        self.assertTrue(self.store.check("read_folder", self.allowed, project="alpha"))
+        with self.assertRaises(PermissionDenied):
+            self.store.check("read_folder", self.allowed, project="beta")
+
+    def test_revoking_takes_effect_immediately_and_emergency_stop_clears_all(self):
+        first = self.store.grant("read_folder", self.allowed, "persistent")
+        self.store.revoke(first["id"])
+        with self.assertRaises(PermissionDenied):
+            self.reader.list_files(self.allowed)
+
+        self.store.grant("read_folder", self.allowed, "persistent")
+        self.store.grant("read_folder", self.allowed / "sub", "persistent")
+        self.assertEqual(len(self.store.active()), 2)
+        self.assertEqual(self.store.revoke_all(), 2)
+        self.assertEqual(self.store.active(), [])
+        with self.assertRaises(PermissionDenied):
+            self.reader.list_files(self.allowed)
+
+    def test_a_read_grant_never_implies_permission_to_write(self):
+        writer = ExternalWriter(self.store, self.base / "history",
+                                self.base / "external-changes.jsonl")
+        self.store.grant("read_folder", self.allowed, "persistent")
+        with self.assertRaises(PermissionDenied):
+            writer.write_file(self.allowed / "note.txt", "overwritten")
+        self.assertEqual((self.allowed / "note.txt").read_text(encoding="utf-8"), "inside")
+
+    def test_external_writes_are_snapshotted_and_undoable(self):
+        writer = ExternalWriter(self.store, self.base / "history",
+                                self.base / "external-changes.jsonl")
+        self.store.grant("write_folder", self.allowed, "persistent")
+
+        overwritten = writer.write_file(self.allowed / "note.txt", "new text")
+        self.assertFalse(overwritten["created"])
+        self.assertEqual((self.allowed / "note.txt").read_text(encoding="utf-8"), "new text")
+
+        created = writer.write_file(self.allowed / "fresh.txt", "brand new")
+        self.assertTrue(created["created"])
+
+        # Undo walks back newest first: the created file goes, then the
+        # overwritten one returns to its original contents.
+        self.assertEqual(writer.undo_last()["action"], "removed")
+        self.assertFalse((self.allowed / "fresh.txt").exists())
+        self.assertEqual(writer.undo_last()["action"], "restored")
+        self.assertEqual((self.allowed / "note.txt").read_text(encoding="utf-8"), "inside")
+        with self.assertRaises(ValueError):
+            writer.undo_last()
+
+    def test_writes_cannot_escape_the_granted_folder(self):
+        writer = ExternalWriter(self.store, self.base / "history",
+                                self.base / "external-changes.jsonl")
+        self.store.grant("write_folder", self.allowed, "persistent")
+        with self.assertRaises(PermissionDenied):
+            writer.write_file(self.secret / "keys.txt", "hacked")
+        with self.assertRaises(PermissionDenied):
+            writer.write_file(self.allowed / ".." / "secret" / "keys.txt", "hacked")
+        self.assertEqual((self.secret / "keys.txt").read_text(encoding="utf-8"),
+                         "do not read")
+
+    def test_revoking_write_access_blocks_further_writes(self):
+        writer = ExternalWriter(self.store, self.base / "history",
+                                self.base / "external-changes.jsonl")
+        grant = self.store.grant("write_folder", self.allowed, "persistent")
+        writer.write_file(self.allowed / "note.txt", "first")
+        self.store.revoke(grant["id"])
+        with self.assertRaises(PermissionDenied):
+            writer.write_file(self.allowed / "note.txt", "second")
+        self.assertEqual((self.allowed / "note.txt").read_text(encoding="utf-8"), "first")
+
+    def test_system_and_root_locations_can_never_be_granted(self):
+        root = Path(self.base.anchor or "/")
+        with self.assertRaises(PermissionRefused):
+            self.store.grant("read_folder", root, "persistent")
+        protected = os.environ.get("SystemRoot") or "/etc"
+        if Path(protected).is_dir():
+            with self.assertRaises(PermissionRefused):
+                self.store.grant("read_folder", protected, "persistent")
+
+    def test_unknown_capabilities_modes_and_files_are_refused(self):
+        with self.assertRaises(PermissionRefused):
+            self.store.grant("delete_everything", self.allowed, "persistent")
+        with self.assertRaises(PermissionRefused):
+            self.store.grant("read_folder", self.allowed, "forever")
+        with self.assertRaises(PermissionRefused):
+            self.store.grant("read_folder", self.allowed / "note.txt", "persistent")
+
+
+class AccessibilityCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.sandbox = WorkspaceSandbox(Path(self.temp.name) / "workspace")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def rules(self, html, name="page.html"):
+        self.sandbox.write_file(name, html)
+        result = check_accessibility(self.sandbox)
+        return {issue["rule"] for issue in result["issues"]}, result
+
+    def test_clean_page_reports_nothing(self):
+        found, result = self.rules(
+            '<!doctype html><html lang="en"><head><title>Shop</title></head><body>'
+            '<h1>Shop</h1><h2>Items</h2>'
+            '<img src="a.png" alt="A blue mug">'
+            '<label for="q">Search</label><input id="q" type="text">'
+            '<a href="/x">Go to items</a>'
+            '<button aria-label="Close">&times;</button>'
+            "</body></html>")
+        self.assertEqual(found, set())
+        self.assertEqual(result["checked"], 1)
+
+    def test_missing_alt_label_and_empty_link_are_caught(self):
+        found, _ = self.rules(
+            '<!doctype html><html lang="en"><head><title>T</title></head><body>'
+            '<img src="a.png">'
+            '<input id="lonely" type="text">'
+            '<a href="/x"></a>'
+            "</body></html>")
+        self.assertEqual(found, {"img-alt", "control-label", "empty-link"})
+
+    def test_document_level_problems_are_caught(self):
+        found, _ = self.rules(
+            "<!doctype html><html><head><title>  </title></head><body>"
+            "<h1>A</h1><h3>Skipped</h3></body></html>")
+        self.assertEqual(found, {"html-lang", "document-title", "heading-order"})
+
+    def test_alternative_labelling_methods_are_accepted(self):
+        # A wrapping <label>, an aria-label, and a hidden input all count as
+        # labelled; flagging them would train the user to ignore the report.
+        found, _ = self.rules(
+            '<!doctype html><html lang="en"><head><title>T</title></head><body>'
+            "<label>Name <input type='text'></label>"
+            "<input type='email' aria-label='Email address'>"
+            "<input type='hidden' name='csrf'>"
+            "<input type='submit' value='Send'>"
+            "<a href='/p'><img src='p.png' alt='Product'></a>"
+            "</body></html>")
+        self.assertEqual(found, set())
+
+    def test_pointing_at_a_single_page_checks_that_page(self):
+        # Regression: a file path used to scan nothing, and the empty issue list
+        # was reported to the user as "no accessibility issues found".
+        self.sandbox.write_file(
+            "site/index.html",
+            '<!doctype html><html lang="en"><head><title>T</title></head>'
+            "<body><img src='a.png'></body></html>")
+        result = check_accessibility(self.sandbox, "site/index.html")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["checked"], 1)
+        self.assertEqual([i["rule"] for i in result["issues"]], ["img-alt"])
+
+    def test_checking_nothing_is_an_error_not_a_clean_result(self):
+        self.sandbox.write_file("notes.txt", "not html")
+        result = check_accessibility(self.sandbox, "notes.txt")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["checked"], 0)
+        self.assertIn("nothing was checked", result["error"])
+
+    def test_contrast_is_explicitly_not_evaluated(self):
+        _, result = self.rules(
+            '<!doctype html><html lang="en"><head><title>T</title></head>'
+            '<body style="color:#eee;background:#fff"><h1>Faint</h1></body></html>')
+        self.assertFalse(result["contrast_checked"])
+        self.assertIn("contrast", result["note"])
+
+    def test_issues_carry_file_and_line_numbers(self):
+        self.sandbox.write_file(
+            "deep/page.html",
+            '<!doctype html>\n<html lang="en">\n<head><title>T</title></head>\n'
+            "<body>\n<img src='x.png'>\n</body>\n</html>")
+        result = check_accessibility(self.sandbox, "deep")
+        self.assertEqual(len(result["issues"]), 1)
+        self.assertEqual(result["issues"][0]["file"], "deep/page.html")
+        self.assertEqual(result["issues"][0]["line"], 5)
+
+
+class ImageDiffTests(unittest.TestCase):
+    @staticmethod
+    def png(width, height, colour_at, *, alpha=False):
+        """Build a real PNG so the decoder is tested against genuine bytes."""
+        channels = 4 if alpha else 3
+        rows = []
+        for y in range(height):
+            row = bytearray(b"\x00")
+            for x in range(width):
+                pixel = colour_at(x, y)
+                row += bytes(pixel[:3])
+                if alpha:
+                    row += bytes((255,))
+            rows.append(bytes(row))
+        raw = b"".join(rows)
+
+        def chunk(tag, data):
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+        colour_type = 6 if alpha else 2
+        return (b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, colour_type, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw, 6))
+                + chunk(b"IEND", b""))
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write(self, name, data):
+        target = self.root / name
+        target.write_bytes(data)
+        return target
+
+    def test_identical_images_report_no_change(self):
+        flat = self.png(40, 20, lambda x, y: (10, 120, 200))
+        a = self.write("a.png", flat)
+        b = self.write("b.png", flat)
+        result = compare_images(a, b)
+        self.assertTrue(result["identical"])
+        self.assertEqual(result["changed_pixels"], 0)
+
+    def test_changed_region_is_located_precisely(self):
+        base = self.png(40, 20, lambda x, y: (255, 255, 255))
+        # A single 4x3 red block starting at (10, 5).
+        def spotted(x, y):
+            return (255, 0, 0) if 10 <= x < 14 and 5 <= y < 8 else (255, 255, 255)
+        a = self.write("base.png", base)
+        b = self.write("spotted.png", self.png(40, 20, spotted))
+        result = compare_images(a, b)
+        self.assertFalse(result["identical"])
+        self.assertEqual(result["changed_pixels"], 12)
+        self.assertEqual(result["changed_region"],
+                         {"left": 10, "top": 5, "right": 13, "bottom": 7,
+                          "width": 4, "height": 3})
+
+    def test_size_change_is_reported_as_a_layout_difference(self):
+        a = self.write("a.png", self.png(40, 20, lambda x, y: (0, 0, 0)))
+        b = self.write("b.png", self.png(40, 30, lambda x, y: (0, 0, 0)))
+        result = compare_images(a, b)
+        self.assertFalse(result["identical"])
+        self.assertEqual(result["reason"], "size")
+        self.assertIn("40x20", result["summary"])
+
+    def test_tolerance_ignores_imperceptible_noise(self):
+        a = self.write("a.png", self.png(20, 10, lambda x, y: (100, 100, 100)))
+        b = self.write("b.png", self.png(20, 10, lambda x, y: (104, 100, 100)))
+        self.assertTrue(compare_images(a, b, tolerance=8)["identical"])
+        self.assertFalse(compare_images(a, b, tolerance=0)["identical"])
+
+    def test_rgb_and_rgba_versions_of_the_same_picture_match(self):
+        colours = lambda x, y: (x * 5 % 256, y * 9 % 256, 60)
+        a = self.write("rgb.png", self.png(20, 10, colours))
+        b = self.write("rgba.png", self.png(20, 10, colours, alpha=True))
+        self.assertTrue(compare_images(a, b)["identical"])
+
+    def test_unsupported_and_broken_files_are_refused(self):
+        self.write("not.png", b"definitely not a png")
+        with self.assertRaises(UnsupportedImage):
+            compare_images(self.root / "not.png", self.root / "not.png")
+
+    def test_paeth_filtered_gradient_decodes_correctly(self):
+        # A gradient makes the encoder pick non-trivial row filters, so this
+        # exercises the Sub/Up/Average/Paeth reconstruction paths.
+        gradient = self.png(60, 40, lambda x, y: (x * 4 % 256, y * 6 % 256, (x + y) % 256))
+        a = self.write("g1.png", gradient)
+        decoded = decode_png(a)
+        self.assertEqual((decoded.width, decoded.height), (60, 40))
+        self.assertEqual(decoded.rgb(10, 7), (40, 42, 17))
+        self.assertTrue(compare_images(a, self.write("g2.png", gradient))["identical"])
+
+
+class WorkspaceIndexTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.sandbox = WorkspaceSandbox(Path(self.temp.name) / "workspace")
+        self.index = WorkspaceIndex(self.sandbox)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_tokenizer_splits_camel_case_and_snake_case_alike(self):
+        self.assertEqual(tokenize("avatarFace"), ["avatar", "face"])
+        self.assertEqual(tokenize("avatar_face"), ["avatar", "face"])
+        self.assertEqual(tokenize("HTMLParser"), ["html", "parser"])
+
+    def test_ranks_multi_word_query_that_substring_search_cannot_find(self):
+        self.sandbox.write_file("render/avatar.js", "function drawAvatarFace() { renderMouth(); }")
+        self.sandbox.write_file("docs/notes.md", "Shopping list and unrelated prose about lunch.")
+        query = "avatar face render"
+        # The existing exact-substring search finds nothing for this phrasing.
+        self.assertEqual(self.sandbox.search_files(query), [])
+        results = self.index.search(query)
+        self.assertEqual(results[0]["path"], "render/avatar.js")
+        self.assertIn("avatar", results[0]["matched"])
+
+    def test_unrelated_files_score_nothing(self):
+        self.sandbox.write_file("a.md", "kittens and puppies")
+        self.assertEqual(self.index.search("quantum chromodynamics"), [])
+
+    def test_index_follows_edits_and_deletions(self):
+        # Same byte length before and after, so only the timestamp reveals the
+        # edit — the cache must not be relying on file size alone.
+        self.sandbox.write_file("note.md", "polymerase aaaa")
+        self.assertTrue(self.index.search("polymerase"))
+        self.sandbox.write_file("note.md", "helicopter aaaa")
+        self.assertEqual(self.index.search("polymerase"), [])
+        self.assertTrue(self.index.search("helicopter"))
+        self.sandbox.safe_delete_file("note.md")
+        self.assertEqual(self.index.search("helicopter"), [])
+
+    def test_binary_and_oversized_files_are_skipped(self):
+        self.sandbox.write_file("keep.md", "readable marker text")
+        (self.sandbox.root / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n binary marker")
+        self.assertEqual(self.index.refresh(), 1)
 
 
 class TaskJournalTests(unittest.TestCase):
@@ -1529,6 +2220,81 @@ class WebBridgeTests(unittest.TestCase):
         result = self.bridge.check_workspace_assets("site")
         self.assertTrue(result["ok"])
         self.assertEqual([item["reference"] for item in result["broken"]], ["missing.js"])
+
+    def test_the_model_can_use_but_never_widen_folder_permissions(self):
+        outside = Path(self.temp.name) / "outside"
+        outside.mkdir()
+        (outside / "readme.txt").write_text("external content", encoding="utf-8")
+
+        # Without a grant the tools fail, and no tool exists for self-granting.
+        names = {d["function"]["name"] for d in self.bridge.agent.tool_definitions()}
+        self.assertNotIn("grant_folder_access", names)
+        denied = self.bridge.agent._execute_tool(
+            ToolCall("c1", "read_external_file", {"path": str(outside / "readme.txt")}), None)
+        self.assertFalse(denied["ok"])
+
+        # The user grants it through the bridge, which is UI-only.
+        granted = self.bridge.grant_folder_access(str(outside), "session")
+        self.assertTrue(granted["ok"])
+        allowed = self.bridge.agent._execute_tool(
+            ToolCall("c2", "read_external_file", {"path": str(outside / "readme.txt")}), None)
+        self.assertTrue(allowed["ok"])
+        self.assertEqual(allowed["content"], "external content")
+
+        listed = self.bridge.agent._execute_tool(
+            ToolCall("c3", "list_granted_folders", {}), None)
+        self.assertEqual(len(listed["folders"]), 1)
+
+        # Emergency stop closes it again immediately.
+        self.assertEqual(self.bridge.revoke_all_permissions()["revoked"], 1)
+        after = self.bridge.agent._execute_tool(
+            ToolCall("c4", "read_external_file", {"path": str(outside / "readme.txt")}), None)
+        self.assertFalse(after["ok"])
+        self.assertEqual(self.bridge.list_permissions()["active"], [])
+
+    def test_granting_a_protected_location_is_refused_through_the_bridge(self):
+        result = self.bridge.grant_folder_access(Path(self.temp.name).anchor or "/",
+                                                 "session")
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.bridge.list_permissions()["active"], [])
+
+    def test_vision_mode_is_settable_and_readable_through_settings(self):
+        # The override existed in config but had no Settings control, so the
+        # documented way to force images on or off was not actually reachable.
+        self.assertEqual(self.bridge.get_settings()["vision_mode"], "auto")
+        saved = self.bridge.save_settings({**self.bridge.get_settings(),
+                                           "vision_mode": "off"})
+        self.assertTrue(saved["ok"])
+        self.assertEqual(self.bridge.get_settings()["vision_mode"], "off")
+        self.assertFalse(self.bridge.agent.vision_enabled())
+        # An unknown value must fall back to the safe automatic guess.
+        self.bridge.save_settings({**self.bridge.get_settings(),
+                                   "vision_mode": "sometimes"})
+        self.assertEqual(self.bridge.get_settings()["vision_mode"], "auto")
+
+    def test_memory_export_writes_readable_json_into_the_workspace(self):
+        self.bridge.agent.memory.learn_fact("preference", "Concise answers", source="t",
+                                            confidence=.9, explicit=True)
+        result = self.bridge.export_personal_memory()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 1)
+        exported = json.loads(self.bridge.agent.sandbox.read_file(result["path"]))
+        self.assertEqual(exported["count"], 1)
+        self.assertEqual(exported["memories"][0]["value"], "Concise answers")
+        self.assertTrue(exported["exported"])
+
+    def test_memory_revert_round_trip_through_the_bridge(self):
+        item = self.bridge.agent.memory.learn_fact("tool", "Python for prototypes",
+                                                   source="t", confidence=.9, explicit=True)
+        self.assertTrue(self.bridge.update_personal_memory(
+            item["id"], {"value": "Rust for prototypes"})["ok"])
+        reverted = self.bridge.revert_personal_memory(item["id"])
+        self.assertTrue(reverted["ok"])
+        self.assertEqual(reverted["memory"]["value"], "Python for prototypes")
+        # A second revert has nothing left to restore and must fail cleanly.
+        again = self.bridge.revert_personal_memory(item["id"])
+        self.assertFalse(again["ok"])
+        self.assertIn("earlier version", again["error"])
 
     def test_personal_memory_bridge_is_transparent_editable_and_local(self):
         empty = self.bridge.get_personal_memory()
