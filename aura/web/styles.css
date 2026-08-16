@@ -252,7 +252,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .mind-footer { padding: 8px 20px 10px; border-top: 1px solid #182a40; background: #08111e; color: #c6d1de; font-size: 12px; }
 .mind-detail-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .mind-actions { display: flex; flex: 0 0 auto; gap: 6px; }
-.mind-footer small { display: block; margin-top: 4px; color: #586b83; }
+.mind-footer small { display: block; margin-top: 4px; color: #74879e; }
+.mind-legend { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 8px; }
+.mind-legend-item { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border: 1px solid #1e344c; border-radius: 999px; background: #0c1a2b; color: #c6d1de; font-size: 10px; cursor: pointer; }
+.mind-legend-item:hover { border-color: #2c4a68; }
+.mind-legend-item.off { color: #74879e; background: transparent; }
+.mind-legend-item.off .mind-legend-dot { background: #3a4c61 !important; }
+.mind-legend-dot { width: 8px; height: 8px; border-radius: 50%; }
 
 .workspace-view { position: absolute; z-index: 30; inset: 0; display: grid; grid-template-rows: 64px minmax(0, 1fr) 34px; background: #060e18; animation: workspace-in .22s ease-out; }
 @keyframes workspace-in { from { opacity: 0; transform: translateX(12px); } }

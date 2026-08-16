@@ -96,6 +96,8 @@ Replies can include compact task cards with tools used and buttons for **Details
 
 Select **Aura Mind** in the sidebar to open a living visual map inspired by a knowledge graph. It uses Aura's actual local state: remembered identity and preferences, recent conversation, task outcomes, tools used, workspace folders, and files. Nothing is uploaded or inferred from an external service.
 
+The legend along the bottom doubles as the filter: each layer — Identity, Memory, Preferences, Conversation, Tasks, Tools, Workspace — can be switched off to concentrate on the rest, and the header reports how much is hidden. A fact stored both as a preference and as something Aura learned about you is drawn once and hung under both headings rather than twice, a task with no recorded request is named instead of appearing as a blank circle, and a task is linked to the message that asked for it.
+
 Drag nodes to rearrange them, drag empty space to pan, use the mouse wheel to zoom, search to highlight matching knowledge, and select a node for details. Selected nodes can now be sent back to Aura as conversational context; file and folder nodes can open directly in the workspace explorer. **Refresh** reads the latest safe local state, **Fit** frames the current graph, and **Reset** rebuilds its force-directed layout. The graph caps displayed files for readability but never deletes or changes workspace data.
 
 ### Personal learning

@@ -2385,6 +2385,42 @@ class MindMapTests(unittest.TestCase):
         self.assertIn(("personal_memory", "personal:mem-one"), edge_pairs)
         self.assertTrue(any(node.kind == "tool" and node.label == "create file" for node in nodes))
 
+    def test_one_fact_is_one_node_even_when_stored_in_two_places(self):
+        """A preference Aura also learned about you was drawn twice, in two
+        branches, with no hint that it was the same thing."""
+        memory = {
+            "preferences": {"tone": "terse", "theme": "dark"},
+            "profile_memories": [{"id": "mem", "category": "preference",
+                                  "value": "tone = terse", "confidence": 1,
+                                  "confirmed": True, "pinned": False, "source": "user"}],
+        }
+        nodes, edges = build_mind_graph(memory, [], [])
+        edge_pairs = {(edge.source, edge.target) for edge in edges}
+        labels = [node.label for node in nodes]
+        self.assertEqual(sum("terse" in label for label in labels), 1)
+        # The single node hangs under both headings, so neither view loses it.
+        self.assertIn(("personal_memory", "personal:mem"), edge_pairs)
+        self.assertIn(("preferences", "personal:mem"), edge_pairs)
+        # An unrelated preference still gets its own node.
+        self.assertTrue(any(label.startswith("theme") for label in labels))
+
+    def test_a_task_without_a_request_is_named_rather_than_blank(self):
+        nodes, _ = build_mind_graph({}, [{"task_id": "t", "request": "",
+                                          "status": "error", "tools": []}], [])
+        task = next(node for node in nodes if node.node_id.startswith("task:"))
+        self.assertTrue(task.label.strip())
+        self.assertIn("no request", task.label.casefold())
+
+    def test_a_task_is_linked_to_the_message_that_asked_for_it(self):
+        memory = {"conversation": [{"role": "user", "text": "Build a clock"},
+                                   {"role": "assistant", "text": "Done."}]}
+        tasks = [{"task_id": "t", "request": "build a clock!", "status": "completed",
+                  "tools": []}]
+        _, edges = build_mind_graph(memory, tasks, [])
+        pairs = {(edge.source, edge.target) for edge in edges}
+        self.assertTrue(any(source.startswith("conversation:") and target.startswith("task:")
+                            for source, target in pairs))
+
     def test_graph_caps_visible_files(self):
         files = [f"project/file-{index}.txt" for index in range(100)]
         nodes, _ = build_mind_graph({}, [], files, max_files=12)

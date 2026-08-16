@@ -24,6 +24,18 @@ def _shorten(value: object, limit: int = 38) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def _comparable(value: object) -> str:
+    """A loose form for spotting the same fact written two ways.
+
+    `tone = terse` in preferences and `tone: terse` learned in conversation are
+    one fact, and the map should not claim Aura holds two.
+    """
+    return " ".join(
+        "".join(character if character.isalnum() or character.isspace() else " "
+                for character in str(value).casefold()).split()
+    )
+
+
 def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
                      max_files: int = 60) -> tuple[list[MindNode], list[MindEdge]]:
     """Build a bounded graph from Aura's real local state without reading file contents."""
@@ -70,23 +82,7 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
         add("person:name", "Name not set", "empty", "Aura has not been told the user's name yet.")
     link("identity", "person:name")
 
-    if preferences:
-        for index, (key, value) in enumerate(sorted(preferences.items())[:16]):
-            node_id = f"preference:{index}"
-            add(
-                node_id,
-                f"{_shorten(key, 18)}: {_shorten(value, 24)}",
-                "preference",
-                f"Saved preference\n{key} = {value}",
-            )
-            link("preferences", node_id)
-    else:
-        add(
-            "preference:empty", "No preferences yet", "empty",
-            "Ask Aura to remember a preference and it will appear here.",
-        )
-        link("preferences", "preference:empty")
-
+    remembered: dict[str, str] = {}
     if personal_memories:
         ordered_memories = sorted(
             personal_memories,
@@ -106,6 +102,7 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
                 f"Updated: {item.get('updated', '')}",
             )
             link("personal_memory", node_id)
+            remembered[_comparable(value)] = node_id
     else:
         add(
             "personal:empty", "Still getting to know you", "empty",
@@ -113,13 +110,39 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
         )
         link("personal_memory", "personal:empty")
 
+    if preferences:
+        for index, (key, value) in enumerate(sorted(preferences.items())[:16]):
+            # One fact, one node. A preference Aura also learned in conversation
+            # is hung under both headings rather than drawn twice.
+            existing = remembered.get(_comparable(f"{key} {value}"))
+            if existing:
+                link("preferences", existing)
+                continue
+            node_id = f"preference:{index}"
+            add(
+                node_id,
+                f"{_shorten(key, 18)}: {_shorten(value, 24)}",
+                "preference",
+                f"Saved preference\n{key} = {value}",
+            )
+            link("preferences", node_id)
+    else:
+        add(
+            "preference:empty", "No preferences yet", "empty",
+            "Ask Aura to remember a preference and it will appear here.",
+        )
+        link("preferences", "preference:empty")
+
     recent_conversation = conversations[-10:]
+    asked: dict[str, str] = {}
     if recent_conversation:
         previous_id: str | None = None
         for index, message in enumerate(recent_conversation):
             role = "Aura" if message.get("role") == "assistant" else "You"
             message_text = str(message.get("text", ""))
             node_id = f"conversation:{index}"
+            if role == "You":
+                asked.setdefault(_comparable(message_text), node_id)
             kind = "conversation_aura" if role == "Aura" else "conversation_user"
             add(
                 node_id, f"{role}: {_shorten(message_text)}", kind,
@@ -139,14 +162,22 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
             status = str(task.get("status") or "running").casefold()
             kind = "task_completed" if status == "completed" else (
                 "task_error" if status in {"error", "cancelled"} else "task_running")
-            request = str(task.get("request", "Untitled task"))
+            # An empty request used to draw a nameless circle: the key exists,
+            # so the dict default never applied.
+            request = str(task.get("request") or "").strip()
+            label = _shorten(request) if request else "Task with no request recorded"
             node_id = f"task:{index}:{task.get('task_id', index)}"
             add(
-                node_id, _shorten(request), kind,
-                f"Status: {status}\nTask: {task.get('task_id', '')}\n\n{request}\n\n"
+                node_id, label, kind,
+                f"Status: {status}\nTask: {task.get('task_id', '')}\n\n"
+                f"{request or 'No request text was recorded for this task.'}\n\n"
                 f"{task.get('summary', '')}",
             )
             link("tasks", node_id)
+            # The message that started it, rather than the same words twice.
+            origin = asked.get(_comparable(request)) if request else None
+            if origin:
+                link(origin, node_id)
             for tool in dict.fromkeys(str(item) for item in task.get("tools", []) if item):
                 if tool not in tool_nodes and len(tool_nodes) < 20:
                     tool_id = f"tool:{len(tool_nodes)}"

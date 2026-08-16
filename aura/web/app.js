@@ -2030,12 +2030,49 @@ function installResizers() {
   });
 }
 
+// The legend and the filters are one control: the key that explains a colour
+// is the switch that hides it, so there is nothing to learn twice.
+// Memory is listed before Preferences on purpose: a fact stored in both places
+// is one node, and it should be filed under the memory that can be edited.
+const MIND_LAYERS = [
+  { id: "identity", label: "Identity", color: "#81d69a" },
+  { id: "personal_memory", label: "Memory", color: "#f0abfc" },
+  { id: "preferences", label: "Preferences", color: "#f472b6" },
+  { id: "conversation", label: "Conversation", color: "#60a5fa" },
+  { id: "tasks", label: "Tasks", color: "#4ade80" },
+  { id: "capabilities", label: "Tools", color: "#fb923c" },
+  { id: "workspace", label: "Workspace", color: "#38bdf8" },
+];
+const hiddenMindLayers = new Set();
+
 const NODE_COLORS = {
   aura: "#80e0d2", category: "#d96cb6", identity: "#81d69a", preference: "#f472b6",
   conversation_user: "#60a5fa", conversation_aura: "#a78bfa", task_completed: "#4ade80",
   task_error: "#f87171", task_running: "#fbbf24", tool: "#fb923c", folder: "#22d3ee",
   file: "#38bdf8", personal_memory: "#f0abfc", personal_memory_pinned: "#facc15", empty: "#64748b",
 };
+
+function renderMindLegend() {
+  const legend = $("#mindLegend");
+  legend.replaceChildren();
+  for (const layer of MIND_LAYERS) {
+    const hidden = hiddenMindLayers.has(layer.id);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "mind-legend-item" + (hidden ? " off" : "");
+    button.setAttribute("aria-pressed", String(!hidden));
+    const swatch = document.createElement("span");
+    swatch.className = "mind-legend-dot";
+    swatch.style.background = layer.color;
+    button.append(swatch, document.createTextNode(layer.label));
+    button.addEventListener("click", () => {
+      if (hidden) hiddenMindLayers.delete(layer.id); else hiddenMindLayers.add(layer.id);
+      renderMindLegend();
+      mindGraph?.applyLayers();
+    });
+    legend.append(button);
+  }
+}
 
 function installFaceInteraction() {
   let frame = null;
@@ -2126,12 +2163,65 @@ class MindGraph {
   }
 
   load(data) {
-    this.nodes = data.nodes || [];
-    this.nodeMap = new Map(this.nodes.map(node => [node.node_id, node]));
-    this.edges = (data.edges || []).filter(edge => this.nodeMap.has(edge.source) && this.nodeMap.has(edge.target));
+    this.allNodes = data.nodes || [];
+    const known = new Set(this.allNodes.map(node => node.node_id));
+    this.allEdges = (data.edges || []).filter(edge => known.has(edge.source) && known.has(edge.target));
+    this.assignLayers();
     this.selected = null;
     elements.mindDetail.textContent = "Select a node to see what Aura knows about it.";
-    elements.mindSummary.textContent = `${this.nodes.length} thoughts • ${this.edges.length} connections`;
+    this.applyLayers();
+  }
+
+  assignLayers() {
+    // Layers are read from the graph itself: whatever hangs off a category is
+    // part of that layer.
+    this.layerOf = new Map();
+    const children = new Map();
+    for (const edge of this.allEdges) {
+      if (!children.has(edge.source)) children.set(edge.source, []);
+      children.get(edge.source).push(edge.target);
+    }
+    const categories = new Set(MIND_LAYERS.map(layer => layer.id));
+    // Whatever a category holds directly belongs to it, before anything else
+    // claims it. Tools hang off both `capabilities` and the tasks that used
+    // them; without this pass, hiding Tasks took the whole Tools layer with it.
+    for (const layer of MIND_LAYERS) {
+      this.layerOf.set(layer.id, layer.id);
+      for (const child of children.get(layer.id) || []) {
+        if (!categories.has(child) && !this.layerOf.has(child)) {
+          this.layerOf.set(child, layer.id);
+        }
+      }
+    }
+    // Then everything deeper — folders, files — follows its parent.
+    const queue = [...this.layerOf.keys()];
+    while (queue.length) {
+      const current = queue.shift();
+      for (const child of children.get(current) || []) {
+        if (categories.has(child) || this.layerOf.has(child)) continue;
+        this.layerOf.set(child, this.layerOf.get(current));
+        queue.push(child);
+      }
+    }
+  }
+
+  applyLayers() {
+    const visible = new Set(this.allNodes
+      .filter(node => node.node_id === "aura"
+        || !hiddenMindLayers.has(this.layerOf.get(node.node_id)))
+      .map(node => node.node_id));
+    this.nodes = this.allNodes.filter(node => visible.has(node.node_id));
+    this.nodeMap = new Map(this.nodes.map(node => [node.node_id, node]));
+    this.edges = this.allEdges.filter(edge => visible.has(edge.source) && visible.has(edge.target));
+    if (this.selected && !visible.has(this.selected)) {
+      this.selected = null;
+      updateMindActions(null);
+      elements.mindDetail.textContent = "Select a node to see what Aura knows about it.";
+    }
+    const hidden = this.allNodes.length - this.nodes.length;
+    elements.mindSummary.textContent =
+      `${this.nodes.length} thoughts • ${this.edges.length} connections`
+      + (hidden ? ` • ${hidden} hidden` : "");
     this.reset();
   }
 
@@ -2378,6 +2468,7 @@ const mindGraph = new MindGraph(elements.mindCanvas);
 async function openMind() {
   if (!elements.workspaceView.classList.contains("hidden")) closeWorkspaceExplorer();
   elements.mindView.classList.remove("hidden");
+  renderMindLegend();
   elements.mindDetail.textContent = "Reading Aura's local memory and workspace map…";
   try {
     const result = await callApi("get_mind_graph");
