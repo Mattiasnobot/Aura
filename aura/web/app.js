@@ -1225,19 +1225,29 @@ async function startNewSession() {
 }
 
 async function openSessions(focus = true) {
-  if (focus) openModal(elements.sessionsModal);
+  // Opening the panel starts from the whole list; refreshes keep what was typed.
+  if (focus) { $("#sessionSearch").value = ""; openModal(elements.sessionsModal); }
   const list = $("#sessionList");
   list.textContent = "Reading local conversations…";
   const showArchived = $("#showArchivedSessions").checked;
+  const query = $("#sessionSearch").value.trim();
   try {
-    const result = await callApi("list_sessions", 30, showArchived);
+    const result = query
+      ? await callApi("search_conversations", query, showArchived)
+      : await callApi("list_sessions", 30, showArchived);
     if (!result.ok) throw new Error(result.error);
+    // A later keystroke may have already asked a different question.
+    if ($("#sessionSearch").value.trim() !== query) return;
     list.replaceChildren();
-    const usable = (result.sessions || []).filter(item => item.messages > 0);
+    const usable = (result.sessions || []).filter(item => query || item.messages > 0);
     if (!usable.length) {
       const empty = document.createElement("div"); empty.className = "memory-empty";
-      const title = document.createElement("strong"); title.textContent = "No conversations yet";
-      const detail = document.createElement("p"); detail.textContent = "Say something and it will be kept here.";
+      const title = document.createElement("strong");
+      title.textContent = query ? "Nothing found" : "No conversations yet";
+      const detail = document.createElement("p");
+      detail.textContent = query
+        ? `No conversation contains every word of “${query}”.`
+        : "Say something and it will be kept here.";
       empty.append(title, detail); list.append(empty); return;
     }
     for (const session of usable) {
@@ -1245,7 +1255,9 @@ async function openSessions(focus = true) {
       const copy = document.createElement("div"); copy.className = "memory-item-copy";
       const head = document.createElement("div"); head.className = "memory-item-head";
       const badge = document.createElement("span"); badge.className = "memory-category";
-      badge.textContent = session.id === result.current ? "Current" : `${session.messages} messages`;
+      badge.textContent = session.id === result.current ? "Current"
+        : query ? `${session.hits} match${session.hits === 1 ? "" : "es"}`
+        : `${session.messages} messages`;
       head.append(badge);
       if (session.archived) {
         const archived = document.createElement("span"); archived.className = "memory-category";
@@ -1254,9 +1266,17 @@ async function openSessions(focus = true) {
       const value = document.createElement("p");
       value.textContent = session.title || "Untitled conversation";
       const meta = document.createElement("small");
-      const when = session.last_used || session.started;
+      const when = session.last_used || session.started
+        || (session.matches && session.matches.length ? session.matches[0].time : null);
       meta.textContent = when ? new Date(when).toLocaleString() : "";
       copy.append(head, value, meta);
+      for (const match of session.matches || []) {
+        const hit = document.createElement("p"); hit.className = "session-hit";
+        const who = document.createElement("strong");
+        who.textContent = (match.role === "user" ? "You" : "Aura") + ": ";
+        hit.append(who, document.createTextNode(match.snippet));
+        copy.append(hit);
+      }
       const actions = document.createElement("div"); actions.className = "memory-actions";
       if (session.id !== result.current) {
         const open = document.createElement("button");
@@ -1280,6 +1300,15 @@ async function openSessions(focus = true) {
         });
         actions.append(archive);
       }
+      // Exporting the conversation you are in is fine — it only reads it.
+      const exportButton = document.createElement("button");
+      exportButton.type = "button"; exportButton.textContent = "Export";
+      exportButton.addEventListener("click", async () => {
+        const written = await callApi("export_conversation", session.id);
+        if (!written.ok) return toast(written.error, true);
+        toast(`Saved to workspace as ${written.path}.`);
+      });
+      actions.append(exportButton);
       card.append(copy, actions); list.append(card);
     }
   } catch (error) {
@@ -2315,6 +2344,11 @@ function bindControls() {
   $("#permissionsButton").addEventListener("click", () => openPermissions());
   $("#sessionsButton").addEventListener("click", () => openSessions());
   $("#showArchivedSessions").addEventListener("change", () => openSessions(false));
+  let sessionSearchTimer = null;
+  $("#sessionSearch").addEventListener("input", () => {
+    clearTimeout(sessionSearchTimer);
+    sessionSearchTimer = setTimeout(() => openSessions(false), 220);
+  });
   $("#newSessionButton").addEventListener("click", startNewSession);
   $("#permissionGrant").addEventListener("submit", grantFolderAccess);
   $("#permissionRevokeAll").addEventListener("click", revokeAllPermissions);

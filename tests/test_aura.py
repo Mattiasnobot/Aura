@@ -1405,6 +1405,39 @@ class SessionTests(unittest.TestCase):
         restarted = AuraAgent(self.agent.sandbox.root, provider=MockProvider())
         self.assertEqual(restarted.db.sessions(10), [])
 
+    def test_search_finds_conversations_by_what_was_said(self):
+        self.agent.handle("remember my name is Maya")
+        maya = self.agent.session_id
+        self.agent.new_session()
+        self.agent.handle("remember preference tone = terse")
+        terse = self.agent.session_id
+
+        found = self.agent.db.search_messages("Maya")
+        self.assertEqual([item["id"] for item in found], [maya])
+        self.assertIn("Maya", found[0]["matches"][0]["snippet"])
+        # Every word has to appear, so an unrelated extra word rules a match out.
+        self.assertEqual(self.agent.db.search_messages("Maya terse"), [])
+        self.assertEqual([item["id"] for item in self.agent.db.search_messages("preference")],
+                         [terse])
+        self.assertEqual(self.agent.db.search_messages("   "), [])
+
+    def test_search_treats_wildcards_as_ordinary_characters(self):
+        """A `%` in the box must not quietly match everything."""
+        self.agent.handle("remember my name is Maya")
+        self.assertEqual(self.agent.db.search_messages("%"), [])
+        self.agent.handle("remember interest is 50% humidity")
+        self.assertTrue(self.agent.db.search_messages("50%"))
+
+    def test_search_can_be_limited_to_conversations_still_in_the_list(self):
+        self.agent.handle("remember my name is Maya")
+        archived = self.agent.session_id
+        self.agent.new_session()
+        self.agent.db.archive_session(archived)
+        self.assertEqual(self.agent.db.search_messages("Maya"), [])
+        self.assertEqual(
+            [item["id"] for item in self.agent.db.search_messages("Maya", 20, True)],
+            [archived])
+
     def test_archiving_hides_a_conversation_without_deleting_it(self):
         self.agent.handle("remember my name is Maya")
         archived_id = self.agent.session_id
@@ -2390,6 +2423,17 @@ class WebBridgeTests(unittest.TestCase):
         self.assertEqual(
             [item["id"] for item in self.bridge.list_sessions(30, True)["sessions"]],
             [current])
+
+    def test_exporting_a_conversation_writes_readable_markdown(self):
+        self.bridge.agent.handle("remember my name is Maya")
+        session_id = self.bridge.agent.session_id
+        written = self.bridge.export_conversation(session_id)
+        self.assertTrue(written["ok"])
+        text = (self.bridge.agent.sandbox.root / written["path"]).read_text(encoding="utf-8")
+        self.assertIn("remember my name is Maya", text)
+        self.assertIn("**You**", text)
+        self.assertIn("**Aura**", text)
+        self.assertFalse(self.bridge.export_conversation("does-not-exist")["ok"])
 
     def test_bridge_streams_structured_events_without_exposing_raw_tools(self):
         self.assertTrue(self.bridge.submit("hello")["ok"])

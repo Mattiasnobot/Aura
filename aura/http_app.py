@@ -32,6 +32,7 @@ API_METHODS = {
     "list_permissions", "grant_folder_access", "revoke_folder_access",
     "revoke_all_permissions", "external_changes", "undo_external_change", "resume_task",
     "list_sessions", "new_session", "open_session", "archive_session",
+    "search_conversations", "export_conversation",
     "create_workspace_folder", "create_workspace_file", "rename_workspace_item",
     "move_workspace_item", "copy_workspace_item", "delete_workspace_item",
     "list_trash", "restore_workspace_item", "undo_workspace_change",

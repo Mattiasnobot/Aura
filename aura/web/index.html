@@ -175,6 +175,7 @@
   <div id="sessionsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="sessionsTitle">
     <div class="modal-card memory-card">
       <header><div><h2 id="sessionsTitle">Conversations</h2><p>Every conversation is kept locally. Open one to continue it.</p></div><button class="modal-x" data-close="sessionsModal">×</button></header>
+      <div class="session-search"><input type="search" id="sessionSearch" placeholder="Search everything said in every conversation…" aria-label="Search conversations"></div>
       <div id="sessionList" class="memory-list"></div>
       <footer><label class="inline-check"><input type="checkbox" id="showArchivedSessions"> Show archived</label><span>Starting a new conversation never deletes an old one.</span><button class="primary-button" data-close="sessionsModal">Done</button></footer>
     </div>

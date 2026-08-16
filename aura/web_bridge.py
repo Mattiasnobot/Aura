@@ -204,6 +204,39 @@ class AuraWebBridge:
                    conversation=messages)
         return {"ok": True, "session_id": self.agent.session_id, "conversation": messages}
 
+    def search_conversations(self, query: str, include_archived: bool = False) -> dict:
+        return {"ok": True, "current": self.agent.session_id, "query": str(query),
+                "sessions": self.agent.db.search_messages(
+                    str(query), 20, bool(include_archived))}
+
+    def export_conversation(self, session_id: str) -> dict:
+        """Write one conversation into the workspace as readable Markdown."""
+        try:
+            messages = self.agent.db.session_messages(str(session_id), 10000)
+            if not messages:
+                return {"ok": False, "error": "That conversation has no messages."}
+            listed = {item["id"]: item
+                      for item in self.agent.db.sessions(200, include_archived=True)}
+            title = (listed.get(str(session_id)) or {}).get("title") or "Conversation"
+            lines = [f"# {title}", "",
+                     f"Exported {datetime.now().strftime('%Y-%m-%d %H:%M')} "
+                     f"· {len(messages)} messages · local only", ""]
+            for item in messages:
+                who = "You" if item["role"] == "user" else "Aura"
+                lines.append(f"**{who}** · {item['time']}")
+                lines.append("")
+                lines.append(str(item["text"]).rstrip())
+                lines.append("")
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            target = self.agent.sandbox.write_file(
+                f"aura-conversation-{stamp}.md", "\n".join(lines))
+            path = target.relative_to(self.agent.sandbox.root).as_posix()
+            self.agent.log.record("export_conversation", "ok", path=path,
+                                  session_id=str(session_id), messages=len(messages))
+            return {"ok": True, "path": path, "messages": len(messages)}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
     def archive_session(self, session_id: str, archived: bool = True) -> dict:
         """Hide a conversation from the list. Nothing is deleted; it comes back
         with `Show archived`."""

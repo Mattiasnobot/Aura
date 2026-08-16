@@ -282,6 +282,58 @@ class Database:
                  "archived": bool(row["archived"]), "messages": int(row["messages"] or 0),
                  "last_used": row["last_used"]} for row in rows]
 
+    @staticmethod
+    def _like_literal(term: str) -> str:
+        """Escape a user's search term so `%`, `_`, and `\\` match themselves."""
+        for character in ("\\", "%", "_"):
+            term = term.replace(character, "\\" + character)
+        return term
+
+    def search_messages(self, query: str, limit: int = 20,
+                        include_archived: bool = False) -> list[dict]:
+        """Find conversations containing every word of the query.
+
+        Every term must appear somewhere in the same message, which is what
+        people expect from a search box; results come back newest first with
+        the matching lines, so a conversation is recognisable without opening it.
+        """
+        terms = [term for term in str(query).split() if term]
+        if not terms:
+            return []
+        condition = " AND ".join("m.text LIKE ? ESCAPE '\\'" for _ in terms)
+        rows = self._query(
+            "SELECT m.session_id, m.role, m.text, m.time, s.title, s.archived "
+            "FROM messages m JOIN sessions s ON s.id = m.session_id "
+            f"WHERE {condition} AND (? OR s.archived = 0) "
+            "ORDER BY m.rowid_alias DESC LIMIT ?",
+            tuple(f"%{self._like_literal(term)}%" for term in terms)
+            + (1 if include_archived else 0, max(int(limit), 1) * 20))
+
+        found: dict[str, dict] = {}
+        for row in rows:
+            session = found.setdefault(row["session_id"], {
+                "id": row["session_id"], "title": row["title"],
+                "archived": bool(row["archived"]), "hits": 0, "matches": []})
+            session["hits"] += 1
+            if len(session["matches"]) < 3:
+                session["matches"].append({
+                    "role": row["role"], "time": row["time"],
+                    "snippet": self._snippet(row["text"], terms[0])})
+            if len(found) >= int(limit) and row["session_id"] not in found:
+                break
+        return list(found.values())[:int(limit)]
+
+    @staticmethod
+    def _snippet(text: str, term: str, width: int = 160) -> str:
+        """A readable window around the first match, not the first 160 characters."""
+        flat = " ".join(str(text).split())
+        found = flat.casefold().find(term.casefold())
+        if found < 0 or len(flat) <= width:
+            return flat[:width] + ("…" if len(flat) > width else "")
+        start = max(0, found - width // 3)
+        end = min(len(flat), start + width)
+        return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
+
     def archive_session(self, session_id: str, archived: bool = True) -> None:
         self._execute("UPDATE sessions SET archived = ? WHERE id = ?",
                       (1 if archived else 0, str(session_id)))

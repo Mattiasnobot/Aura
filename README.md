@@ -77,7 +77,9 @@ With Piper, mouth opening follows the amplitude envelope measured directly from 
 
 ### Conversations
 
-**New** starts a fresh conversation and **Conversations** lists the earlier ones, each named after its first message and kept locally in `aura.db`. Opening one restores it as Aura's live context, so she continues where that conversation left off. **Clear** only empties the view; starting a new conversation never deletes an old one, and a launch you never spoke in is not kept as one. **Archive** hides a conversation from the list without deleting it — tick **Show archived** to see it again and **Restore** it. The current conversation cannot be archived; start a new one first.
+**New** starts a fresh conversation and **Conversations** lists the earlier ones, each named after its first message and kept locally in `aura.db`. Opening one restores it as Aura's live context, so she continues where that conversation left off. **Clear** only empties the view; starting a new conversation never deletes an old one, and a launch you never spoke in is not kept as one.
+
+The search box looks through everything said in every conversation and shows the matching lines, so a conversation is recognisable without opening it; every word typed has to appear in the same message, and `%` or `_` search for themselves. **Export** writes one conversation into the workspace as readable Markdown. **Archive** hides a conversation from the list without deleting it — tick **Show archived** to see it again and **Restore** it. The current conversation cannot be archived; start a new one first.
 
 ### Interactive workspace
 
