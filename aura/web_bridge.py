@@ -114,6 +114,7 @@ class AuraWebBridge:
             event_cursor = self._event_sequence
         return {
             "app": "Aura",
+            "session_id": self.agent.session_id,
             "workspace": str(self.agent.sandbox.root),
             "conversation": conversation,
             "actions": self._session_actions(60),
@@ -177,6 +178,39 @@ class AuraWebBridge:
         self._push("user_message", text=text)
         self._push("busy", value=True)
         threading.Thread(target=self._work, args=(text,), daemon=True, name="aura-agent").start()
+        return {"ok": True}
+
+    def list_sessions(self, limit: int = 30, include_archived: bool = False) -> dict:
+        return {"ok": True, "current": self.agent.session_id,
+                "sessions": self.agent.db.sessions(int(limit), bool(include_archived))}
+
+    def new_session(self) -> dict:
+        with self._state_lock:
+            if self._busy:
+                return {"ok": False, "error": "Finish or stop the current task first."}
+        session_id = self.agent.new_session()
+        self._push("session_changed", session_id=session_id, conversation=[])
+        return {"ok": True, "session_id": session_id, "conversation": []}
+
+    def open_session(self, session_id: str) -> dict:
+        with self._state_lock:
+            if self._busy:
+                return {"ok": False, "error": "Finish or stop the current task first."}
+        try:
+            messages = self.agent.open_session(str(session_id))
+        except KeyError as exc:
+            return {"ok": False, "error": str(exc)}
+        self._push("session_changed", session_id=self.agent.session_id,
+                   conversation=messages)
+        return {"ok": True, "session_id": self.agent.session_id, "conversation": messages}
+
+    def archive_session(self, session_id: str, archived: bool = True) -> dict:
+        """Hide a conversation from the list. Nothing is deleted; it comes back
+        with `Show archived`."""
+        if archived and str(session_id) == self.agent.session_id:
+            return {"ok": False,
+                    "error": "Start a new conversation before archiving this one."}
+        self.agent.db.archive_session(str(session_id), bool(archived))
         return {"ok": True}
 
     def resume_task(self, task_id: str) -> dict:

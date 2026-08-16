@@ -58,6 +58,22 @@ CREATE TABLE IF NOT EXISTS trash (
     deleted_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS messages (
+    rowid_alias INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    text TEXT NOT NULL,
+    time TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS messages_session ON messages (session_id);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    title TEXT,
+    started TEXT NOT NULL,
+    archived INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS external_changes (
     id TEXT PRIMARY KEY,
     path TEXT NOT NULL,
@@ -218,6 +234,57 @@ class Database:
                         event[key] = {}
             events.append(event)
         return events
+
+    # -------------------------------------------------------------- sessions
+
+    def start_session(self, session_id: str, title: str | None = None) -> None:
+        self._execute(
+            "INSERT OR IGNORE INTO sessions (id, title, started) VALUES (?, ?, ?)",
+            (str(session_id), title, _now()))
+
+    def add_message(self, session_id: str, role: str, text: str, time: str) -> None:
+        self.start_session(session_id)
+        self._execute(
+            "INSERT INTO messages (session_id, role, text, time) VALUES (?, ?, ?, ?)",
+            (str(session_id), str(role), str(text), str(time)))
+        # The first thing said names the conversation until the user renames it.
+        rows = self._query("SELECT title FROM sessions WHERE id = ?", (str(session_id),))
+        if rows and not rows[0]["title"] and str(role) == "user":
+            self.set_session_title(session_id, str(text).strip().splitlines()[0][:80])
+
+    def set_session_title(self, session_id: str, title: str) -> None:
+        self._execute("UPDATE sessions SET title = ? WHERE id = ?",
+                      (str(title), str(session_id)))
+
+    def session_messages(self, session_id: str, limit: int = 200) -> list[dict]:
+        rows = self._query(
+            "SELECT role, text, time FROM messages WHERE session_id = ? "
+            "ORDER BY rowid_alias DESC LIMIT ?", (str(session_id), int(limit)))
+        return [{"role": row["role"], "text": row["text"], "time": row["time"]}
+                for row in reversed(rows)]
+
+    def sessions(self, limit: int = 30, include_archived: bool = False) -> list[dict]:
+        """List conversations worth showing, newest activity first.
+
+        Sessions with no messages are left out: a launch or a `New` click that
+        was never used is not a conversation, and listing those empties would
+        push real conversations past the limit.
+        """
+        rows = self._query(
+            "SELECT s.id, s.title, s.started, s.archived, "
+            "       COUNT(m.rowid_alias) AS messages, MAX(m.time) AS last_used "
+            "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
+            "WHERE (? OR s.archived = 0) "
+            "GROUP BY s.id HAVING messages > 0 "
+            "ORDER BY COALESCE(MAX(m.time), s.started) DESC LIMIT ?",
+            (1 if include_archived else 0, int(limit)))
+        return [{"id": row["id"], "title": row["title"], "started": row["started"],
+                 "archived": bool(row["archived"]), "messages": int(row["messages"] or 0),
+                 "last_used": row["last_used"]} for row in rows]
+
+    def archive_session(self, session_id: str, archived: bool = True) -> None:
+        self._execute("UPDATE sessions SET archived = ? WHERE id = ?",
+                      (1 if archived else 0, str(session_id)))
 
     # --------------------------------------------------------------- changes
 

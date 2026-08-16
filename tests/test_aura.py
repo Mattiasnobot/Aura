@@ -763,6 +763,13 @@ class VisionTests(unittest.TestCase):
         target, combined = AuraAgent._extract_artifact_contract(
             "Create hello.py in the demo folder")
         self.assertEqual((target, combined), ("demo", ["demo/hello.py"]))
+        # A resume brief names the same file bare and qualified; the completion
+        # evidence used to list "shop/style.css" twice because of it.
+        _, resumed = AuraAgent._extract_artifact_contract(
+            "Build a small site in the shop folder with index.html, style.css and "
+            "about.html.\nRequested files that still do not exist:\n"
+            "- shop/style.css\n- shop/about.html")
+        self.assertEqual(resumed, ["shop/index.html", "shop/style.css", "shop/about.html"])
 
     def test_capture_page_rejects_non_html_and_missing_pages(self):
         self.agent.sandbox.write_file("notes.txt", "plain text")
@@ -1341,6 +1348,77 @@ class MigrationTests(unittest.TestCase):
     def test_migration_is_skipped_when_there_is_nothing_to_import(self):
         db = Database(self.meta / "aura.db")
         self.assertEqual(db.migrate_jsonl(self.meta), {})
+
+
+class SessionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_a_new_conversation_keeps_the_old_one_on_disk(self):
+        self.agent.handle("remember my name is Maya")
+        first = self.agent.session_id
+        self.assertTrue(self.agent.memory.data["conversation"])
+
+        self.agent.new_session()
+        self.assertNotEqual(self.agent.session_id, first)
+        # The live context is empty, but nothing was destroyed.
+        self.assertEqual(self.agent.memory.data["conversation"], [])
+        kept = self.agent.db.session_messages(first)
+        self.assertTrue(any("Maya" in item["text"] for item in kept))
+
+    def test_reopening_a_conversation_restores_it_as_live_context(self):
+        self.agent.handle("remember my name is Maya")
+        first = self.agent.session_id
+        self.agent.new_session()
+        self.agent.handle("remember preference tone = terse")
+
+        restored = self.agent.open_session(first)
+        self.assertEqual(self.agent.session_id, first)
+        self.assertTrue(any("Maya" in item["text"] for item in restored))
+        # The provider context follows the reopened conversation.
+        self.assertTrue(any("Maya" in item["text"]
+                            for item in self.agent.memory.data["conversation"]))
+
+    def test_a_conversation_is_titled_by_its_first_message(self):
+        self.agent.handle("Build the invoice tool")
+        listed = {item["id"]: item for item in self.agent.db.sessions(10)}
+        self.assertIn("Build the invoice tool", listed[self.agent.session_id]["title"] or "")
+
+    def test_the_session_survives_a_restart(self):
+        self.agent.handle("remember my name is Maya")
+        expected = self.agent.session_id
+        reopened = AuraAgent(self.agent.sandbox.root, provider=MockProvider())
+        self.assertEqual(reopened.session_id, expected)
+
+    def test_opening_an_unknown_conversation_is_refused(self):
+        with self.assertRaises(KeyError):
+            self.agent.open_session("does-not-exist")
+
+    def test_an_unused_session_never_appears_as_a_conversation(self):
+        """Launching Aura, or clicking New and saying nothing, is not a conversation."""
+        self.agent.new_session()
+        self.assertEqual(self.agent.db.sessions(10), [])
+        restarted = AuraAgent(self.agent.sandbox.root, provider=MockProvider())
+        self.assertEqual(restarted.db.sessions(10), [])
+
+    def test_archiving_hides_a_conversation_without_deleting_it(self):
+        self.agent.handle("remember my name is Maya")
+        archived_id = self.agent.session_id
+        self.agent.new_session()
+        self.agent.db.archive_session(archived_id)
+
+        self.assertEqual([item["id"] for item in self.agent.db.sessions(10)], [])
+        listed = self.agent.db.sessions(10, include_archived=True)
+        self.assertEqual([item["id"] for item in listed], [archived_id])
+        self.assertTrue(listed[0]["archived"])
+        # Still openable, and restoring puts it back in the ordinary list.
+        self.assertTrue(self.agent.db.session_messages(archived_id))
+        self.agent.db.archive_session(archived_id, False)
+        self.assertEqual([item["id"] for item in self.agent.db.sessions(10)], [archived_id])
 
 
 class ResumeTests(unittest.TestCase):
@@ -2296,6 +2374,23 @@ class WebBridgeTests(unittest.TestCase):
             finally:
                 bridge.shutdown()
 
+    def test_archiving_the_live_conversation_is_refused(self):
+        """Archiving what you are currently in would hide a conversation that
+        keeps collecting messages, so it has to be left behind first."""
+        self.bridge.agent.handle("hello")
+        current = self.bridge.agent.session_id
+        refused = self.bridge.archive_session(current)
+        self.assertFalse(refused["ok"])
+        self.assertEqual([item["id"] for item in self.bridge.list_sessions()["sessions"]],
+                         [current])
+
+        self.bridge.new_session()
+        self.assertTrue(self.bridge.archive_session(current)["ok"])
+        self.assertEqual(self.bridge.list_sessions()["sessions"], [])
+        self.assertEqual(
+            [item["id"] for item in self.bridge.list_sessions(30, True)["sessions"]],
+            [current])
+
     def test_bridge_streams_structured_events_without_exposing_raw_tools(self):
         self.assertTrue(self.bridge.submit("hello")["ok"])
         events = []
@@ -2983,6 +3078,27 @@ class HTMLServerTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as raised:
             urlopen(request, timeout=3)
         self.assertEqual(raised.exception.code, 403)
+
+    def test_loopback_is_accepted_by_either_name_but_nothing_else_is(self):
+        """Opening the page as localhost used to leave the whole UI dead with
+        'Unauthorized local request'; both loopback names are the same machine."""
+        port = self.server.server_address[1]
+        for origin, expected in ((f"http://localhost:{port}", True),
+                                 (f"http://127.0.0.1:{port}", True),
+                                 ("http://evil.example", False)):
+            request = Request(
+                self.base + "/api/call",
+                data=b'{"method":"get_bootstrap","args":[]}',
+                headers={"Content-Type": "application/json", "Cookie": self.cookie,
+                         "Origin": origin, "X-Aura-Client": "html-ui-v1"},
+                method="POST")
+            if expected:
+                with urlopen(request, timeout=3) as response:
+                    self.assertTrue(json.loads(response.read().decode("utf-8"))["ok"])
+            else:
+                with self.assertRaises(HTTPError) as raised:
+                    urlopen(request, timeout=3)
+                self.assertEqual(raised.exception.code, 403)
 
     def test_agent_can_inspect_local_http_without_command_execution(self):
         result = self.bridge.agent._execute_tool(ToolCall("http", "http_get", {

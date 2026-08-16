@@ -504,8 +504,9 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
    - Surface proposals before execution, enforce retry/time/cost budgets, and provide pause and emergency-stop controls.
    - **Gate:** a scheduled local task runs only within its saved permissions and produces a concise notification and audit record.
 
-49. **UX consolidation and release readiness — Planned (P3)**
-   - Add named conversation/project sessions with search, archive, export, and a true new-conversation flow.
+49. **UX consolidation and release readiness — In progress (P3)**
+   - **Done — conversation sessions.** Every message is kept in `aura.db` against a session id, while `memory.data["conversation"]` stays the current session's view so the provider context, bootstrap, and Aura Mind read it unchanged. **New** starts a fresh conversation without destroying the old one; **Conversations** lists them, titled by their first message; opening one restores it as the live context. A session row is written on the first message, so launching Aura and saying nothing leaves no empty conversation behind. **Archive** hides a conversation and **Show archived** brings it back; the live conversation is refused, since archiving what is still collecting messages would hide it mid-use. Conversations are user content and are not touched by the 30-day recovery sweep.
+   - Still open here: searching conversations and exporting one.
    - Refine Aura Mind with filters, a legend, project/task/memory layers, relationship editing, and the live task plan; remove duplicated or misleading nodes.
    - Add sticky modal actions, keyboard focus handling, screen-reader summaries, contrast/reduced-motion checks, diagnostics export, first-run onboarding, and dependable packaging/updating.
    - **Gate:** a new user can install, connect LM Studio, choose voice and permissions, complete a first project, understand failures, and recover without opening source files.

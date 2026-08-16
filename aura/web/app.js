@@ -23,7 +23,7 @@ const elements = {
   workspacePreview: $("#workspacePreview"), previewPath: $("#previewPath"), previewMeta: $("#previewMeta"),
   previewAsk: $("#previewAsk"), previewOpen: $("#previewOpen"), previewCompare: $("#previewCompare"),
   settingsModal: $("#settingsModal"), tasksModal: $("#tasksModal"), memoryModal: $("#memoryModal"),
-  permissionsModal: $("#permissionsModal"),
+  permissionsModal: $("#permissionsModal"), sessionsModal: $("#sessionsModal"),
   memoryList: $("#memoryList"),
   promptModal: $("#promptModal"), promptForm: $("#promptForm"), promptTitle: $("#promptTitle"),
   promptHint: $("#promptHint"), promptInput: $("#promptInput"), promptStatus: $("#promptStatus"),
@@ -1209,6 +1209,84 @@ function populateMemoryCategories(select, selected = "personal") {
   setSelectValue(select, selected);
 }
 
+function renderConversation(messages) {
+  elements.conversation.replaceChildren();
+  streamMessage = null;
+  for (const item of messages || []) {
+    if (item && item.role && item.text) addMessage(item.role, item.text);
+  }
+}
+
+async function startNewSession() {
+  const result = await callApi("new_session");
+  if (!result.ok) return toast(result.error, true);
+  renderConversation([]);
+  toast("Started a new conversation. The previous one is kept.");
+}
+
+async function openSessions(focus = true) {
+  if (focus) openModal(elements.sessionsModal);
+  const list = $("#sessionList");
+  list.textContent = "Reading local conversations…";
+  const showArchived = $("#showArchivedSessions").checked;
+  try {
+    const result = await callApi("list_sessions", 30, showArchived);
+    if (!result.ok) throw new Error(result.error);
+    list.replaceChildren();
+    const usable = (result.sessions || []).filter(item => item.messages > 0);
+    if (!usable.length) {
+      const empty = document.createElement("div"); empty.className = "memory-empty";
+      const title = document.createElement("strong"); title.textContent = "No conversations yet";
+      const detail = document.createElement("p"); detail.textContent = "Say something and it will be kept here.";
+      empty.append(title, detail); list.append(empty); return;
+    }
+    for (const session of usable) {
+      const card = document.createElement("article"); card.className = "memory-item";
+      const copy = document.createElement("div"); copy.className = "memory-item-copy";
+      const head = document.createElement("div"); head.className = "memory-item-head";
+      const badge = document.createElement("span"); badge.className = "memory-category";
+      badge.textContent = session.id === result.current ? "Current" : `${session.messages} messages`;
+      head.append(badge);
+      if (session.archived) {
+        const archived = document.createElement("span"); archived.className = "memory-category";
+        archived.textContent = "Archived"; head.append(archived);
+      }
+      const value = document.createElement("p");
+      value.textContent = session.title || "Untitled conversation";
+      const meta = document.createElement("small");
+      const when = session.last_used || session.started;
+      meta.textContent = when ? new Date(when).toLocaleString() : "";
+      copy.append(head, value, meta);
+      const actions = document.createElement("div"); actions.className = "memory-actions";
+      if (session.id !== result.current) {
+        const open = document.createElement("button");
+        open.type = "button"; open.textContent = "Open";
+        open.addEventListener("click", async () => {
+          const opened = await callApi("open_session", session.id);
+          if (!opened.ok) return toast(opened.error, true);
+          renderConversation(opened.conversation);
+          closeModal(elements.sessionsModal);
+          toast("Continuing that conversation.");
+        });
+        actions.append(open);
+        const archive = document.createElement("button");
+        archive.type = "button";
+        archive.textContent = session.archived ? "Restore" : "Archive";
+        archive.addEventListener("click", async () => {
+          const changed = await callApi("archive_session", session.id, !session.archived);
+          if (!changed.ok) return toast(changed.error, true);
+          await openSessions(false);
+          toast(session.archived ? "Conversation restored." : "Archived. Nothing was deleted.");
+        });
+        actions.append(archive);
+      }
+      card.append(copy, actions); list.append(card);
+    }
+  } catch (error) {
+    list.textContent = String(error);
+  }
+}
+
 async function openPermissions(focus = true) {
   if (focus) openModal(elements.permissionsModal);
   const list = $("#permissionList");
@@ -2235,6 +2313,9 @@ function bindControls() {
   $("#mindButton").addEventListener("click", openMind);
   $("#memoryButton").addEventListener("click", () => openPersonalMemory());
   $("#permissionsButton").addEventListener("click", () => openPermissions());
+  $("#sessionsButton").addEventListener("click", () => openSessions());
+  $("#showArchivedSessions").addEventListener("change", () => openSessions(false));
+  $("#newSessionButton").addEventListener("click", startNewSession);
   $("#permissionGrant").addEventListener("submit", grantFolderAccess);
   $("#permissionRevokeAll").addEventListener("click", revokeAllPermissions);
   $("#settingsButton").addEventListener("click", openSettings);

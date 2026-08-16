@@ -13,8 +13,10 @@ import shutil
 import sys
 import tempfile
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from uuid import uuid4
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -87,6 +89,11 @@ class AuraAgent:
         self.current_task_id: str | None = None
         self.last_learned: list[dict] = []
         self.last_recalled: list[dict] = []
+        self.session_id = str(self.config.data.get("current_session") or "") or uuid4().hex[:12]
+        self.config.update(current_session=self.session_id)
+        # No session row is written here: `add_message` creates one on the first
+        # thing actually said, so launching Aura and closing it again leaves no
+        # empty conversation behind.
         self._sweep_retention()
 
     MUTATING_TOOL_NAMES = {
@@ -94,6 +101,38 @@ class AuraAgent:
         "replace_in_file", "apply_edits", "copy_file", "move_file", "safe_delete_file",
         "create_archive", "extract_archive", "import_file", "write_external_file",
     }
+
+    def _remember(self, role: str, text: str) -> None:
+        """Keep a message in the live context and in durable session history.
+
+        `memory.data["conversation"]` stays the *current session's* view, so the
+        provider context, bootstrap, and Aura Mind keep reading it unchanged.
+        """
+        self.memory.remember_message(role, text)
+        self.db.add_message(self.session_id, role, text,
+                            datetime.now(timezone.utc).isoformat())
+
+    def new_session(self) -> str:
+        """Begin a fresh conversation, leaving the previous one intact on disk."""
+        self.session_id = uuid4().hex[:12]
+        self.config.update(current_session=self.session_id)
+        self.memory.data["conversation"] = []
+        self.memory.save()
+        self.log.record("new_session", "ok", session_id=self.session_id)
+        return self.session_id
+
+    def open_session(self, session_id: str) -> list[dict]:
+        """Switch to an earlier conversation and restore it as the live context."""
+        messages = self.db.session_messages(str(session_id), self.memory.limit)
+        if not messages:
+            raise KeyError(f"No conversation {session_id}")
+        self.session_id = str(session_id)
+        self.config.update(current_session=self.session_id)
+        self.memory.data["conversation"] = [dict(item) for item in messages]
+        self.memory.save()
+        self.log.record("open_session", "ok", session_id=self.session_id,
+                        messages=len(messages))
+        return messages
 
     def resume_brief(self, task_id: str) -> dict:
         """Describe an interrupted task from what is verifiably on disk now.
@@ -319,7 +358,7 @@ class AuraAgent:
         task_id = self.tasks.start(message)
         self.current_task_id = task_id
         self.sandbox.active_task_id = task_id
-        self.memory.remember_message("user", message)
+        self._remember("user", message)
         self.last_recalled = []
         self.last_learned = (
             self.memory.learn_from_message(message, project=self._extract_artifact_contract(message)[0])
@@ -371,7 +410,7 @@ class AuraAgent:
             self.log.record("request", "error", error=str(exc))
             set_state("error")
             response = f"I couldn’t complete that safely: {exc}"
-        self.memory.remember_message("assistant", response)
+        self._remember("assistant", response)
         self.tasks.finish(task_id, status, response)
         self.current_task_id = None
         self.sandbox.active_task_id = None
@@ -886,8 +925,15 @@ class AuraAgent:
                         "my", "your", "our", "his", "her", "their", "its", "some", "any"}:
                     target = candidate
                     break
-        paths = [f"{target}/{name}" if target and "/" not in name and "\\" not in name else name
-                 for name in filenames]
+        # Deduplicate *after* the folder is applied: a resume brief names the same
+        # file both bare ("style.css") and qualified ("shop/style.css"), which used
+        # to make one file appear twice in the completion evidence.
+        paths: list[str] = []
+        for name in filenames:
+            resolved = (f"{target}/{name}"
+                        if target and "/" not in name and "\\" not in name else name)
+            if resolved not in paths:
+                paths.append(resolved)
         return target, paths
 
     @staticmethod

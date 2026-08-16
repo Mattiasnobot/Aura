@@ -75,6 +75,10 @@ With Piper, mouth opening follows the amplitude envelope measured directly from 
 - **Hide/Show action log** gives the conversation more room. **Activity** shows friendly events from the current Aura session, while **Diagnostics** exposes the corresponding technical names and details; the durable audit history is still preserved locally in `aura.db`.
 - Use the **+** button or drag up to five files anywhere over Aura to copy them into the protected workspace.
 
+### Conversations
+
+**New** starts a fresh conversation and **Conversations** lists the earlier ones, each named after its first message and kept locally in `aura.db`. Opening one restores it as Aura's live context, so she continues where that conversation left off. **Clear** only empties the view; starting a new conversation never deletes an old one, and a launch you never spoke in is not kept as one. **Archive** hides a conversation from the list without deleting it — tick **Show archived** to see it again and **Restore** it. The current conversation cannot be archived; start a new one first.
+
 ### Interactive workspace
 
 Select **Workspace** in the sidebar to open Aura's built-in local explorer. It provides file filtering, sizes, safe text/code previews, sandboxed HTML/SVG rendering, image previews, and direct **Ask Aura** and **Open** actions. Rendered pages receive a protected read-only workspace URL, so their relative stylesheets, images, fonts, and links work correctly. Scripts, forms, outside connections, and embedded frames remain disabled. Imported files use recoverable workspace snapshots and are renamed safely instead of overwriting an existing file.
@@ -142,7 +146,8 @@ This checks Python, the local HTML service and assets, the LM Studio server, and
 - Deleted files move to `aura-workspace/.aura-trash`.
 - Commands use argument arrays (no command shell), run with the workspace as their working directory, capture output, and time out.
 - Version checks, Python `compileall`/`py_compile`/`json.tool`, and Node syntax checks can be auto-approved when they only target workspace paths. Project runtimes, test suites, package scripts/installers, external HTTP requests, and desktop launches require visible confirmation.
-- Actions, tasks, workspace changes, and trash records live in `aura-workspace/.aura/aura.db`; settings, personal memory, and permissions stay as readable JSON beside it.
+- Actions, tasks, workspace changes, trash records, and conversations live in `aura-workspace/.aura/aura.db`; settings, personal memory, and permissions stay as readable JSON beside it.
+- The local interface answers on `127.0.0.1` and `localhost` only, and every API call additionally needs the session cookie and Aura's own client header.
 - Recovery is kept for 30 days or 500 changes, whichever ends first. Expiring a change removes its backups in the same transaction, and Aura never deletes a backup another record still needs.
 
 ## Tests

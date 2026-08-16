@@ -31,6 +31,7 @@ API_METHODS = {
     "export_personal_memory",
     "list_permissions", "grant_folder_access", "revoke_folder_access",
     "revoke_all_permissions", "external_changes", "undo_external_change", "resume_task",
+    "list_sessions", "new_session", "open_session", "archive_session",
     "create_workspace_folder", "create_workspace_file", "rename_workspace_item",
     "move_workspace_item", "copy_workspace_item", "delete_workspace_item",
     "list_trash", "restore_workspace_item", "undo_workspace_change",
@@ -53,6 +54,16 @@ class AuraHTTPServer(ThreadingHTTPServer):
     @property
     def origin(self) -> str:
         return f"http://127.0.0.1:{self.server_address[1]}"
+
+    @property
+    def allowed_origins(self) -> set[str]:
+        """`localhost` is the same loopback interface, and people type it.
+
+        Only these two names are accepted: any other host — including a domain
+        that resolves to 127.0.0.1 — still sends its own Origin and is refused.
+        """
+        port = self.server_address[1]
+        return {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
 
 
 class AuraRequestHandler(BaseHTTPRequestHandler):
@@ -223,7 +234,7 @@ class AuraRequestHandler(BaseHTTPRequestHandler):
 
     def _authorized(self) -> bool:
         origin = self.headers.get("Origin")
-        if origin and origin != self.server.origin:
+        if origin and origin not in self.server.allowed_origins:
             return False
         if self.headers.get("X-Aura-Client") != "html-ui-v1":
             return False

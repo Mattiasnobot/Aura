@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#07101c">
   <title>Aura</title>
+  <!-- Inline so the browser never asks for /favicon.ico the local server has no answer for. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2307101c'/%3E%3Ccircle cx='16' cy='16' r='7' fill='none' stroke='%235be0c8' stroke-width='2.5'/%3E%3Ccircle cx='16' cy='16' r='2.5' fill='%235be0c8'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -64,6 +66,8 @@
         </div>
         <div class="top-actions">
           <button id="toggleLogButton" class="ghost-button">Action log</button>
+          <button id="sessionsButton" class="ghost-button">Conversations</button>
+          <button id="newSessionButton" class="ghost-button">New</button>
           <button id="clearButton" class="ghost-button">Clear</button>
         </div>
       </header>
@@ -164,6 +168,15 @@
       </form>
       <div id="memoryList" class="memory-list"></div>
       <footer><span>Credentials and sensitive personal details are never learned automatically.</span><button id="memoryExport" type="button">Export</button><button class="primary-button" data-close="memoryModal">Done</button></footer>
+    </div>
+  </div>
+
+
+  <div id="sessionsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="sessionsTitle">
+    <div class="modal-card memory-card">
+      <header><div><h2 id="sessionsTitle">Conversations</h2><p>Every conversation is kept locally. Open one to continue it.</p></div><button class="modal-x" data-close="sessionsModal">×</button></header>
+      <div id="sessionList" class="memory-list"></div>
+      <footer><label class="inline-check"><input type="checkbox" id="showArchivedSessions"> Show archived</label><span>Starting a new conversation never deletes an old one.</span><button class="primary-button" data-close="sessionsModal">Done</button></footer>
     </div>
   </div>
 
