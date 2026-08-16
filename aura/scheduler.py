@@ -61,9 +61,17 @@ class Scheduler:
         self._thread.start()
 
     def stop(self, timeout: float = 2.0) -> None:
+        """Stop the thread, including a batch that is part way through.
+
+        The flag is cleared once the thread is gone, so the object is left at
+        rest rather than permanently refusing: `start()` can revive it, and a
+        caller driving `tick()` by hand is not silently ignored. Leaving it set
+        made a stopped scheduler look alive while doing nothing.
+        """
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=timeout)
+        self._stop.clear()
 
     def _loop(self) -> None:
         while not self._stop.is_set():

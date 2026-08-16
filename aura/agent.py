@@ -15,7 +15,7 @@ import shutil
 import sys
 import tempfile
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 from uuid import uuid4
@@ -947,6 +947,9 @@ class AuraAgent:
             names.add("http_get")
         if includes("weather", "forecast", "temperature outside", "raining", "ilm"):
             names.add("get_weather")
+        if includes("remind", "reminder", "later", "in an hour", "tomorrow",
+                    "don't let me forget", "meelde"):
+            names.add("set_reminder")
         if includes("zip", "archive", "compress"):
             names.update({"create_archive", "extract_archive", "list_files"})
         if includes("open", "launch", "preview"):
@@ -1799,6 +1802,38 @@ class AuraAgent:
     def _tool_recent_tasks(self, name, args, approve, call):
         result = {"tasks": self.tasks.recent(max(1, min(int(args.get("limit", 5)), 20)))}
         return result
+
+    #: A reminder only ever shows a message, so the model may set one. It may
+    #: not schedule anything else: this tool hard-codes the kind, so nothing it
+    #: writes can become background work that acts.
+    MAX_ACTIVE_REMINDERS = 20
+
+    @tool('set_reminder',
+          "Remind the user about something later. Give the delay in minutes from now — "
+          "convert 'tomorrow morning' or 'in an hour' yourself. A reminder only shows a "
+          "message; it cannot change anything, and it waits for quiet hours.",
+          {'text': {'type': 'string', 'description': 'What to remind the user about'},
+           'in_minutes': {'type': 'integer', 'minimum': 1, 'maximum': 20160,
+                          'description': 'Delay from now, up to two weeks'},
+           'repeat_minutes': {'type': 'integer', 'minimum': 5, 'maximum': 20160,
+                              'description': 'Optional: repeat every N minutes'}},
+          ['text', 'in_minutes'])
+    def _tool_set_reminder(self, name, args, approve, call):
+        text = str(args.get("text", "")).strip()
+        if not text:
+            raise ValueError("a reminder needs something to say")
+        active = [task for task in self.db.scheduled_tasks(include_disabled=False)
+                  if task.get("kind") == "reminder"]
+        if len(active) >= self.MAX_ACTIVE_REMINDERS:
+            raise ValueError(
+                f"there are already {len(active)} reminders waiting; cancel one first")
+        delay = max(1, min(int(args.get("in_minutes", 60)), 20160))
+        repeat = int(args.get("repeat_minutes") or 0)
+        due = datetime.now(timezone.utc) + timedelta(minutes=delay)
+        task = self.db.add_scheduled("reminder", text[:400], every_minutes=repeat,
+                                     next_run=due.isoformat())
+        return {"reminder": text[:400], "due": task["next_run"],
+                "in_minutes": delay, "repeats_every_minutes": repeat or None}
 
 
     def _execute_tool(self, call: ToolCall, approve: Callable[[list[str]], bool] | None) -> dict:

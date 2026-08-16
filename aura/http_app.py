@@ -33,6 +33,7 @@ API_METHODS = {
     "export_personal_memory", "export_diagnostics",
     "list_permissions", "grant_folder_access", "grant_domain_access", "network_status",
     "autonomy_status", "pause_autonomy", "emergency_stop",
+    "list_reminders", "cancel_reminder",
     "revoke_folder_access",
     "revoke_all_permissions", "external_changes", "undo_external_change", "resume_task",
     "list_sessions", "new_session", "open_session", "archive_session",

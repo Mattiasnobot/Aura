@@ -80,7 +80,38 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         # kinds of background work arrive in 48.3 and 48.4.
         self.scheduler = Scheduler(self.agent.db, self.agent.autonomy,
                                    self.agent.log, busy=self._is_busy)
+        self.scheduler.register("reminder", self._deliver_reminder)
         self.scheduler.start()
+
+    def _deliver_reminder(self, task: dict) -> str:
+        """Say the reminder, in the conversation, as Aura.
+
+        It lands in the durable session history rather than only on screen, so
+        a reminder that arrives while the window is closed is still there when
+        it is opened — and it reads as something she said, because it is.
+        """
+        text = str(task.get("request", "")).strip() or "You asked me to remind you about something."
+        spoken = f"Reminder: {text}"
+        self.agent._remember("assistant", spoken)
+        self._push("reply", text=spoken, streamed=False, reminder=True)
+        self._push("state", value="idle")
+        if self.speech.enabled:
+            threading.Thread(target=lambda: self.speech.speak(spoken),
+                             daemon=True, name="aura-reminder-voice").start()
+        return f"delivered: {text[:80]}"
+
+    def list_reminders(self) -> dict:
+        reminders = [task for task in self.agent.db.scheduled_tasks(include_disabled=False)
+                     if task.get("kind") == "reminder"]
+        return {"ok": True, "reminders": reminders}
+
+    def cancel_reminder(self, reminder_id: str) -> dict:
+        task = self.agent.db.scheduled_task(str(reminder_id))
+        if not task or task.get("kind") != "reminder":
+            return {"ok": False, "error": "That reminder no longer exists."}
+        self.agent.db.delete_scheduled_task(str(reminder_id))
+        self.agent.log.record("cancel_reminder", "ok", reminder_id=str(reminder_id))
+        return {"ok": True}
 
     def _is_busy(self) -> bool:
         """Is a user request in flight? Background work waits for it."""

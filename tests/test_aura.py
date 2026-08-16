@@ -3688,6 +3688,97 @@ class AutonomyGuardTests(unittest.TestCase):
         self.assertIsNone(self.guard.next_opening(self.at(12)))
 
 
+class ReminderTests(unittest.TestCase):
+    """The first real handler: it proves 48.1 and 48.2 work together."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        agent.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00")
+        self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+        self.bridge.scheduler.stop()          # tick by hand, not by clock
+
+    def tearDown(self):
+        self.bridge.shutdown()
+        self.temp.cleanup()
+
+    def set_reminder(self, text="stretch", minutes=60, repeat=None):
+        arguments = {"text": text, "in_minutes": minutes}
+        if repeat:
+            arguments["repeat_minutes"] = repeat
+        return self.bridge.agent._execute_tool(ToolCall("1", "set_reminder", arguments), None)
+
+    def make_due(self, reminder_id):
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        self.bridge.agent.db._execute(
+            "UPDATE scheduled_tasks SET next_run = ? WHERE id = ?", (past, reminder_id))
+
+    def test_a_reminder_is_delivered_as_something_aura_said(self):
+        self.assertTrue(self.set_reminder("drink water", 30)["ok"])
+        reminder = self.bridge.list_reminders()["reminders"][0]
+        self.make_due(reminder["id"])
+        self.assertEqual(self.bridge.scheduler.tick(), [reminder["id"]])
+        # In the durable conversation, not only on screen: a reminder that
+        # arrives while the window is shut is still there when it opens.
+        said = self.bridge.agent.memory.data["conversation"][-1]
+        self.assertEqual(said["role"], "assistant")
+        self.assertIn("drink water", said["text"])
+        self.assertTrue(any(event.get("type") == "reply" and event.get("reminder")
+                            for event in self.bridge.events))
+
+    def test_a_one_off_reminder_does_not_come_back(self):
+        self.set_reminder("once", 5)
+        reminder = self.bridge.list_reminders()["reminders"][0]
+        self.make_due(reminder["id"])
+        self.bridge.scheduler.tick()
+        self.assertEqual(self.bridge.list_reminders()["reminders"], [])
+
+    def test_a_repeating_reminder_is_rescheduled(self):
+        self.set_reminder("stand up", 5, repeat=60)
+        reminder = self.bridge.list_reminders()["reminders"][0]
+        self.make_due(reminder["id"])
+        self.bridge.scheduler.tick()
+        still = self.bridge.list_reminders()["reminders"]
+        self.assertEqual(len(still), 1)
+        self.assertGreater(still[0]["next_run"], datetime.now(timezone.utc).isoformat())
+
+    def test_quiet_hours_hold_a_reminder_rather_than_dropping_it(self):
+        self.bridge.agent.config.update(quiet_hours_start="00:00", quiet_hours_end="23:59")
+        self.set_reminder("late", 5)
+        reminder = self.bridge.list_reminders()["reminders"][0]
+        self.make_due(reminder["id"])
+        self.assertEqual(self.bridge.scheduler.tick(), [])
+        self.assertEqual(len(self.bridge.list_reminders()["reminders"]), 1)
+
+    def test_the_user_can_cancel_one(self):
+        self.set_reminder("never mind", 60)
+        reminder = self.bridge.list_reminders()["reminders"][0]
+        self.assertTrue(self.bridge.cancel_reminder(reminder["id"])["ok"])
+        self.assertEqual(self.bridge.list_reminders()["reminders"], [])
+        self.assertFalse(self.bridge.cancel_reminder("nonsense")["ok"])
+
+    def test_the_model_cannot_schedule_anything_but_a_reminder(self):
+        """The kind is hard-coded, so this tool cannot become a way to run
+        background work that acts."""
+        offered = {item["function"]["name"] for item in self.bridge.agent.tool_definitions()}
+        self.assertIn("set_reminder", offered)
+        for forbidden in ("add_scheduled", "schedule_task", "pause_autonomy"):
+            self.assertNotIn(forbidden, offered)
+        self.set_reminder("only kind", 10)
+        kinds = {task["kind"] for task in self.bridge.agent.db.scheduled_tasks()}
+        self.assertEqual(kinds, {"reminder"})
+
+    def test_reminders_are_capped(self):
+        for index in range(AuraAgent.MAX_ACTIVE_REMINDERS):
+            self.assertTrue(self.set_reminder(f"one {index}", 60)["ok"])
+        refused = self.set_reminder("one too many", 60)
+        self.assertFalse(refused["ok"])
+        self.assertIn("already", refused["error"])
+
+    def test_an_empty_reminder_is_refused(self):
+        self.assertFalse(self.set_reminder("   ", 10)["ok"])
+
+
 class SchedulerTests(unittest.TestCase):
     """The loop only decides *when*; these are the rules it exists to keep."""
 
@@ -3832,8 +3923,13 @@ class AutonomyControlTests(unittest.TestCase):
                         or self.bridge.agent.autonomy.in_quiet_hours())
 
     def test_the_scheduler_runs_nothing_it_has_not_been_taught(self):
-        """48.2 delivers the loop; the kinds of work arrive in 48.3 and 48.4."""
-        self.assertEqual(self.bridge.scheduler.handlers, {})
+        """It knows exactly the kinds that have been built and nothing else.
+
+        This asserted an empty registry while 48.2 was the whole of the
+        scheduler; 48.3 added the first handler, so the assertion moved with the
+        code rather than being dropped.
+        """
+        self.assertEqual(set(self.bridge.scheduler.handlers), {"reminder"})
 
     def test_the_bootstrap_carries_the_envelope(self):
         autonomy = self.bridge.get_bootstrap()["autonomy"]
