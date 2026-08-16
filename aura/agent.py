@@ -26,8 +26,10 @@ from .commands import CommandAgent
 from .config import ConfigStore
 from .memory import MemoryStore
 from .provider import LMStudioProvider, MockProvider, Provider, ProviderContext, ToolCall
+from . import services
 from .image_diff import compare_images
-from .permissions import ExternalReader, ExternalWriter, PermissionStore
+from .permissions import (ExternalReader, ExternalWriter, PermissionRefused,
+                          PermissionStore, reject_unsafe_host)
 from .preview_server import PreviewServer
 from .safety import SandboxViolation, WorkspaceSandbox
 from .screenshot import (ScreenshotUnavailable, browser_command_preview, capture,
@@ -89,6 +91,9 @@ class AuraAgent:
         self.current_task_id: str | None = None
         self.last_learned: list[dict] = []
         self.last_recalled: list[dict] = []
+        # Every external URL actually fetched in the current turn, so a reply
+        # that used the network can name what it read.
+        self.fetched_sources: list[str] = []
         self.session_id = str(self.config.data.get("current_session") or "") or uuid4().hex[:12]
         self.config.update(current_session=self.session_id)
         # No session row is written here: `add_message` creates one on the first
@@ -360,6 +365,7 @@ class AuraAgent:
         self.sandbox.active_task_id = task_id
         self._remember("user", message)
         self.last_recalled = []
+        self.fetched_sources = []
         self.last_learned = (
             self.memory.learn_from_message(message, project=self._extract_artifact_contract(message)[0])
             if bool(self.config.data.get("learn_from_conversations", True)) else [])
@@ -434,13 +440,25 @@ class AuraAgent:
             # Do not advertise a capability the loaded model cannot honour.
             selected_tools = [definition for definition in selected_tools
                               if definition["function"]["name"] != "look_at_image"]
-        expected_base, expected_paths = self._extract_artifact_contract(routing_request)
+        expected_base, _inherited_paths = self._extract_artifact_contract(routing_request)
+        # Deliverables come from what the user actually asked for *this turn*.
+        # The routing request also carries the previous message, and inheriting
+        # its filenames made "Call undo_external_change to roll that back" demand
+        # the report.txt of the turn before it — a file this request never
+        # mentioned. The folder still comes from the inherited text, because it
+        # only scopes validation reporting rather than demanding anything.
+        _, expected_paths = self._extract_artifact_contract(message)
         if not self._requires_mutation(routing_request):
             # Naming a file in a read-only request ("read notes.txt", "screenshot
             # index.html") is a reference, not a promise to create it. Demanding
             # it exist afterwards fails tasks that in fact succeeded — and an
             # external file can never be inside the workspace at all. The folder
             # itself stays, because it still scopes validation reporting.
+            expected_paths = []
+        if self._targets_external_location(message):
+            # Work in a granted folder produces nothing inside the workspace, so
+            # a workspace contract can only ever fail. This one was reached three
+            # times in a row on the same request before it was rephrased.
             expected_paths = []
         host = "Windows" if os.name == "nt" else "a POSIX operating system"
         messages.insert(1, {"role": "system", "content":
@@ -538,7 +556,18 @@ class AuraAgent:
             messages.append(assistant)
             if not response.tool_calls:
                 if not response.content:
-                    raise RuntimeError("the model returned neither text nor a tool request")
+                    # An empty completion is usually a stumble, not a verdict —
+                    # it was the single most frequent failure in real use. Spend
+                    # one retry asking plainly before giving up on the turn.
+                    if retries_left > 0:
+                        retries_left -= 1
+                        messages.append({"role": "system", "content":
+                            "Your last response was completely empty. Answer the user in plain "
+                            "text now, or call exactly one tool. Never reply with nothing."})
+                        continue
+                    raise RuntimeError(
+                        "the model kept returning an empty response. Check that a model "
+                        "is loaded in LM Studio, or try a shorter request")
                 missing_action = action_expected and successful_tools == 0
                 missing_mutation = requires_mutation and not mutation_performed
                 # Work in a granted folder can never satisfy a workspace
@@ -551,9 +580,16 @@ class AuraAgent:
                     retries_left -= 1
                     if token:
                         token("Aura is checking the requested deliverables and continuing…\n\n")
+                    # Name the tool. The journal shows this model ignoring
+                    # "create a file called X" three times in a row, then obeying
+                    # "use create_file to make X" immediately — naming the tool
+                    # is what the user had to do by hand.
                     messages.append({"role": "system", "content":
-                        "The artifact contract is not satisfied. Create these exact missing paths now: " +
-                        json.dumps(missing_artifacts) + ". Then validate and inspect them before reporting completion."})
+                        "The artifact contract is not satisfied. Call the tool create_file once for "
+                        "each of these exact paths, with the content the user asked for: " +
+                        json.dumps(missing_artifacts) +
+                        ". Do not answer in prose until every one of them exists; "
+                        "then read them back before reporting completion."})
                     continue
                 if missing_artifacts:
                     # Report rather than raise: the model's work is still worth
@@ -609,10 +645,20 @@ class AuraAgent:
                     retries_left -= 1
                     if token:
                         token("Aura noticed the requested action was not completed and is correcting it…\n\n")
-                    requirement = "perform the requested workspace mutation" if missing_mutation else "use the relevant tool"
+                    # Same lesson as the artifact nudge: offer the names, not a
+                    # description. "Use the relevant tool" is exactly the kind of
+                    # instruction this model answers with prose.
+                    offered = [item["function"]["name"] for item in selected_tools]
+                    candidates = [name for name in offered
+                                  if name in self.MUTATING_TOOL_NAMES] if missing_mutation else offered
+                    naming = (" Call one of these tools by name: "
+                              + ", ".join(candidates[:6]) + ".") if candidates else ""
+                    requirement = ("perform the requested workspace mutation" if missing_mutation
+                                   else "use the relevant tool")
                     messages.append({"role": "system", "content":
                         f"The user requested an actionable operation, but no successful tool has fulfilled it. "
-                        f"Do not claim completion or inability: {requirement} now, inspect the result, and report only confirmed facts."})
+                        f"Do not claim completion or inability: {requirement} now, inspect the result, "
+                        f"and report only confirmed facts.{naming}"})
                     continue
                 if missing_action or missing_mutation:
                     if missing_action and not missing_mutation and not requires_mutation:
@@ -670,6 +716,7 @@ class AuraAgent:
                 return self._format_completion_evidence(
                     response.content, validation_scope, validation_evidence,
                     sorted(verified_final_paths), present, unconfirmed,
+                    list(self.fetched_sources),
                 )
             if response.content and token:
                 token("\n\n")
@@ -779,6 +826,8 @@ class AuraAgent:
             names.add("system_info")
         if includes("http", "url", "endpoint", "api", "localhost", "server response"):
             names.add("http_get")
+        if includes("weather", "forecast", "temperature outside", "raining", "ilm"):
+            names.add("get_weather")
         if includes("zip", "archive", "compress"):
             names.update({"create_archive", "extract_archive", "list_files"})
         if includes("open", "launch", "preview"):
@@ -894,6 +943,24 @@ class AuraAgent:
             "update", "modify", "fix", "refactor", "improve", "polish", "enhance", "append",
             "copy", "move", "rename",
             "delete", "remove", "trash", "undo", "revert", "rollback",
+        ))
+
+    @staticmethod
+    def _targets_external_location(message: str) -> bool:
+        """Is this request about a granted folder rather than the workspace?
+
+        Detected from the words the user used and the external tools they named,
+        not from what ran — the point is to avoid demanding a workspace file
+        before anything has had a chance to run at all.
+        """
+        lower = str(message).casefold()
+        if any(tool in lower for tool in EXTERNAL_TOOLS):
+            return True
+        if re.search(r"\b[a-z]:[\\/]", lower):
+            return True
+        return any(phrase in lower for phrase in (
+            "granted folder", "granted write folder", "granted read folder",
+            "outside the workspace", "outside my workspace", "external folder",
         ))
 
     @staticmethod
@@ -1069,7 +1136,8 @@ class AuraAgent:
     def _format_completion_evidence(content: str, validation_scope: str | None,
                                     validation: dict | None, verified_paths: list[str],
                                     expected_paths: list[str],
-                                    unconfirmed: list[str] | None = None) -> str:
+                                    unconfirmed: list[str] | None = None,
+                                    sources: list[str] | None = None) -> str:
         evidence: list[str] = []
         if validation and validation.get("valid"):
             scope = validation_scope or "."
@@ -1097,6 +1165,14 @@ class AuraAgent:
         if unconfirmed:
             # Stated plainly, so an answer is never mistaken for verified work.
             report += "\n\nNot confirmed:\n" + "\n".join(f"- {item}" for item in unconfirmed)
+        if sources:
+            # An answer that left the machine says exactly where it went, so the
+            # user can judge the source rather than take Aura's word for it.
+            listed = list(dict.fromkeys(sources))
+            report += "\n\nRead from the network:\n" + "\n".join(
+                f"- {item}" for item in listed[:8])
+            if len(listed) > 8:
+                report += f"\n- …and {len(listed) - 8} more addresses."
         return report
 
     @staticmethod
@@ -1236,7 +1312,7 @@ class AuraAgent:
             tool("run_command", "Run an actual program, test, build, or project runtime inside the workspace. Commands use a direct argument array with no shell. Never use this for file/folder operations; create_file and write_file create parent folders. Use python for Python; unsafe commands require approval.",
                  {"command": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                   "timeout": {"type": "number", "minimum": 1, "maximum": 60, "default": 15}}, ["command"]),
-            tool("http_get", "Fetch a bounded HTTP(S) text response. Localhost is direct; external network access asks for approval.",
+            tool("http_get", "Fetch a bounded HTTP(S) text response. Localhost is direct; any other domain must already be granted by the user under Permissions, and cannot be requested from here.",
                  {"url": {"type": "string"},
                   "timeout": {"type": "number", "minimum": 1, "maximum": 20, "default": 10}}, ["url"]),
             tool("open_workspace_item", "Open a workspace file or folder in its normal desktop application after approval.",
@@ -1263,13 +1339,23 @@ class AuraAgent:
                  ["query", "new_value"]),
             tool("recent_tasks", "Review Aura's recent persistent task outcomes and tools used.",
                  {"limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5}}),
+            # Registered services append themselves here, so a new integration
+            # never means editing this list or the tool loop below.
+            *(service.tool_definition() for service in services.services()),
         ]
 
     def _execute_tool(self, call: ToolCall, approve: Callable[[list[str]], bool] | None) -> dict:
         name, args = call.name, call.arguments
         tool_ok = True
         try:
-            if name == "list_files":
+            service = services.get(name)
+            if service is not None:
+                # The service is handed a fetch that already enforces the domain
+                # grant, so it cannot reach anywhere the user has not allowed.
+                result = service.handler(
+                    lambda url, timeout=10.0: self._http_get(url, timeout), dict(args))
+                tool_ok = bool(result.get("ok", True))
+            elif name == "list_files":
                 result = {"files": self.sandbox.list_files(str(args.get("path", ".")))[:1000]}
             elif name == "create_folder":
                 target = self.sandbox.create_folder(str(args["path"]))
@@ -1508,7 +1594,7 @@ class AuraAgent:
                         reason = run.stderr.strip() or f"Command exited with code {run.returncode}."
                     result["error"] = reason
             elif name == "http_get":
-                result = self._http_get(str(args["url"]), approve,
+                result = self._http_get(str(args["url"]),
                                         max(1.0, min(float(args.get("timeout", 10)), 20.0)))
             elif name == "open_workspace_item":
                 path = str(args["path"])
@@ -1693,15 +1779,13 @@ class AuraAgent:
             raise ValueError("result is too large")
         return value
 
-    def _http_get(self, url: str, approve: Callable[[list[str]], bool] | None,
-                  timeout: float) -> dict:
+    def _http_get(self, url: str, timeout: float) -> dict:
         class NoRedirect(HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
                 return None
 
         opener = build_opener(NoRedirect)
         current = url.strip()
-        approved_hosts: set[str] = set()
         for _ in range(6):
             parsed = urlparse(current)
             if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -1710,10 +1794,18 @@ class AuraAgent:
                 raise ValueError("URLs containing credentials are not allowed")
             host = parsed.hostname.casefold()
             is_loopback = host in {"localhost", "127.0.0.1", "::1"}
-            if not is_loopback and host not in approved_hosts:
-                if not approve or not approve(["HTTP GET", current]):
-                    raise PermissionError("External network request was not approved")
-                approved_hosts.add(host)
+            if not is_loopback:
+                # A domain grant, never a dialog: asking mid-task is how a model
+                # talks its way outward, and the folder capabilities already
+                # settled that permission is something the user gives up front.
+                self.permissions.check("reach_domain", current, consume=False)
+                try:
+                    # Re-resolved on every hop, because a name that was public
+                    # when granted can point at the local network later.
+                    reject_unsafe_host(host)
+                except PermissionRefused as exc:
+                    raise PermissionError(str(exc)) from exc
+                self.fetched_sources.append(current)
             request = Request(current, headers={
                 "User-Agent": "Aura-Local/1.0", "Accept": "text/*, application/json, application/xml",
             })

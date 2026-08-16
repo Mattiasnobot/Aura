@@ -3,17 +3,22 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import threading
 from datetime import datetime, timedelta, timezone
+from ipaddress import ip_address
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from .store import Database
 
 
-CAPABILITIES = {"read_folder", "write_folder"}
+CAPABILITIES = {"read_folder", "write_folder", "reach_domain"}
 # Only these are scoped to a folder; the rest grant the capability itself.
 PATH_CAPABILITIES = {"read_folder", "write_folder"}
+# Scoped to a hostname instead: the grant covers that host and its subdomains.
+HOST_CAPABILITIES = {"reach_domain"}
 MODES = {"once", "session", "project", "persistent"}
 
 
@@ -48,6 +53,68 @@ def _forbidden_roots() -> list[Path]:
         Path("/private/etc"), Path("/System"), Path("/Library/Keychains"),
     ])
     return roots
+
+
+def normalize_host(target: str) -> str:
+    """Reduce whatever the user typed to a bare, comparable hostname.
+
+    Accepts "https://example.com/path", "Example.COM:443", or "example.com".
+    A grant is stored as the hostname alone so it can never be widened later by
+    a path, a port, or a differently-cased spelling.
+    """
+    raw = str(target).strip()
+    if not raw:
+        raise PermissionRefused("Name the domain Aura may reach.")
+    if "//" not in raw:
+        raw = "//" + raw
+    parsed = urlsplit(raw if "://" in raw else "https:" + raw)
+    host = (parsed.hostname or "").strip().strip(".").casefold()
+    if not host:
+        raise PermissionRefused(f"{target!r} is not a domain name.")
+    if parsed.username or parsed.password:
+        raise PermissionRefused("A domain grant cannot carry credentials.")
+    if "*" in host:
+        raise PermissionRefused("Wildcard domains cannot be granted; name the host itself.")
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise PermissionRefused(f"{target!r} is not a valid domain name.") from exc
+    if "." not in host:
+        raise PermissionRefused(
+            f"{host!r} is not a public domain. Aura reaches localhost without a grant.")
+    return host
+
+
+def is_private_address(address: str) -> bool:
+    """Would reaching this address mean reaching the user's own machine or LAN?"""
+    try:
+        parsed = ip_address(address)
+    except ValueError:
+        return False
+    return bool(parsed.is_private or parsed.is_loopback or parsed.is_link_local
+                or parsed.is_multicast or parsed.is_reserved or parsed.is_unspecified)
+
+
+def reject_unsafe_host(host: str) -> None:
+    """Refuse a domain that resolves onto the local machine or private network.
+
+    A public name may still point at 127.0.0.1 or a router at 192.168.x.x, and
+    a grant dialog showing only the name gives the user no way to see that. This
+    is checked when the grant is made and again on every request, because DNS
+    can change between the two.
+    """
+    if is_private_address(host):
+        raise PermissionRefused(
+            f"{host} is a local or private address, not a public domain.")
+    try:
+        resolved = {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except OSError as exc:
+        raise PermissionRefused(f"{host} could not be resolved: {exc}") from exc
+    private = sorted(address for address in resolved if is_private_address(address))
+    if private:
+        raise PermissionRefused(
+            f"{host} resolves to a private address ({private[0]}), so reaching it "
+            "would mean reaching this machine or its network.")
 
 
 class PermissionStore:
@@ -122,6 +189,9 @@ class PermissionStore:
                 raise PermissionRefused(f"{resolved} is not an existing folder.")
             self._reject_unsafe_root(resolved)
             root = str(resolved)
+        elif capability in HOST_CAPABILITIES:
+            root = normalize_host(target)
+            reject_unsafe_host(root)
         else:
             # Extension point: a capability with nothing to scope by path is
             # granted as itself. None exist today; every current capability is
@@ -160,7 +230,9 @@ class PermissionStore:
               *, project: str | None = None, consume: bool = True) -> dict:
         """Return the grant permitting this access, or raise PermissionDenied."""
         scoped = capability in PATH_CAPABILITIES
+        host_scoped = capability in HOST_CAPABILITIES
         resolved = self._resolve(target) if scoped else None
+        host = normalize_host(target) if host_scoped else ""
         with self._lock:
             for grant in self._grants:
                 if grant.get("capability") != capability or not self._live(grant):
@@ -171,10 +243,20 @@ class PermissionStore:
                     root = Path(str(grant.get("root", "")))
                     if resolved != root and root not in resolved.parents:
                         continue
+                if host_scoped:
+                    # A grant on example.com covers its subdomains, so a redirect
+                    # to www. does not turn into a second permission question.
+                    granted = str(grant.get("root", "")).casefold()
+                    if host != granted and not host.endswith("." + granted):
+                        continue
                 if consume and grant.get("mode") == "once":
                     grant["used"] = int(grant.get("used", 0)) + 1
                     self.save()
                 return dict(grant)
+        if host_scoped:
+            raise PermissionDenied(
+                f"Aura has no permission to reach {host}. Grant that domain under "
+                "Permissions if you want her to read it.")
         where = f" at {resolved}" if scoped else ""
         raise PermissionDenied(
             f"Aura has no active permission to {capability}{where}.")

@@ -311,7 +311,16 @@ function update(now,dt){
     const elapsed=now-state.speechStarted;
     if(state.speechCues.length&&elapsed<=state.speechDuration+180){
       while(state.cueIndex+1<state.speechCues.length&&state.speechCues[state.cueIndex+1].at_ms<=elapsed)state.cueIndex++;
-      const cue=state.speechCues[state.cueIndex];target=clamp(Number(cue?.open)||0,0,1);
+      const cue=state.speechCues[state.cueIndex];
+      const next=state.speechCues[state.cueIndex+1];
+      target=clamp(Number(cue?.open)||0,0,1);
+      // Cues are sampled every 55 ms, well below frame rate. Reading between two
+      // of them keeps the jaw on the syllable instead of stepping after it.
+      if(next){
+        const span=Math.max(1,next.at_ms-cue.at_ms);
+        const ratio=clamp((elapsed-cue.at_ms)/span,0,1);
+        target=clamp(target+(clamp(Number(next.open)||0,0,1)-target)*ratio,0,1);
+      }
       state.mouthShape=cue?.shape||'audio';
     }else{
       if(now>state.nextSyl){state.syl=Math.random();state.nextSyl=now+100+Math.random()*150;}
@@ -560,13 +569,18 @@ class AuraAvatar3D{
     if(!state.talking){state.speechCues=[];state.speechStarted=0;state.cueIndex=0;}
     this.root?.classList.toggle('speaking',state.talking);
   }
-  setSpeechCues(cues,durationMs,source='timing'){
+  setSpeechCues(cues,durationMs,source='timing',alreadyElapsedMs=0){
     state.speechCues=(Array.isArray(cues)?cues:[]).slice(0,4000).map(cue=>({
       at_ms:Math.max(0,Number(cue.at_ms)||0),open:clamp(Number(cue.open)||0,0,1),
       shape:String(cue.shape||'neutral')
     }));
     state.speechDuration=Math.max(0,Number(durationMs)||0);
-    state.speechSource=String(source||'timing');state.speechStarted=performance.now();state.cueIndex=0;
+    state.speechSource=String(source||'timing');
+    // Playback began on the Python side when these cues were pushed; they only
+    // reach the page a poll later. Starting the clock at zero here is what put
+    // the mouth behind the voice by that whole delay.
+    const elapsed=clamp(Number(alreadyElapsedMs)||0,0,600);
+    state.speechStarted=performance.now()-elapsed;state.cueIndex=0;
     canvas.dataset.speechSource=state.speechSource;
   }
   applySettings(values={}){

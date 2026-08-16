@@ -64,7 +64,7 @@ Aura keeps protected snapshots before file and folder mutations. Ask `undo the l
 
 Aura's browser frame is responsive: drag either divider to resize the sidebar, conversation, or action log. Aura's active avatar is the locally adapted feminine digital-human renderer in `aura/web/avatar-face.js`, based on the improved face supplied by the user. It contains no photograph, cloud renderer, external font, browser speech engine, or frontend package. Thousands of depth-positioned points and connected lines form a shaped forehead, jaw, cheeks, nose, nostrils, eyebrows, eyelids, irises, pupils, articulated lips, ears, neck, shoulders, and layered hair. Perspective projection gives her independent iris gaze, softer pointer tracking, natural variable blinks, restrained head motion, and distinct idle, listening, thinking, working, success, and error expressions. The renderer pauses off-screen, adapts detail and frame rate to load, and honors the operating system's reduced-motion preference. The message composer supports multiple lines, and panel preferences persist between launches.
 
-With Piper, mouth opening follows the amplitude envelope measured directly from Aura's locally generated WAV. The Windows SAPI fallback uses local phoneme-timing estimates because SAPI does not expose its output samples. Nothing is sent away from the computer. Motion style, intensity, and automatic/high/lower detail can be changed under **Settings → Presence**.
+With Piper, mouth opening follows the amplitude envelope measured directly from Aura's locally generated WAV. Audio starts on the Python side the moment those cues are pushed, but they only reach the page on its next poll, so the mouth clock is offset by however long the event actually spent in transit and polling tightens from 140 ms to 45 ms while Aura speaks; between cues the jaw is interpolated rather than stepped. Measured in the running app, the delivery delay fell from 140–280 ms to about 30 ms. The Windows SAPI fallback uses local phoneme-timing estimates because SAPI does not expose its output samples. Nothing is sent away from the computer. Motion style, intensity, and automatic/high/lower detail can be changed under **Settings → Presence**.
 
 On the first launch a short guide explains what Aura is, helps connect LM Studio and pick a model, and points out where permissions, undo, and the diagnostics report live. It can be skipped without changing any setting, and reopened later from **Settings → Show first-run guide**.
 
@@ -136,6 +136,8 @@ Aura uses Piper with the local `en_US-lessac-medium` neural model for substantia
 
 The neural runtime is recorded in `requirements-neural-voice.txt`; its model and configuration are stored in `aura-voices/`. If Piper or its model is unavailable, Aura continues speaking through SAPI instead of failing.
 
+Spoken replies are punctuated before they are synthesised, because a neural voice takes its entire sense of rhythm from punctuation: a stripped bullet list carried no terminal marks at all and was read as one unbroken sentence. Each sentence is now synthesised separately and assembled with a real breath between sentences and a longer pause between paragraphs, and file paths are spoken as names — `shop/index.html` becomes "shop, index dot html" rather than a string of punctuation. Any Piper voice placed in `aura-voices/` (the `.onnx` and its `.onnx.json` together) can be selected under **Settings → Neural voice**; Aura never downloads one by itself, and nothing outside that folder can be chosen.
+
 Microphone input is offline-first and now supports two natural interaction styles: click **Voice** once for automatic end-of-speech detection, or hold it while talking and release to send. Aura shows a live input meter, partial PocketSphinx transcription, calibration/listening/processing states, retry and cancel controls, and immediately stops her own speech when you begin talking. **Settings → Voice input** provides compatible microphone selection, room calibration, language, timeout, end-of-speech timing, and recognizer choice. The active local installation includes streaming PocketSphinx and SoundDevice; text chat remains available if audio hardware fails.
 
 Whisper.cpp is supported as an optional stronger recognizer. Select it in Settings and provide the local executable and GGML/GGUF model paths; Automatic mode prefers it when both are available and otherwise uses PocketSphinx. Aura never downloads a model silently and never sends microphone audio over the network.
@@ -154,10 +156,19 @@ This checks Python, the local HTML service and assets, the LM Studio server, and
 - Absolute paths, `..` traversal, symlinks, and Aura metadata paths are rejected.
 - Deleted files move to `aura-workspace/.aura-trash`.
 - Commands use argument arrays (no command shell), run with the workspace as their working directory, capture output, and time out.
-- Version checks, Python `compileall`/`py_compile`/`json.tool`, and Node syntax checks can be auto-approved when they only target workspace paths. Project runtimes, test suites, package scripts/installers, external HTTP requests, and desktop launches require visible confirmation.
+- Version checks, Python `compileall`/`py_compile`/`json.tool`, and Node syntax checks can be auto-approved when they only target workspace paths. Project runtimes, test suites, package scripts/installers, and desktop launches require visible confirmation.
+- Aura is offline until you say otherwise. Apart from `localhost`, she cannot reach any address without a `reach_domain` grant you create under **Permissions**, and there is no tool that lets her ask for one — as with folders, she can use a grant but never request it. A grant covers the named host and its subdomains.
+- A domain that is, or resolves to, a loopback, private, link-local, or reserved address is refused outright, whatever you type: a public name can point at your own router, and a dialog showing only the name gives you no way to see that. The address is checked again on every request and every redirect, because DNS can change in between.
+- Whatever Aura reads over the network is listed under **Read from the network** in her reply, so an answer that left the machine names its sources.
 - Actions, tasks, workspace changes, trash records, and conversations live in `aura-workspace/.aura/aura.db`; settings, personal memory, and permissions stay as readable JSON beside it.
 - The local interface answers on `127.0.0.1` and `localhost` only, and every API call additionally needs the session cookie and Aura's own client header.
 - Recovery is kept for 30 days or 500 changes, whichever ends first. Expiring a change removes its backups in the same transaction, and Aura never deletes a backup another record still needs.
+
+## Network services
+
+Optional capabilities that live outside this machine are declared in `aura/services.py`. A service names the tool the model sees, the domains it needs, and a handler that receives a fetch already bound to the `reach_domain` check — so it cannot open its own connection or reach past what you granted. Adding one means writing a module and calling `register()`; the tool list and the tool loop stay untouched.
+
+The one shipped service is keyless weather via Open-Meteo. Grant `geocoding-api.open-meteo.com` and `api.open-meteo.com` under **Permissions** and Aura can answer "what is the weather in Tartu right now?", citing both addresses she read. Until then the tool exists but refuses, naming the domains it would need. There is no general web search: that requires a third-party API key, and Aura holds no credentials.
 
 ## Packaging
 
@@ -185,7 +196,8 @@ The suite currently contains 187 checks, including real PCM level metering, stre
 - `aura/search_index.py` — dependency-free BM25 ranking for workspace file discovery
 - `aura/screenshot.py` — headless Chromium page capture, no extra packages
 - `aura/image_diff.py` — standard-library PNG decoding and pixel comparison
-- `aura/permissions.py` — revocable grants for folders outside the safe workspace
+- `aura/permissions.py` — revocable grants for folders and domains outside the safe workspace
+- `aura/services.py` — registry for optional network services, each bound to the domains it declares
 - `aura/agent.py` — LM Studio tool loop, request routing, and project builder
 - `aura/safety.py` — sandboxed file agent and recoverable deletion
 - `aura/commands.py` — command policy, execution, capture, timeout

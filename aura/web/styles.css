@@ -114,6 +114,9 @@ button { color: inherit; }
 .provider-label { min-height: 30px; padding: 7px 2px 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .provider-label.offline { color: #f98383; }
 .power-label { margin-top: -5px; color: #6f8fa5; font-size: 9px; text-align: center; letter-spacing: .15px; }
+.network-label { margin-top: 2px; color: #74879e; font-size: 9px; text-align: center; letter-spacing: .15px; }
+.network-label.online { color: var(--aura); }
+.permission-hint { margin: 0 22px 10px; color: #74879e; font-size: 11px; }
 
 .side-actions { display: flex; flex-direction: column; gap: 5px; }
 .side-button {

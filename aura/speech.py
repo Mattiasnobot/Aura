@@ -99,6 +99,52 @@ class SpeechOutput:
         paragraphs = [re.sub(r"[ \t]+", " ", part).strip() for part in re.split(r"\n\s*\n", plain)]
         return "\n\n".join(part for part in paragraphs if part)
 
+    # A path read aloud character by character — "shop slash index dot h t m l"
+    # — is the least human thing Aura says. Spoken form keeps the name and drops
+    # the punctuation the ear cannot use.
+    _PATH_PATTERN = re.compile(r"(?<![\w.])((?:[\w.-]+[/\\])+[\w-]+(?:\.[A-Za-z0-9]{1,5})?"
+                               r"|[\w-]+\.(?:py|json|toml|md|txt|html|css|js|ts|tsx|jsx|yaml|yml|onnx|db|wav|png))"
+                               r"(?![\w-])")
+
+    @classmethod
+    def _speakable_path(cls, match: re.Match) -> str:
+        raw = match.group(1).replace("\\", "/")
+        name = raw.rsplit("/", 1)[-1]
+        stem, _, extension = name.rpartition(".")
+        spoken = f"{stem} dot {extension}" if stem and extension else name
+        folder = raw.rsplit("/", 1)[0] if "/" in raw else ""
+        return f"{folder.replace('/', ', ')}, {spoken}" if folder else spoken
+
+    @classmethod
+    def prepare_spoken_text(cls, text: str) -> str:
+        """Punctuate a reply so a neural voice can breathe through it.
+
+        Piper takes its entire sense of rhythm from punctuation. A stripped list
+        item ends up with no terminal mark at all, so several of them are read as
+        one long breathless sentence — the main reason spoken replies sounded
+        mechanical even though the voice itself is fine.
+        """
+        plain = cls.prepare_plain_text(text)
+        plain = cls._PATH_PATTERN.sub(cls._speakable_path, plain)
+        plain = re.sub(r"\s*[—–]\s*", ", ", plain)
+        plain = re.sub(r"(?<=\w)\s+-\s+(?=\w)", ", ", plain)
+        paragraphs = []
+        for paragraph in re.split(r"\n\s*\n", plain):
+            lines = []
+            for line in paragraph.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.endswith(":"):
+                    # A heading followed by its items reads as one thought.
+                    line = line[:-1] + ","
+                elif not re.search(r"[.!?,;:]$", line):
+                    line += "."
+                lines.append(line)
+            if lines:
+                paragraphs.append(" ".join(lines))
+        return "\n\n".join(paragraphs)
+
     @staticmethod
     def prepare_sapi_xml(text: str) -> str:
         plain = SpeechOutput.prepare_plain_text(text)
@@ -231,8 +277,50 @@ class SpeechOutput:
                 return neural_result
         return self._speak_sapi(text, on_cues) if on_cues else self._speak_sapi(text)
 
+    SENTENCE_PAUSE_MS = 190
+    PARAGRAPH_PAUSE_MS = 420
+
+    def _render_piper_wav(self, plain: str, target: str) -> None:
+        """Write one WAV from per-sentence chunks, with silence between them.
+
+        Piper synthesizes a chunk per sentence but joins them edge to edge, which
+        is what makes a long reply sound like one unbroken exhale. Assembling the
+        chunks here puts a breath between sentences and a longer one between
+        paragraphs, the same pacing the SAPI path has always had.
+        """
+        from piper import SynthesisConfig
+        length_scale = max(0.7, min(1.5, 1.05 - (self.rate * 0.035)))
+        synthesis = SynthesisConfig(
+            length_scale=length_scale,
+            # Slightly above the model's 0.8 default: phoneme lengths vary a
+            # little more, so the cadence stops sounding metronomic.
+            noise_w_scale=0.9,
+            volume=self.volume / 100.0,
+        )
+        paragraphs = [part for part in re.split(r"\n\s*\n", plain) if part.strip()]
+        with wave.open(target, "wb") as wav_file:
+            configured = False
+            for paragraph_index, paragraph in enumerate(paragraphs):
+                for chunk_index, chunk in enumerate(
+                        self._neural_voice.synthesize(paragraph, syn_config=synthesis)):
+                    if not configured:
+                        wav_file.setnchannels(chunk.sample_channels)
+                        wav_file.setsampwidth(chunk.sample_width)
+                        wav_file.setframerate(chunk.sample_rate)
+                        configured = True
+                    elif chunk_index or paragraph_index:
+                        wav_file.writeframes(self._silence(chunk, self.SENTENCE_PAUSE_MS))
+                    wav_file.writeframes(chunk.audio_int16_bytes)
+                if paragraph_index < len(paragraphs) - 1 and configured:
+                    wav_file.writeframes(self._silence(chunk, self.PARAGRAPH_PAUSE_MS))
+
+    @staticmethod
+    def _silence(chunk, milliseconds: int) -> bytes:
+        frames = int(chunk.sample_rate * milliseconds / 1000)
+        return b"\x00" * (frames * chunk.sample_width * chunk.sample_channels)
+
     def _speak_piper(self, text: str, on_cues: Callable[[dict], None] | None = None) -> tuple[bool, str]:
-        plain = self.prepare_plain_text(text[:8000])
+        plain = self.prepare_spoken_text(text[:8000])
         if not plain:
             return False, "There is no text to speak."
         with self._lock:
@@ -245,15 +333,12 @@ class SpeechOutput:
                     pass
         temporary_path: str | None = None
         try:
-            from piper import PiperVoice, SynthesisConfig
+            from piper import PiperVoice
             if self._neural_voice is None:
                 self._neural_voice = PiperVoice.load(self.neural_model)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
                 temporary_path = temporary.name
-            length_scale = max(0.7, min(1.5, 1.0 - (self.rate * 0.035)))
-            synthesis = SynthesisConfig(length_scale=length_scale, volume=self.volume / 100.0)
-            with wave.open(temporary_path, "wb") as wav_file:
-                self._neural_voice.synthesize_wav(plain, wav_file, syn_config=synthesis)
+            self._render_piper_wav(plain, temporary_path)
             with self._lock:
                 if generation != self._generation:
                     return False, "Speech was superseded by a newer reply."

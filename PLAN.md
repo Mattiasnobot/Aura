@@ -494,10 +494,14 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
    - Preserve the safe workspace as the default and require narrow approval for broader access.
    - **Gate:** every external capability is off by default, visibly scoped, revocable, logged, and incapable of silently broadening its own access.
 
-47. **Network and tool extensibility — Planned (P2)**
-   - Add permission-scoped search, weather, and per-domain browsing with a clear online/offline indicator and source reporting.
-   - Create a documented tool/provider extension interface so future local services and integrations do not require changes to the core agent.
-   - **Gate:** Aura can perform an approved online lookup, cite what it used, and remain fully functional in local-only mode.
+47. **Network and tool extensibility — Mostly complete (P2)**
+   - **Offline by default, per-domain grants.** `reach_domain` joins the folder capabilities as a third, host-scoped kind of grant. Aura reaches nothing outside `localhost` until the user names a domain under **Permissions**; a grant covers that host and its subdomains, so a redirect to `www.` does not become a second question. There is deliberately **no tool** for granting a domain, exactly as with folders: the model can use a grant, never ask for one, so nothing it reads on the network can talk Aura into reaching further.
+   - **Two refusals that no dialog can override.** A domain that is, or resolves to, a loopback/private/link-local/reserved address is refused at grant time — a public name pointing at `192.168.x.x` or `169.254.169.254` would otherwise let an innocuous-looking approval reach the user's own network. The address is re-resolved on **every request and every redirect hop**, because DNS can change between the grant and the use.
+   - **Source reporting.** Every URL actually fetched in a turn is recorded and listed under **Read from the network** in the reply, so an answer that left the machine says exactly where it went.
+   - **Online/offline indicator** in the sidebar: "Offline • local only" until a grant exists, then "Online • N domains" with the list on hover. The Permissions panel names which domains the built-in services still need.
+   - **Extension interface** (`aura/services.py`): a service declares its tool, its domains, and a handler that is *given* a fetch already bound to `reach_domain`. Adding one is a new module plus a `register()` call — the tool list and the tool loop are untouched. The first service is keyless weather via Open-Meteo. **Verified live 2026-08-16:** with both domains granted, "What is the weather in Tartu right now?" called `get_weather` unprompted and answered from real data with both addresses cited.
+   - **Not done:** general web search, which needs a third-party API key. Per the user's decision, no key handling was added.
+   - **Gate:** met — an approved lookup works, cites what it read, and Aura is fully functional with no grants at all.
 
 48. **Proactive companion — Planned (P2)**
    - Add queued and scheduled work, reminders, recurring checks, quiet hours, and three autonomy modes: suggest, ask, and act-within-grants.
@@ -642,6 +646,35 @@ can Aura prove it?* — with four counters, four message styles, and inconsisten
   unverified work as verified.
 - **One retry budget of three**, shared by every gate, replacing four counters that
   together allowed nine extra rounds — each of which re-answered from scratch.
+**What the journal said about "required artifacts are still missing" (9 occurrences)**
+
+Read back from `task_events`, the nine failures were three different things, only two of
+which were Aura's fault:
+
+1. **The contract inherited the previous turn's filenames.** It was extracted from the
+   routing request, which prepends the previous message. "Call undo_external_change to roll
+   that back" therefore demanded `report.txt` — a file that follow-up never mentioned.
+   Deliverables now come from the current message; the folder still comes from the
+   inherited text, because it only scopes validation reporting.
+2. **A granted-folder request was owed a workspace file.** "Use write_external_file to
+   replace report.txt in the granted write folder" produces nothing inside the workspace,
+   so the contract could only fail — it did, three times in a row, until the request was
+   rephrased by hand. A request that names an external tool, an absolute path, or a granted
+   folder no longer carries a workspace contract at all.
+3. **The model simply did not call a tool.** Three attempts at "Create a file called
+   loop-checkver2.txt … and validate it" produced *no tool events whatsoever*; the very
+   next attempt, worded "Use create_file to make loop-checkver2.txt", called it
+   immediately. Aura cannot fix the model, but it can stop asking the way that fails: the
+   retries now name the tool ("Call the tool create_file once for each of these paths")
+   instead of saying "use the relevant tool", which is the phrasing that reliably came back
+   as prose.
+
+- **An empty completion now costs one retry instead of the whole turn.** The diagnostics
+  report made this measurable: "the model returned neither text nor a tool request" was the
+  single most frequent failure on the real machine, and it was the one case that raised
+  immediately while a retry budget sat unused beside it. Aura now asks plainly for an
+  answer or one tool call, and only gives up — naming LM Studio as the thing to check —
+  once the shared budget is gone.
 - **Validation only when there is something to validate.** "build", "project", "app",
   "website" now require an actual workspace mutation; an explicit "validate" still stands
   alone. "How does my project look?" used to demand validation because it contains

@@ -19,6 +19,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from . import __version__
+from . import services
 from .agent import AuraAgent
 from .graph_model import build_mind_graph
 from .permissions import PermissionRefused
@@ -119,6 +120,7 @@ class AuraWebBridge:
             "app": "Aura",
             "version": __version__,
             "onboarded": bool(config["onboarded"]),
+            "network": self.network_status()["network"],
             "session_id": self.agent.session_id,
             "workspace": str(self.agent.sandbox.root),
             "conversation": conversation,
@@ -400,7 +402,8 @@ class AuraWebBridge:
         return {key: config[key] for key in (
             "lm_studio_url", "model", "timeout", "temperature", "max_tokens",
             "reasoning_depth", "autonomy_mode", "learn_from_conversations", "vision_mode",
-            "speak_responses", "speech_engine", "speech_voice", "speech_rate", "speech_volume",
+            "speak_responses", "speech_engine", "speech_voice", "speech_model",
+            "speech_rate", "speech_volume",
             "voice_engine", "voice_device", "voice_language", "voice_calibration_ms",
             "voice_silence_ms", "voice_max_seconds", "voice_noise_floor",
             "whisper_cpp_path", "whisper_model_path",
@@ -475,6 +478,12 @@ class AuraWebBridge:
             engine = str(values.get("speech_engine", "piper"))
             if engine not in {"piper", "sapi"}:
                 raise ValueError("Speech engine must be Piper or SAPI.")
+            speech_model = str(values.get(
+                "speech_model", self.agent.config.data["speech_model"])).strip()
+            if speech_model and speech_model not in self._neural_voice_models():
+                # Only a model already present in the voices folder: this setting
+                # must never become a way to point Aura at an arbitrary file.
+                raise ValueError("Choose a neural voice from Aura's voices folder.")
             provider = LMStudioProvider(
                 str(values.get("lm_studio_url", "")).strip(),
                 str(values.get("model") or "").strip() or None,
@@ -488,6 +497,7 @@ class AuraWebBridge:
                 reasoning_depth=reasoning_depth, autonomy_mode=autonomy_mode,
                 learn_from_conversations=learn_from_conversations, vision_mode=vision_mode,
                 speak_responses=enabled, speech_engine=engine, speech_voice=voice,
+                speech_model=speech_model or self.agent.config.data["speech_model"],
                 speech_rate=speech_rate, speech_volume=speech_volume,
                 voice_engine=voice_engine, voice_device=voice_device,
                 voice_language=voice_language, voice_calibration_ms=voice_calibration_ms,
@@ -560,8 +570,25 @@ class AuraWebBridge:
         except Exception as exc:
             return {"ok": False, "error": str(exc), "models": []}
 
+    NEURAL_VOICE_FOLDER = "aura-voices"
+
     def get_voices(self) -> dict:
-        return {"ok": True, "voices": SpeechOutput.installed_voices()}
+        return {"ok": True, "voices": SpeechOutput.installed_voices(),
+                "neural": self._neural_voice_models(),
+                "neural_selected": str(self.agent.config.data["speech_model"])}
+
+    def _neural_voice_models(self) -> list[str]:
+        """Piper voices sitting in `aura-voices/`, newest naming aside.
+
+        Aura never downloads one by itself; this only makes a model the user has
+        already put there selectable without editing config.json by hand.
+        """
+        folder = Path(self.NEURAL_VOICE_FOLDER)
+        if not folder.is_dir():
+            return []
+        return sorted(f"{self.NEURAL_VOICE_FOLDER}/{path.name}"
+                      for path in folder.glob("*.onnx")
+                      if path.with_suffix(".onnx.json").is_file())
 
     def get_microphones(self) -> dict:
         return {
@@ -705,13 +732,17 @@ class AuraWebBridge:
             was_enabled = self.speech.enabled
             self.speech.enabled = True
             self._push("speech", active=True, preview=True)
+            spoken, message = False, "Aura could not start the voice preview."
             try:
-                self.speech.speak(
+                spoken, message = self.speech.speak(
                     "Hello. I’m Aura. I’m here, listening, and ready to create with you.",
                     on_cues=lambda payload: self._push("speech_cues", **payload),
                 )
             finally:
-                self._push("speech", active=False, preview=True)
+                # The outcome used to be discarded: a preview that failed sounded
+                # exactly like one that worked but was inaudible.
+                self._push("speech", active=False, preview=True,
+                           spoken=spoken, message=message)
                 self.speech.enabled = was_enabled
 
         threading.Thread(target=speak, daemon=True, name="aura-voice-preview").start()
@@ -1088,6 +1119,39 @@ class AuraWebBridge:
             self.agent.log.record("grant_folder_access", "error", path=str(path),
                                   error=str(exc))
             return {"ok": False, "error": str(exc)}
+
+    def grant_domain_access(self, domain: str, mode: str = "session",
+                            project: str | None = None) -> dict:
+        """Allow Aura to read one domain. Only ever called by the user.
+
+        There is deliberately no tool for this: as with folders, the model can
+        use a grant but can never ask for one, so nothing it reads on the
+        network can talk Aura into reaching further.
+        """
+        try:
+            grant = self.agent.permissions.grant("reach_domain", str(domain), str(mode),
+                                                 project=project or None)
+            self.agent.log.record("grant_domain_access", "ok", domain=grant["root"],
+                                  mode=grant["mode"], grant_id=grant["id"])
+            self._push("permissions_changed", action="granted", grant=grant)
+            self._push("network", **self.network_status()["network"])
+            return {"ok": True, "grant": grant}
+        except (PermissionRefused, OSError, ValueError) as exc:
+            self.agent.log.record("grant_domain_access", "error", domain=str(domain),
+                                  error=str(exc))
+            return {"ok": False, "error": str(exc)}
+
+    def network_status(self) -> dict:
+        """Whether Aura can reach anything at all, and exactly what."""
+        domains = sorted({str(grant.get("root", "")) for grant in self.agent.permissions.active()
+                          if grant.get("capability") == "reach_domain" and grant.get("root")})
+        return {"ok": True, "network": {
+            "online": bool(domains),
+            "domains": domains,
+            "services": [{"name": service.name, "domains": list(service.domains),
+                          "hint": service.grant_hint}
+                         for service in services.services()],
+        }}
 
     def external_changes(self, limit: int = 20) -> dict:
         return {"ok": True, "changes": self.agent.external_writer.changes(int(limit))}

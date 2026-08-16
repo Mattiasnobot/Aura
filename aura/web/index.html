@@ -29,6 +29,7 @@
       </div>
 
       <div class="privacy-line"><span></span> Local • private • calm</div>
+      <div id="networkLabel" class="network-label">Offline • local only</div>
       <div id="providerLabel" class="provider-label">LM Studio • checking…</div>
       <div id="powerLabel" class="power-label">Deep mind • powerful tools</div>
 
@@ -244,6 +245,16 @@
         <input id="permissionPath" placeholder="Full path to a folder Aura may use" aria-label="Folder path">
         <button class="primary-button" type="submit">Grant</button>
       </form>
+      <form id="domainGrant" class="memory-teach">
+        <select id="domainMode" aria-label="Domain grant duration">
+          <option value="session">This session</option>
+          <option value="once">Once</option>
+          <option value="persistent">Until revoked</option>
+        </select>
+        <input id="domainName" placeholder="Domain Aura may read, e.g. api.open-meteo.com" aria-label="Domain name">
+        <button class="primary-button" type="submit">Allow domain</button>
+      </form>
+      <p id="domainSuggestions" class="permission-hint"></p>
       <div id="permissionList" class="memory-list"></div>
       <footer><span>Aura cannot grant itself access. Nothing outside the workspace is readable by default.</span><button id="permissionRevokeAll" type="button" class="danger">Revoke all</button><button class="primary-button" data-close="permissionsModal">Done</button></footer>
     </div>
@@ -278,6 +289,7 @@
         <details class="voice-advanced wide"><summary>Optional Whisper.cpp paths</summary><label>Whisper executable<input id="settingWhisperPath" type="text" placeholder="whisper-cli.exe"></label><label>Whisper model<input id="settingWhisperModel" type="text" placeholder="model.ggml"></label></details>
         <div class="settings-section wide"><strong>Voice output</strong><span>Piper stays local and drives Aura’s mouth from generated audio.</span></div>
         <label>Speech engine<select id="settingSpeechEngine"><option value="piper">Piper neural</option><option value="sapi">Windows SAPI</option></select></label>
+        <label>Neural voice<select id="settingSpeechModel"></select></label>
         <label class="wide model-field">SAPI fallback voice<select id="settingVoice"></select><button id="refreshVoices" type="button">Refresh voices</button></label>
         <label>Speech rate<input id="settingRate" type="range" min="-10" max="10"><output id="rateOutput"></output></label>
         <label>Speech volume<input id="settingVolume" type="range" min="0" max="100"><output id="volumeOutput"></output></label>

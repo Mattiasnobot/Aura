@@ -4,7 +4,8 @@ const $ = (selector) => document.querySelector(selector);
 const elements = {
   app: $("#app"), sidebar: $("#sidebar"), sidebarResizer: $("#sidebarResizer"),
   main: $(".main-panel"), face: $("#faceWrap"), state: $("#stateLabel"),
-  activity: $("#activityText"), provider: $("#providerLabel"), power: $("#powerLabel"), conversation: $("#conversation"),
+  activity: $("#activityText"), provider: $("#providerLabel"), power: $("#powerLabel"),
+  networkLabel: $("#networkLabel"), conversation: $("#conversation"),
   composer: $("#composer"), send: $("#sendButton"), stop: $("#stopButton"),
   actionPanel: $("#actionPanel"), actionLog: $("#actionLog"), logResizer: $("#logResizer"),
   logCount: $("#logCount"), toggleLog: $("#toggleLogButton"), workspacePath: $("#workspacePath"),
@@ -52,6 +53,13 @@ let logVisible = true;
 let expandedSidebarWidth = 250;
 let saveTimer = null;
 let eventPollTimer = null;
+// Speech cues are the only latency-critical events, so polling tightens while
+// Aura is speaking and relaxes again the moment she stops.
+const IDLE_POLL_MS = 140;
+const SPEAKING_POLL_MS = 45;
+let pollIntervalMs = IDLE_POLL_MS;
+let lastPollReturn = performance.now();
+let lastEventAgeMs = 0;
 let pollFailures = 0;
 let sessionRecoveryAttempted = false;
 let eventCursor = 0;
@@ -579,10 +587,19 @@ async function handleEvent(event) {
     case "speech":
       avatarMotion?.setSpeaking(Boolean(event.active));
       elements.voiceButton.classList.toggle("speaking", Boolean(event.active));
+      setPollInterval(event.active ? SPEAKING_POLL_MS : IDLE_POLL_MS);
+      // Silence and failure are indistinguishable to the ear, so say so.
+      if (event.preview && event.active === false && event.spoken === false) {
+        toast(event.message || "Aura could not speak that preview.", true);
+      }
       break;
     case "speech_cues":
-      avatarMotion?.setSpeechCues(event.cues || [], event.duration_ms || 0, event.source || "timing");
+      // The sound started on the Python side the moment these were pushed, so
+      // the mouth clock has to begin where the audio already is.
+      avatarMotion?.setSpeechCues(event.cues || [], event.duration_ms || 0,
+                                  event.source || "timing", lastEventAgeMs);
       break;
+    case "network": renderNetworkStatus(event); break;
     case "approval": showApproval(event); break;
     case "settings_saved": toast("Settings saved locally."); break;
     case "memory_learned": {
@@ -599,12 +616,26 @@ async function handleEvent(event) {
   }
 }
 
+function setPollInterval(milliseconds) {
+  if (!eventPollTimer || pollIntervalMs === milliseconds) return;
+  pollIntervalMs = milliseconds;
+  clearInterval(eventPollTimer);
+  eventPollTimer = setInterval(pollEvents, milliseconds);
+}
+
 async function pollEvents() {
   if (polling) return;
   polling = true;
+  const sentAt = performance.now();
   try {
     const events = await callApi("poll_events", eventCursor, 120);
     pollFailures = 0;
+    // An event can be pushed at any point between two polls, so by the time it
+    // arrives it is already this old on average. Lip sync is the one consumer
+    // that cares: without this the mouth starts a whole poll behind the sound.
+    const returnedAt = performance.now();
+    lastEventAgeMs = (returnedAt - lastPollReturn) / 2 + (returnedAt - sentAt) / 2;
+    lastPollReturn = returnedAt;
     for (const event of events) {
       await handleEvent(event);
       eventCursor = Math.max(eventCursor, Number(event._seq) || eventCursor);
@@ -1433,7 +1464,8 @@ async function openPermissions(focus = true) {
       kind.textContent = grant.mode === "persistent" ? "Until revoked"
         : grant.mode === "once" ? "Once" : grant.mode === "project" ? "Project" : "This session";
       const scope = document.createElement("span"); scope.className = "memory-confidence";
-      scope.textContent = grant.capability === "write_folder" ? "read and write" : "read only";
+      scope.textContent = grant.capability === "reach_domain" ? "domain, and its subdomains"
+        : grant.capability === "write_folder" ? "read and write" : "read only";
       head.append(kind, scope);
       const value = document.createElement("p");
       value.textContent = grant.root;
@@ -1468,6 +1500,37 @@ async function grantFolderAccess(event) {
   $("#permissionPath").value = "";
   toast(`Aura may now read ${result.grant.root}`);
   await openPermissions(false);
+}
+
+async function grantDomainAccess(event) {
+  event.preventDefault();
+  const domain = $("#domainName").value.trim();
+  if (!domain) return toast("Enter a domain first.", true);
+  const result = await callApi("grant_domain_access", domain, $("#domainMode").value);
+  if (!result.ok) return toast(result.error, true);
+  $("#domainName").value = "";
+  toast(`Aura may now read ${result.grant.root}`);
+  await openPermissions(false);
+}
+
+function renderNetworkStatus(network) {
+  if (!network) return;
+  const online = Boolean(network.online);
+  elements.networkLabel.textContent = online
+    ? `Online • ${network.domains.length} domain${network.domains.length === 1 ? "" : "s"}`
+    : "Offline • local only";
+  elements.networkLabel.classList.toggle("online", online);
+  elements.networkLabel.title = online
+    ? `Aura may read: ${network.domains.join(", ")}`
+    : "Aura cannot reach the network. Grant a domain under Permissions to change that.";
+  // Name what each built-in service still needs, so enabling one is not guesswork.
+  const hint = $("#domainSuggestions");
+  if (!hint) return;
+  const missing = (network.services || []).flatMap(service =>
+    (service.domains || []).filter(domain => !network.domains.includes(domain)));
+  hint.textContent = missing.length
+    ? `Built-in services still need: ${[...new Set(missing)].join(", ")}`
+    : "Every built-in service has the domains it needs.";
 }
 
 async function revokeAllPermissions() {
@@ -1665,6 +1728,7 @@ async function openSettings() {
     $("#settingAvatarQuality").value = settings.avatar_quality || "auto";
     $("#settingAvatarIntensity").value = settings.avatar_intensity ?? 65;
     updateRangeOutputs();
+    await refreshNeuralVoices(settings.speech_model || "");
     await refreshMicrophones(false, settings.voice_device || "");
     status.textContent = "Settings stay on this computer.";
   } catch (error) {
@@ -1701,6 +1765,24 @@ async function refreshVoices() {
   for (const voice of result.voices || []) select.add(new Option(voice, voice));
   setSelectValue(select, previous || result.voices?.[0] || "");
   status.textContent = result.voices?.length ? `Found ${result.voices.length} local voice(s).` : "No SAPI fallback voices found.";
+}
+
+async function refreshNeuralVoices(preferred = "") {
+  const select = $("#settingSpeechModel");
+  const result = await callApi("get_voices");
+  const models = result.neural || [];
+  select.replaceChildren();
+  if (!models.length) {
+    // Aura never downloads a voice on its own, so say where one would go.
+    select.add(new Option("No neural voice in aura-voices/", ""));
+    select.disabled = true;
+    return;
+  }
+  select.disabled = false;
+  for (const model of models) {
+    select.add(new Option(model.split("/").pop().replace(/\.onnx$/, ""), model));
+  }
+  setSelectValue(select, preferred || result.neural_selected || models[0]);
 }
 
 async function refreshMicrophones(showStatus = true, preferred = null) {
@@ -1764,6 +1846,7 @@ async function saveSettings() {
     learn_from_conversations: $("#settingLearning").checked,
     speech_engine: $("#settingSpeechEngine").value,
     speech_voice: $("#settingVoice").value,
+    speech_model: $("#settingSpeechModel").value,
     speech_rate: $("#settingRate").value,
     speech_volume: $("#settingVolume").value,
     speak_responses: $("#settingSpeak").checked,
@@ -2535,6 +2618,7 @@ function bindControls() {
   });
   $("#newSessionButton").addEventListener("click", startNewSession);
   $("#permissionGrant").addEventListener("submit", grantFolderAccess);
+  $("#domainGrant").addEventListener("submit", grantDomainAccess);
   $("#permissionRevokeAll").addEventListener("click", revokeAllPermissions);
   $("#settingsButton").addEventListener("click", openSettings);
   $("#workspaceButton").addEventListener("click", async () => {
@@ -2714,6 +2798,7 @@ async function initialize() {
     elements.workspacePath.textContent = bootstrap.workspace;
     elements.workspacePath.title = bootstrap.workspace;
     updatePowerStatus(bootstrap.capabilities || {});
+    renderNetworkStatus(bootstrap.network);
     clearConversation();
     logEvents = [...(bootstrap.actions || [])];
     setLogMode("activity");
@@ -2743,7 +2828,7 @@ async function initialize() {
     if (previewPath) await openWorkspaceExplorer(previewPath);
     if (!bootstrap.onboarded) startOnboarding(bootstrap.workspace);
     await callApi("check_provider");
-    eventPollTimer = setInterval(pollEvents, 140);
+    eventPollTimer = setInterval(pollEvents, pollIntervalMs);
   } catch (error) {
     addMessage("assistant", `Aura's interface could not connect to the Python core: ${error}`);
     toast(String(error), true);

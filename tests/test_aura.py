@@ -3,6 +3,7 @@ import io
 import json
 import math
 import os
+import re
 import struct
 import subprocess
 import tempfile
@@ -22,6 +23,7 @@ from urllib.request import Request, urlopen
 import package
 import aura_app
 from aura import __version__ as aura_version
+from aura import services
 from aura.action_log import ActionLog
 from aura.agent import AuraAgent
 from aura.config import ConfigStore
@@ -1801,6 +1803,102 @@ class LMStudioProviderTests(unittest.TestCase):
             self.assertEqual(agent.sandbox.read_file("site/index.html"), "<h1>Aura</h1>")
             self.assertEqual(provider.complete.call_count, 5)
 
+    def test_a_follow_up_does_not_inherit_the_previous_turns_deliverables(self):
+        """From the real log: three external-write attempts, then "Call
+        undo_external_change to roll that back" failed demanding report.txt —
+        a file that follow-up never mentioned."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            provider.complete = unittest.mock.Mock(
+                return_value=ProviderReply("Rolled that change back.", []))
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            agent.memory.remember_message(
+                "user", "Use write_external_file to replace report.txt with the text hello")
+            agent.memory.remember_message("assistant", "Done, report.txt was replaced.")
+            answer = agent.handle("Call undo_external_change to roll that back.")
+            self.assertNotIn("still missing", answer)
+            self.assertNotIn("report.txt", answer)
+
+    def test_work_in_a_granted_folder_is_not_owed_a_workspace_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            provider.complete = unittest.mock.Mock(
+                return_value=ProviderReply("I cannot reach that folder yet.", []))
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            answer = agent.handle(
+                "Use write_external_file to replace report.txt in the granted write folder "
+                "with the text hello")
+            # Honest about what it did not do, but never claiming a workspace
+            # file was owed: report.txt was never meant to live there.
+            self.assertNotIn("required artifacts", answer)
+            self.assertFalse((agent.sandbox.root / "report.txt").exists())
+
+    def test_a_named_file_in_the_current_request_is_still_required(self):
+        """The narrowing must not weaken the contract for the actual request."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            provider.complete = unittest.mock.Mock(
+                return_value=ProviderReply("All done!", []))
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            answer = agent.handle("Create a file called notes.txt with the text hello")
+            self.assertIn("notes.txt", answer)
+            self.assertIn("Not confirmed", answer)
+
+    def test_a_retry_names_the_tool_to_call(self):
+        """The journal is unambiguous: this model ignored "create a file called
+        X" three times, then obeyed "use create_file to make X" at once."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            replies = iter([
+                ProviderReply("I have created the file for you.", []),
+                ProviderReply("", [ToolCall("1", "create_file",
+                                            {"path": "notes.txt", "content": "hello"})]),
+                ProviderReply("notes.txt now exists.", []),
+            ])
+            nudges = []
+            def complete(messages, *_args, **_kwargs):
+                nudges.append(messages[-1].get("content", ""))
+                return next(replies)
+            provider.complete = unittest.mock.Mock(side_effect=complete)
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            answer = agent.handle("Create a file called notes.txt with the text hello")
+            self.assertIn("create_file", nudges[1])
+            self.assertIn("notes.txt", nudges[1])
+            self.assertEqual(agent.sandbox.read_file("notes.txt"), "hello")
+            self.assertNotIn("Not confirmed", answer)
+
+    def test_an_empty_model_response_is_retried_before_the_turn_is_lost(self):
+        """The most frequent real failure: the model answers with nothing at all.
+        It used to end the turn immediately, discarding the request."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            replies = iter([
+                ProviderReply("", []),
+                ProviderReply("Here is what I found.", []),
+            ])
+            nudges = []
+            def complete(messages, *_args, **_kwargs):
+                nudges.append(messages[-1])
+                return next(replies)
+            provider.complete = unittest.mock.Mock(side_effect=complete)
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            answer = agent.handle("What do you think of this idea?")
+            self.assertIn("Here is what I found.", answer)
+            self.assertEqual(provider.complete.call_count, 2)
+            self.assertIn("completely empty", nudges[-1]["content"])
+
+    def test_a_model_that_never_answers_is_reported_plainly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            provider.complete = unittest.mock.Mock(
+                side_effect=lambda *args, **kwargs: ProviderReply("", []))
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            answer = agent.handle("What do you think of this idea?")
+            self.assertIn("empty response", answer)
+            self.assertIn("LM Studio", answer)
+            # The shared budget bounds it: four calls, not an endless loop.
+            self.assertEqual(provider.complete.call_count, 4)
+
     def test_follow_up_routing_inherits_recent_build_intent(self):
         with tempfile.TemporaryDirectory() as temporary:
             agent = AuraAgent(Path(temporary) / "workspace", provider=MockProvider())
@@ -2238,6 +2336,85 @@ class LocalSettingsTests(unittest.TestCase):
         self.assertIn('silence msec="320"', xml)
         self.assertNotIn("https://", xml)
         self.assertNotIn("😊", xml)
+
+    def test_spoken_text_is_punctuated_so_the_voice_can_breathe(self):
+        """A stripped list item carried no terminal mark, so several of them were
+        read as one unbroken sentence — the main reason speech sounded mechanical."""
+        spoken = SpeechOutput.prepare_spoken_text(
+            "Done. I built it.\n\nConfirmed evidence:\n"
+            "- Validation passed for shop\n- Required deliverables present\n\nAnything else?")
+        first, second, third = spoken.split("\n\n")
+        self.assertEqual(first, "Done. I built it.")
+        self.assertIn("Confirmed evidence,", second)
+        self.assertIn("Validation passed for shop.", second)
+        self.assertIn("Required deliverables present.", second)
+        self.assertEqual(third, "Anything else?")
+
+    def test_paths_are_spoken_as_names_not_punctuation(self):
+        spoken = SpeechOutput.prepare_spoken_text("I wrote shop/index.html and style.css.")
+        self.assertNotIn("/", spoken)
+        self.assertIn("index dot html", spoken)
+        self.assertIn("style dot css", spoken)
+
+    def test_neural_speech_puts_real_silence_between_sentences(self):
+        speech = SpeechOutput(enabled=True, engine="piper")
+
+        class FakeChunk:
+            sample_rate, sample_width, sample_channels = 22050, 2, 1
+            audio_int16_bytes = b"\x01\x02" * 2205        # 0.1 s of sound
+
+        class FakeVoice:
+            def synthesize(self, text, syn_config=None):
+                return [FakeChunk() for _ in re.split(r"(?<=[.!?])\s+", text.strip()) if _]
+
+        speech._neural_voice = FakeVoice()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
+            path = Path(temporary.name)
+        try:
+            speech._render_piper_wav("One. Two.\n\nThree.", str(path))
+            with wave.open(str(path)) as handle:
+                seconds = handle.getnframes() / handle.getframerate()
+            # Three sentences of 0.1 s, two sentence gaps and one paragraph gap.
+            expected = 0.3 + (SpeechOutput.SENTENCE_PAUSE_MS * 2
+                              + SpeechOutput.PARAGRAPH_PAUSE_MS) / 1000
+            self.assertAlmostEqual(seconds, expected, places=2)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_a_failed_voice_preview_says_so_instead_of_going_quiet(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        agent = AuraAgent(Path(temp.name) / "workspace", provider=MockProvider())
+        speech = SpeechOutput(enabled=False)
+        bridge = AuraWebBridge(agent=agent, speech=speech)
+        self.addCleanup(bridge.shutdown)
+        with patch.object(speech, "speak",
+                          return_value=(False, "Neural speech is unavailable: no model")):
+            self.assertTrue(bridge.preview_voice()["ok"])
+            deadline = time.monotonic() + 3
+            done = None
+            while time.monotonic() < deadline and done is None:
+                done = next((event for event in list(bridge.events)
+                             if event.get("type") == "speech"
+                             and event.get("preview") and event.get("active") is False), None)
+                time.sleep(0.01)
+        self.assertIsNotNone(done)
+        self.assertFalse(done["spoken"])
+        self.assertIn("unavailable", done["message"])
+
+    def test_a_neural_voice_can_only_be_chosen_from_the_voices_folder(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        agent = AuraAgent(Path(temp.name) / "workspace", provider=MockProvider())
+        bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+        self.addCleanup(bridge.shutdown)
+        listed = bridge.get_voices()
+        self.assertIn("neural", listed)
+        settings = bridge.get_settings()
+        refused = bridge.save_settings({**settings,
+                                        "speech_model": "../../etc/passwd.onnx"})
+        self.assertFalse(refused["ok"])
+        self.assertEqual(agent.config.data["speech_model"], settings["speech_model"])
 
     def test_neural_engine_has_safe_sapi_fallback(self):
         speech = SpeechOutput(enabled=True, engine="piper")
@@ -3103,6 +3280,11 @@ class HTMLServerTests(unittest.TestCase):
         self.assertIn("prefers-reduced-motion", model)
         self.assertIn("speech_cues", script)
         self.assertIn("voice_session", script)
+        # Lip sync: the mouth clock is offset by how long the cue event spent in
+        # transit, and polling tightens while Aura speaks so that stays small.
+        self.assertIn("state.speechStarted=performance.now()-elapsed", model)
+        self.assertIn("lastEventAgeMs", script)
+        self.assertIn("SPEAKING_POLL_MS", script)
         self.assertIn("pointerdown", script)
         self.assertIn('callApi("stop_voice"', script)
         self.assertIn("settingAvatarIntensity", self.index)
@@ -3279,6 +3461,111 @@ class HTMLServerTests(unittest.TestCase):
         self.assertTrue(any(event.get("type") == "reply" for event in events))
         graph = self.call("get_mind_graph")
         self.assertTrue(graph["ok"])
+
+
+class NetworkPermissionTests(unittest.TestCase):
+    """Aura is offline until the user names a domain, and can never widen that."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_no_tool_can_ask_for_network_access(self):
+        offered = {item["function"]["name"] for item in self.agent.tool_definitions()}
+        self.assertNotIn("grant_domain_access", offered)
+        self.assertFalse(any("grant" in name and "domain" in name for name in offered))
+        # The bridge method exists for the Permissions UI, and only there.
+        self.assertTrue(hasattr(AuraWebBridge, "grant_domain_access"))
+
+    def test_a_domain_must_be_granted_before_it_can_be_read(self):
+        result = self.agent._execute_tool(
+            ToolCall("1", "http_get", {"url": "https://example.org/"}), None)
+        self.assertFalse(result["ok"])
+        self.assertIn("no permission to reach example.org", result["error"])
+        self.assertEqual(self.agent.fetched_sources, [])
+
+    def test_local_addresses_and_private_networks_can_never_be_granted(self):
+        for refused in ("localhost", "127.0.0.1", "192.168.1.1", "10.0.0.5",
+                        "169.254.169.254", "*.example.com", "http://user:pw@example.com"):
+            with self.assertRaises(PermissionRefused, msg=refused):
+                self.agent.permissions.grant("reach_domain", refused, "session")
+
+    def test_a_grant_covers_subdomains_but_nothing_else(self):
+        with patch("aura.permissions.reject_unsafe_host", lambda host: None):
+            self.agent.permissions.grant("reach_domain", "example.com", "session")
+        allowed = self.agent.permissions.check(
+            "reach_domain", "https://docs.example.com/a", consume=False)
+        self.assertEqual(allowed["root"], "example.com")
+        with self.assertRaises(PermissionDenied):
+            self.agent.permissions.check("reach_domain", "https://example.com.evil.test/")
+
+    def test_a_granted_name_pointing_at_the_local_network_is_still_refused(self):
+        """DNS can change between the grant and the request, so the address is
+        checked again on every hop rather than trusted from grant time."""
+        with patch("aura.permissions.reject_unsafe_host", lambda host: None):
+            self.agent.permissions.grant("reach_domain", "rebound.test", "session")
+        with patch("aura.agent.reject_unsafe_host",
+                   side_effect=PermissionRefused("rebound.test resolves to a private address")):
+            result = self.agent._execute_tool(
+                ToolCall("1", "http_get", {"url": "https://rebound.test/"}), None)
+        self.assertFalse(result["ok"])
+        self.assertIn("private address", result["error"])
+
+    def test_a_service_cannot_reach_a_domain_the_user_has_not_allowed(self):
+        result = self.agent._execute_tool(
+            ToolCall("1", "get_weather", {"place": "Tartu"}), None)
+        self.assertFalse(result["ok"])
+        self.assertIn("open-meteo.com", result["error"])
+
+    def test_the_reply_names_every_address_it_read(self):
+        report = AuraAgent._format_completion_evidence(
+            "It is 22 degrees in Tartu.", None, None, [], [], None,
+            ["https://api.open-meteo.com/v1/forecast?x=1",
+             "https://api.open-meteo.com/v1/forecast?x=1"])
+        self.assertIn("Read from the network:", report)
+        # Repeated fetches of one address are cited once.
+        self.assertEqual(report.count("https://api.open-meteo.com"), 1)
+
+    def test_a_registered_service_is_offered_without_touching_the_tool_loop(self):
+        offered = {item["function"]["name"] for item in self.agent.tool_definitions()}
+        for service in services.services():
+            self.assertIn(service.name, offered)
+            self.assertTrue(service.domains, f"{service.name} declares no domains")
+
+
+class NetworkStatusTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+
+    def tearDown(self):
+        self.bridge.shutdown()
+        self.temp.cleanup()
+
+    def test_aura_starts_offline_and_says_so(self):
+        status = self.bridge.get_bootstrap()["network"]
+        self.assertFalse(status["online"])
+        self.assertEqual(status["domains"], [])
+        self.assertTrue(status["services"])
+
+    def test_granting_a_domain_brings_her_online_and_lists_it(self):
+        with patch("aura.permissions.reject_unsafe_host", lambda host: None):
+            granted = self.bridge.grant_domain_access("https://api.open-meteo.com/v1", "session")
+        self.assertTrue(granted["ok"])
+        self.assertEqual(granted["grant"]["root"], "api.open-meteo.com")
+        status = self.bridge.network_status()["network"]
+        self.assertTrue(status["online"])
+        self.assertEqual(status["domains"], ["api.open-meteo.com"])
+
+    def test_revoking_everything_puts_her_back_offline(self):
+        with patch("aura.permissions.reject_unsafe_host", lambda host: None):
+            self.bridge.grant_domain_access("api.open-meteo.com", "session")
+        self.bridge.revoke_all_permissions()
+        self.assertFalse(self.bridge.network_status()["network"]["online"])
 
 
 class PackagingTests(unittest.TestCase):
