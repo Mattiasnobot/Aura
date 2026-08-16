@@ -1343,6 +1343,85 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(db.migrate_jsonl(self.meta), {})
 
 
+class ResumeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _interrupted_build(self):
+        """A task that wrote one file, then stopped without finishing."""
+        task_id = self.agent.tasks.start("Build a site in shop with index.html and style.css")
+        self.agent.sandbox.write_file("shop/index.html", "<!doctype html><html></html>")
+        self.agent.tasks.record_tool(task_id, "write_file",
+                                     {"path": "shop/index.html"}, {"ok": True})
+        return task_id
+
+    def test_the_brief_reports_real_state_not_just_the_log(self):
+        task_id = self._interrupted_build()
+        brief = self.agent.resume_brief(task_id)
+        self.assertEqual(brief["status"], "interrupted")
+        self.assertIn("Build a site in shop", brief["request"])
+        self.assertEqual(len(brief["completed"]), 1)
+        self.assertIn("shop/index.html", brief["completed"][0])
+        self.assertIn("exists", brief["completed"][0])
+        # The file the request named but which was never written.
+        self.assertIn("shop/style.css", brief["outstanding"])
+
+    def test_a_step_whose_file_vanished_is_reported_as_missing(self):
+        # The log says it was written; the truth is what counts on resume.
+        task_id = self._interrupted_build()
+        self.agent.sandbox.safe_delete_file("shop/index.html")
+        brief = self.agent.resume_brief(task_id)
+        self.assertIn("MISSING now", brief["completed"][0])
+
+    def test_only_unfinished_tasks_can_be_resumed(self):
+        task_id = self._interrupted_build()
+        self.agent.tasks.finish(task_id, "completed", "All done.")
+        with self.assertRaises(ValueError):
+            self.agent.resume_brief(task_id)
+        with self.assertRaises(KeyError):
+            self.agent.resume_brief("no-such-task")
+
+    def test_the_resume_request_tells_the_model_not_to_repeat_work(self):
+        brief = self.agent.resume_brief(self._interrupted_build())
+        request = self.agent.format_resume_request(brief)
+        self.assertIn("Do not repeat work", request)
+        self.assertIn("Build a site in shop", request)
+        self.assertIn("shop/index.html", request)
+        self.assertIn("shop/style.css", request)
+
+    def test_reading_a_file_is_not_reported_as_completed_work(self):
+        task_id = self.agent.tasks.start("Read notes.txt and summarise it")
+        self.agent.tasks.record_tool(task_id, "read_file", {"path": "notes.txt"}, {"ok": True})
+        brief = self.agent.resume_brief(task_id)
+        self.assertEqual(brief["completed"], [])
+
+    def test_batch_writes_count_as_completed_work(self):
+        # Live test caught this: the model used write_files, whose arguments hold
+        # a list rather than a single path, so the brief claimed nothing had been
+        # done even though a file was on disk.
+        task_id = self.agent.tasks.start("Build a site in shop with index.html and style.css")
+        self.agent.sandbox.write_file("shop/index.html", "<!doctype html><html></html>")
+        self.agent.tasks.record_tool(
+            task_id, "write_files",
+            {"files": [{"path": "shop/index.html"}]}, {"ok": True})
+        brief = self.agent.resume_brief(task_id)
+        self.assertEqual(len(brief["completed"]), 1)
+        self.assertIn("shop/index.html", brief["completed"][0])
+        self.assertIn("exists", brief["completed"][0])
+        self.assertNotIn("No file was successfully changed",
+                         self.agent.format_resume_request(brief))
+
+    def test_a_failed_step_is_not_claimed_as_done(self):
+        task_id = self.agent.tasks.start("Create blocked.txt")
+        self.agent.tasks.record_tool(task_id, "write_file", {"path": "blocked.txt"},
+                                     {"ok": False, "error": "denied"})
+        self.assertEqual(self.agent.resume_brief(task_id)["completed"], [])
+
+
 class TaskJournalTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

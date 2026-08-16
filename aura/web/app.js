@@ -1675,6 +1675,14 @@ function buildTaskCard(task) {
   const path = (task.tool_details || []).map(detail => detail.arguments?.path || detail.arguments?.destination).find(Boolean);
   addAction(path ? "Open file" : "Workspace", () => openWorkspaceExplorer(path || null));
   if (String(task.request || "").trim()) addAction("Repeat", () => { closeModal(elements.tasksModal); sendMessage(task.request); });
+  if (task.status === "interrupted" || task.status === "error") {
+    addAction("Resume", async () => {
+      const result = await callApi("resume_task", task.task_id);
+      if (!result.ok) return toast(result.error, true);
+      closeModal(elements.tasksModal);
+      toast("Continuing from what was already done.");
+    });
+  }
   if ((task.tools || []).some(name => MUTATION_TOOLS.has(name))) addAction("Undo", () => rollbackTask(task), true);
   card.append(copy, actions);
   return card;

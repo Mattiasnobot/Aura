@@ -179,6 +179,24 @@ class AuraWebBridge:
         threading.Thread(target=self._work, args=(text,), daemon=True, name="aura-agent").start()
         return {"ok": True}
 
+    def resume_task(self, task_id: str) -> dict:
+        """Continue an unfinished task as a fresh task grounded in real state.
+
+        Approvals are deliberately not carried over: the new task asks again for
+        anything that needs permission, exactly as a new request would.
+        """
+        try:
+            brief = self.agent.resume_brief(str(task_id))
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        request = self.agent.format_resume_request(brief)
+        started = self.submit(request)
+        if started.get("ok"):
+            self.agent.log.record("resume_task", "ok", task_id=brief["task_id"],
+                                  completed_steps=len(brief["completed"]),
+                                  outstanding=len(brief["outstanding"]))
+        return {**started, "resumed": brief}
+
     def _on_agent_state(self, name: str) -> None:
         """Forward agent states, translating the retry signal for the interface.
 

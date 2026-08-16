@@ -110,6 +110,7 @@ Aura deliberately refuses to learn credentials and filters health, exact contact
 - Multi-replacement edits are atomic and produce one recovery snapshot.
 - Every request is recorded in `aura-workspace/.aura/tasks.jsonl` with its outcome and redacted tool history.
 - Use **Recent tasks** to inspect outcomes and **Stop** to cancel further tool execution.
+- A task interrupted by a restart shows as **Interrupted** and offers **Resume**. Aura continues from what is verifiably on disk rather than replaying the old conversation, so nothing is done twice and any permission is asked for again.
 - Explicit filenames and target folders become a deterministic artifact contract. Aura checks every exact path before completion.
 - Validation is freshness-aware: any later file mutation invalidates an earlier successful validation.
 - `validate_project` checks every project file without executing project code: Python, JSON, TOML, HTML structure, CSS/JavaScript/TypeScript structure, XML/SVG, and UTF-8 text.

@@ -199,6 +199,26 @@ class Database:
             events.append(event)
         return events
 
+    def task_events_for(self, task_id: str) -> list[dict]:
+        """Every event of one task, oldest first."""
+        rows = self._query(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY rowid_alias",
+            (str(task_id),))
+        events: list[dict] = []
+        for row in rows:
+            event = {"task_id": row["task_id"], "event": row["event"], "time": row["time"]}
+            for key in ("request", "tool", "status", "summary"):
+                if row[key] is not None:
+                    event[key] = row[key]
+            for key in ("arguments", "result"):
+                if row[key] is not None:
+                    try:
+                        event[key] = json.loads(row[key])
+                    except json.JSONDecodeError:
+                        event[key] = {}
+            events.append(event)
+        return events
+
     # --------------------------------------------------------------- changes
 
     def add_change(self, change: dict) -> None:

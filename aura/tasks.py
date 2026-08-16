@@ -77,6 +77,31 @@ class TaskJournal:
             selected = [task for task in selected if task["tools"]]
         return selected
 
+    def task(self, task_id: str) -> dict | None:
+        """One task by id, in the same shape `recent()` produces."""
+        events = self.db.task_events_for(str(task_id))
+        if not events:
+            return None
+        task: dict = {"task_id": str(task_id), "tools": [], "tool_details": [],
+                      "status": "running"}
+        for event in events:
+            if event.get("event") == "started":
+                task.update({"request": event.get("request", ""), "started": event.get("time")})
+            elif event.get("event") == "tool":
+                task["tools"].append(event.get("tool"))
+                result = event.get("result", {}) if isinstance(event.get("result"), dict) else {}
+                task["tool_details"].append({
+                    "tool": event.get("tool"), "time": event.get("time"),
+                    "arguments": event.get("arguments", {}), "result": result,
+                })
+            elif event.get("event") == "finished":
+                task.update({"status": event.get("status"), "summary": event.get("summary", ""),
+                             "finished": event.get("time")})
+        if task["status"] == "running":
+            task["status"] = "interrupted"
+        task["project"] = self._infer_project(task["tool_details"])
+        return task
+
     @staticmethod
     def _infer_project(tool_details: list[dict]) -> str | None:
         """Group a task by the top-level workspace folder its first mutated path lands in."""

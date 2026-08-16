@@ -77,7 +77,7 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
    - **Remaining:** `check_workspace_assets` only crawls HTML statically for broken local references (`aura/validation.py`); there is no automated check for responsive layouts or captured browser console errors. This gap is carried forward into phase 43.
    - **Gate:** partially met — Aura can build, launch, inspect, revise, and restore a small site; visual/responsive/console validation is not yet automated.
 
-43. **Durable goals and task engine — In progress (P1)**
+43. **Durable goals and task engine — Complete (P1)**
    - **Step 1 complete 2026-08-14:** `TaskJournal.recent()` (`aura/tasks.py`) now takes
      `only_actionable` (drops tool-free tasks — chit-chat no longer shows up as a task)
      and `active_task_id` (a task left "running" by a crash or restart, other than the
@@ -116,7 +116,30 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
      (safely replaying/continuing an LM Studio tool loop without duplicate side effects
      or stale approvals) is significant enough to warrant its own dedicated
      implementation pass rather than being folded into this one.
-   - **Gate:** an interrupted multi-step build resumes from the correct checkpoint and its history explains what changed and why. *(Not yet met — Steps 1–3 make task history honest, visible, organized by project, and evidence-backed; nothing yet resumes an interrupted build.)*
+   - **Step 4 complete 2026-08-15:** an interrupted task can be resumed. Interrupted and
+     errored cards gain a **Resume** button; `resume_task` builds a brief and submits it
+     as an ordinary new task.
+     **Resume means re-planning from verified state, not replaying the old conversation.**
+     Re-sending the previous turns would repeat side effects — a second `create_file`, a
+     doubled `append_file` — and would carry stale command approvals across a restart.
+     Instead `resume_brief()` reports the original request, every mutating step that
+     succeeded, and **what each of those paths looks like on disk right now**, plus the
+     requested files that still do not exist. Because it is a new task, anything needing
+     permission is asked for again.
+     A step the journal claims succeeded is reported as `MISSING now` when the file is
+     gone — the brief describes reality, not the log. Read-only steps and failed steps are
+     never presented as completed work. Seven tests cover it.
+   - **Live proof of the gate:** Aura was killed mid-build after writing one of three
+     requested files. On restart the task showed as INTERRUPTED, **Resume** ran
+     `list_files` → `write_files` → `validate_project`, and finished with
+     "index.html (already existed), style.css (newly created), about.html (newly created)"
+     — resumed from the correct point, nothing duplicated, and the history explains what
+     changed and why.
+   - **A real bug the live run caught:** the model used `write_files`, whose arguments
+     hold a list rather than a single `path`, so the first brief claimed "no file was
+     successfully changed" while `index.html` sat on disk. Batch arguments are now read
+     properly, with a regression test.
+   - **Gate:** an interrupted multi-step build resumes from the correct checkpoint and its history explains what changed and why. *(Met.)*
 
 44. **Memory v2 — Complete (P2)**
    - **Step 1 complete 2026-08-14:** `MemoryStore.relevant_memories()` (`aura/memory.py`)
@@ -636,3 +659,13 @@ can Aura prove it?* — with four counters, four message styles, and inconsisten
 
 Verified live: "How does my project look these days?" now completes in one round with a
 real answer, where before it burned the retry budget and returned a file listing.
+
+### Known: a rare unreproducible test error
+
+Twice on 2026-08-15 a full `unittest discover` run reported a single error that did not
+recur. Seven consecutive clean runs followed the second one, and the failing test name
+scrolled past before it could be captured, so it remains unidentified. Both sightings
+happened while Aura and a headless browser were also running, which points at a timing
+sensitivity in one of the browser- or port-dependent tests rather than a logic fault —
+but that is a hypothesis, not a finding. If it recurs, capture it with
+`python -m unittest discover -v > run.log 2>&1` and grep the log for `ERROR:`/`FAIL:`.

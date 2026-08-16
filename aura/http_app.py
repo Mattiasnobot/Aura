@@ -30,7 +30,7 @@ API_METHODS = {
     "update_personal_memory", "forget_personal_memory", "revert_personal_memory",
     "export_personal_memory",
     "list_permissions", "grant_folder_access", "revoke_folder_access",
-    "revoke_all_permissions", "external_changes", "undo_external_change",
+    "revoke_all_permissions", "external_changes", "undo_external_change", "resume_task",
     "create_workspace_folder", "create_workspace_file", "rename_workspace_item",
     "move_workspace_item", "copy_workspace_item", "delete_workspace_item",
     "list_trash", "restore_workspace_item", "undo_workspace_change",

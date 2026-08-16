@@ -27,7 +27,7 @@ from .provider import LMStudioProvider, MockProvider, Provider, ProviderContext,
 from .image_diff import compare_images
 from .permissions import ExternalReader, ExternalWriter, PermissionStore
 from .preview_server import PreviewServer
-from .safety import WorkspaceSandbox
+from .safety import SandboxViolation, WorkspaceSandbox
 from .screenshot import (ScreenshotUnavailable, browser_command_preview, capture,
                          find_browser)
 from .search_index import WorkspaceIndex
@@ -88,6 +88,89 @@ class AuraAgent:
         self.last_learned: list[dict] = []
         self.last_recalled: list[dict] = []
         self._sweep_retention()
+
+    MUTATING_TOOL_NAMES = {
+        "create_folder", "create_file", "write_file", "write_files", "append_file",
+        "replace_in_file", "apply_edits", "copy_file", "move_file", "safe_delete_file",
+        "create_archive", "extract_archive", "import_file", "write_external_file",
+    }
+
+    def resume_brief(self, task_id: str) -> dict:
+        """Describe an interrupted task from what is verifiably on disk now.
+
+        Deliberately not a replay of the old conversation: re-sending the model's
+        previous turns would repeat side effects (a second `create_file`, a
+        doubled `append_file`) and would carry stale command approvals across a
+        restart. Resuming instead means planning forward from the real state.
+        """
+        task = self.tasks.task(str(task_id))
+        if task is None:
+            raise KeyError(f"No task {task_id}")
+        if task.get("status") not in {"interrupted", "error", "cancelled"}:
+            raise ValueError("Only an unfinished task can be resumed.")
+
+        done: list[str] = []
+        seen: set[str] = set()
+        for detail in task["tool_details"]:
+            name = str(detail.get("tool") or "")
+            if name not in self.MUTATING_TOOL_NAMES:
+                continue
+            if not (detail.get("result") or {}).get("ok", True):
+                continue
+            arguments = detail.get("arguments") or {}
+            # Batch tools carry a list of files rather than a single path, and a
+            # resume that ignored them would wrongly report "nothing was done".
+            raw_paths = [arguments.get("path") or arguments.get("destination")]
+            for item in (arguments.get("files") or []):
+                raw_paths.append(item.get("path") if isinstance(item, dict) else item)
+            for raw in raw_paths:
+                if not raw:
+                    continue
+                path = self._normalize_path(str(raw))
+                if path in seen:
+                    continue
+                seen.add(path)
+                try:
+                    target = self.sandbox.path(path)
+                    state = (f"exists, {target.stat().st_size} bytes" if target.is_file()
+                             else "folder exists" if target.is_dir() else "MISSING now")
+                except (SandboxViolation, OSError, ValueError):
+                    state = "outside the workspace"
+                done.append(f"{name} → {path} ({state})")
+
+        expected = self._extract_artifact_contract(str(task.get("request", "")))[1]
+        outstanding = []
+        for path in expected:
+            try:
+                if not self.sandbox.path(path).exists():
+                    outstanding.append(path)
+            except (SandboxViolation, OSError, ValueError):
+                continue
+        return {"task_id": task["task_id"], "request": str(task.get("request", "")),
+                "completed": done, "outstanding": outstanding,
+                "status": task.get("status")}
+
+    @staticmethod
+    def format_resume_request(brief: dict) -> str:
+        lines = [
+            "Continue a task that stopped before it finished. Do not repeat work "
+            "that is already done — check the current state first.",
+            "",
+            "The original request was:",
+            str(brief.get("request") or "(not recorded)"),
+        ]
+        completed = brief.get("completed") or []
+        if completed:
+            lines += ["", "Steps that already succeeded, with the state of each path now:"]
+            lines += [f"- {item}" for item in completed[:20]]
+        else:
+            lines += ["", "No file was successfully changed before it stopped."]
+        outstanding = brief.get("outstanding") or []
+        if outstanding:
+            lines += ["", "Requested files that still do not exist:"]
+            lines += [f"- {path}" for path in outstanding[:20]]
+        lines += ["", "Finish only what remains, then verify and report the real result."]
+        return "\n".join(lines)
 
     def _sweep_retention(self) -> None:
         """Expire old recovery records once per launch.
