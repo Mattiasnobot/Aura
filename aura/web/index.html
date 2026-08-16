@@ -81,7 +81,10 @@
             <button id="activityLogTab" class="active" role="tab" aria-selected="true">Activity</button>
             <button id="diagnosticsLogTab" role="tab" aria-selected="false">Diagnostics</button>
           </div>
-          <span id="logCount">0 events this session</span>
+          <div class="panel-heading-end">
+            <button id="exportDiagnostics" class="log-action" title="Write a shareable report of settings, storage, permissions, and recent failures into the workspace">Export report</button>
+            <span id="logCount">0 events this session</span>
+          </div>
         </div>
         <div id="actionLog" class="action-log"></div>
       </section>

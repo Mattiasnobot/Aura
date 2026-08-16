@@ -2363,6 +2363,11 @@ function bindControls() {
   elements.toggleLog.addEventListener("click", () => { logVisible = !logVisible; applyLayout(); scheduleUiSave(); });
   elements.activityLogTab.addEventListener("click", () => setLogMode("activity"));
   elements.diagnosticsLogTab.addEventListener("click", () => setLogMode("diagnostics"));
+  $("#exportDiagnostics").addEventListener("click", async () => {
+    const written = await callApi("export_diagnostics");
+    if (!written.ok) return toast(written.error, true);
+    toast(`Report saved to workspace as ${written.path}.`);
+  });
   $("#collapseSidebar").addEventListener("click", () => {
     const collapsed = elements.sidebar.classList.toggle("collapsed");
     if (collapsed) { expandedSidebarWidth = sidebarWidth; sidebarWidth = 72; $("#collapseSidebar").textContent = "›"; }

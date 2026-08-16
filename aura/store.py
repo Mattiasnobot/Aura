@@ -172,6 +172,41 @@ class Database:
                            "status": row["status"], **details})
         return events
 
+    def failed_actions(self, limit: int) -> list[dict]:
+        """Only what went wrong, newest first — the part worth reading first."""
+        rows = self._query(
+            "SELECT time, action, status, details FROM actions "
+            "WHERE status <> 'ok' ORDER BY rowid_alias DESC LIMIT ?", (int(limit),))
+        events: list[dict] = []
+        for row in rows:
+            try:
+                details = json.loads(row["details"])
+            except (json.JSONDecodeError, TypeError):
+                details = {}
+            events.append({"time": row["time"], "action": row["action"],
+                           "status": row["status"], **details})
+        return events
+
+    def summary(self) -> dict:
+        """Row counts and file size, for a diagnostics report.
+
+        Counts only: nothing here reveals what was said or remembered.
+        """
+        counts = {}
+        for table in ("actions", "task_events", "changes", "change_items", "trash",
+                      "external_changes", "sessions", "messages"):
+            rows = self._query(f"SELECT COUNT(*) AS total FROM {table}")
+            counts[table] = int(rows[0]["total"]) if rows else 0
+        size = 0
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(str(self.path) + suffix)
+            if candidate.exists():
+                size += candidate.stat().st_size
+        return {"counts": counts, "bytes": size,
+                "undone_changes": int(self._query(
+                    "SELECT COUNT(*) AS total FROM changes WHERE undone_at IS NOT NULL"
+                )[0]["total"])}
+
     # ----------------------------------------------------------- task events
 
     def add_task_event(self, event: dict) -> None:
@@ -467,6 +502,12 @@ class Database:
                 (keep,)).rowcount
             expired_external = connection.execute(
                 "DELETE FROM external_changes WHERE time < ?", (cutoff,)).rowcount
+            # Session rows left behind by older builds, which wrote one per
+            # launch. A conversation is its messages; an empty row is not one,
+            # and `add_message` recreates the row the moment anything is said.
+            empty_sessions = connection.execute(
+                "DELETE FROM sessions WHERE id NOT IN "
+                "(SELECT DISTINCT session_id FROM messages)").rowcount
 
         referenced = self.referenced_backups()
         freed = 0
@@ -505,7 +546,8 @@ class Database:
 
         return {"changes_expired": max(0, expired),
                 "external_expired": max(0, expired_external),
-                "backups_freed": freed, "trash_removed": trashed}
+                "backups_freed": freed, "trash_removed": trashed,
+                "empty_sessions_removed": max(0, empty_sessions)}
 
     # ------------------------------------------------------------- migration
 

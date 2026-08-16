@@ -215,6 +215,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .action-panel { min-height: 0; display: flex; flex-direction: column; padding-top: 7px; overflow: hidden; }
 .panel-heading { display: flex; align-items: center; justify-content: space-between; padding: 0 5px 6px; color: #72849b; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
 .log-tabs { display: flex; gap: 4px; }
+.panel-heading-end { display: flex; align-items: center; gap: 10px; }
+.log-action { border: 1px solid transparent; border-radius: 6px; padding: 3px 7px; color: #637990; background: transparent; cursor: pointer; font: inherit; text-transform: uppercase; letter-spacing: .8px; }
+.log-action:hover { color: var(--aura); background: rgba(var(--aura-rgb), .08); }
 .log-tabs button { border: 1px solid transparent; border-radius: 6px; padding: 3px 7px; color: #637990; background: transparent; cursor: pointer; font: inherit; text-transform: uppercase; letter-spacing: .8px; }
 .log-tabs button:hover { color: #a8bdd1; background: #0b1a29; }
 .log-tabs button.active { border-color: rgba(var(--aura-rgb), .28); color: var(--aura); background: rgba(var(--aura-rgb), .08); }

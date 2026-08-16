@@ -73,6 +73,7 @@ With Piper, mouth opening follows the amplitude envelope measured directly from 
 - **Ctrl+O** opens the safe workspace.
 - **Ctrl+,** opens Settings.
 - **Hide/Show action log** gives the conversation more room. **Activity** shows friendly events from the current Aura session, while **Diagnostics** exposes the corresponding technical names and details; the durable audit history is still preserved locally in `aura.db`.
+- **Export report** writes a diagnostics file into the workspace: this machine, the settings in use, storage sizes and row counts, retention sweeps, granted folders, recent tasks, and everything that recently failed. Conversation text, personal memories, and file contents are deliberately left out, so the report can be shared when asking for help. Nothing is uploaded.
 - Use the **+** button or drag up to five files anywhere over Aura to copy them into the protected workspace.
 
 ### Conversations

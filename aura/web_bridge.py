@@ -4,7 +4,9 @@ import base64
 import binascii
 import json
 import os
+import platform
 import re
+import sqlite3
 from collections import deque
 import queue
 import threading
@@ -1076,6 +1078,82 @@ class AuraWebBridge:
         self.agent.log.record("revoke_all_permissions", "ok", revoked=count)
         self._push("permissions_changed", action="revoked_all", revoked=count)
         return {"ok": True, "revoked": count}
+
+    DIAGNOSTIC_SETTINGS = (
+        "lm_studio_url", "model", "timeout", "temperature", "max_tokens",
+        "reasoning_depth", "autonomy_mode", "learn_from_conversations",
+        "vision_mode", "speech_engine", "voice_engine", "avatar_quality",
+    )
+
+    def export_diagnostics(self) -> dict:
+        """Write one readable file describing how this installation is behaving.
+
+        It reports settings, storage, permissions, and what recently failed —
+        never conversation text, memory content, or file contents, so it can be
+        shared without handing over anything private. Nothing is uploaded; the
+        file is written into the workspace and stays there.
+        """
+        try:
+            database = self.agent.db.summary()
+            settings = {key: self.agent.config.data.get(key)
+                        for key in self.DIAGNOSTIC_SETTINGS}
+            failures = self.agent.db.failed_actions(20)
+            tasks = self.agent.tasks.recent(10)
+            grants = self.agent.permissions.active()
+            sweeps = [event for event in self.agent.db.recent_actions(400)
+                      if event.get("action") in {"retention_sweep", "store_migrated"}]
+
+            lines = ["# Aura diagnostics", "",
+                     f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} · local only",
+                     "", "## This machine", "",
+                     f"- Platform: {platform.platform()}",
+                     f"- Python: {platform.python_version()}",
+                     f"- SQLite: {sqlite3.sqlite_version}",
+                     f"- Workspace: `{self.agent.sandbox.root}`",
+                     "", "## Settings", ""]
+            for key in self.DIAGNOSTIC_SETTINGS:
+                lines.append(f"- {key}: `{settings[key]}`")
+
+            lines += ["", "## Storage", "",
+                      f"- Database: {database['bytes'] / 1024:.1f} KB",
+                      f"- Undone changes: {database['undone_changes']}"]
+            for table, total in database["counts"].items():
+                lines.append(f"- {table}: {total} rows")
+
+            lines += ["", "## Retention", ""]
+            lines += ([f"- {event['time']} · {event['action']} · "
+                       + ", ".join(f"{key}={value}" for key, value in event.items()
+                                   if key not in {"time", "action", "status"})
+                       for event in sweeps[-5:]] or ["- Nothing swept yet."])
+
+            lines += ["", "## Folder permissions", ""]
+            lines += ([f"- `{grant.get('root')}` · {grant.get('capability')} · "
+                       f"{grant.get('mode')}" for grant in grants]
+                      or ["- None. Aura can reach only its own workspace."])
+
+            lines += ["", "## Recent tasks", ""]
+            lines += ([f"- {task.get('status')} · {task.get('task_id')} · "
+                       f"{len(task.get('tools') or [])} tools" for task in tasks]
+                      or ["- No tasks yet."])
+
+            lines += ["", "## What recently failed", ""]
+            lines += ([f"- {event['time']} · {event['action']} · {event['status']}"
+                       + (f" · {event.get('error')}" if event.get("error") else "")
+                       for event in failures] or ["- Nothing has failed."])
+
+            lines += ["", "## Not included", "",
+                      "Conversation text, personal memories, and file contents are "
+                      "deliberately left out of this report.", ""]
+
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            target = self.agent.sandbox.write_file(
+                f"aura-diagnostics-{stamp}.md", "\n".join(lines))
+            path = target.relative_to(self.agent.sandbox.root).as_posix()
+            self.agent.log.record("export_diagnostics", "ok", path=path,
+                                  failures=len(failures))
+            return {"ok": True, "path": path, "failures": len(failures)}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     def export_personal_memory(self) -> dict:
         """Write every stored memory into the workspace as readable JSON."""

@@ -28,7 +28,7 @@ API_METHODS = {
     "get_mind_graph", "save_ui_state", "workspace_snapshot", "preview_workspace_file",
     "open_workspace_item", "import_files", "get_personal_memory", "add_personal_memory",
     "update_personal_memory", "forget_personal_memory", "revert_personal_memory",
-    "export_personal_memory",
+    "export_personal_memory", "export_diagnostics",
     "list_permissions", "grant_folder_access", "revoke_folder_access",
     "revoke_all_permissions", "external_changes", "undo_external_change", "resume_task",
     "list_sessions", "new_session", "open_session", "archive_session",

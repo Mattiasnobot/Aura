@@ -1247,6 +1247,17 @@ class RetentionTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.box.undo_last_change()      # nothing undoable is left
 
+    def test_sweeping_clears_empty_session_rows_but_keeps_real_conversations(self):
+        """Older builds wrote a session row per launch; those are not conversations."""
+        database = self.box.db
+        database.start_session("launched-and-never-used")
+        database.add_message("spoke", "user", "hello", "2026-08-01T00:00:00+00:00")
+
+        summary = database.sweep(self.box.history, self.box.trash)
+        self.assertEqual(summary["empty_sessions_removed"], 1)
+        self.assertEqual([item["id"] for item in database.sessions(10)], ["spoke"])
+        self.assertTrue(database.session_messages("spoke"))
+
     def test_sweeping_expires_a_change_with_its_items_and_backups(self):
         self.box.write_file("keep.txt", "v1")
         self.box.write_file("keep.txt", "v2")          # this one has a backup
@@ -2423,6 +2434,25 @@ class WebBridgeTests(unittest.TestCase):
         self.assertEqual(
             [item["id"] for item in self.bridge.list_sessions(30, True)["sessions"]],
             [current])
+
+    def test_diagnostics_report_describes_the_install_without_private_content(self):
+        agent = self.bridge.agent
+        agent.memory.set_name("Maya")
+        agent.memory.learn_fact("interest", "teal paint", source="user")
+        agent.handle("remember my favourite colour is teal")
+        agent.log.record("connect_model", "error", error="Connection refused")
+
+        written = self.bridge.export_diagnostics()
+        self.assertTrue(written["ok"])
+        text = (agent.sandbox.root / written["path"]).read_text(encoding="utf-8")
+        # Useful for diagnosing: what failed, how it is configured, how big it got.
+        self.assertIn("Connection refused", text)
+        self.assertIn("lm_studio_url", text)
+        self.assertIn("messages:", text)
+        self.assertIn("None. Aura can reach only its own workspace.", text)
+        # Private by construction: no conversation text, no memory content.
+        self.assertNotIn("teal", text)
+        self.assertNotIn("Maya", text)
 
     def test_exporting_a_conversation_writes_readable_markdown(self):
         self.bridge.agent.handle("remember my name is Maya")
