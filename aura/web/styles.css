@@ -540,7 +540,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .power-note { grid-column: 1; }
   .memory-overview { grid-template-columns: 1fr 1fr; }.memory-overview label { grid-column: 1 / -1; }.memory-teach { grid-template-columns: 1fr; }.memory-item { grid-template-columns: 1fr; }.memory-actions { justify-content: flex-end; }.memory-editor { grid-template-columns: 1fr; }
   .workspace-content { grid-template-columns: 1fr; }.workspace-tree-panel { border-right: 0; }.workspace-preview-panel { position: absolute; inset: 64px 0 34px; background: #06101a; }.workspace-preview-panel:not(.active) { display: none; }
-  .message-task-card { grid-column: 1 / -1; }
+  .message-task-card, .proposal-card { grid-column: 1 / -1; }
   .memory-recall-note { grid-column: 1 / -1; }
 }
 
@@ -582,3 +582,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .status-line { margin-top: var(--s2); color: var(--text-muted); font-size: var(--t-caption); text-align: center; }
 .status-line .dot { display: inline-block; width: 6px; height: 6px; margin-right: 5px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok); }
 .ghost-button.subtle { color: var(--text-dim); }
+
+/* A proposal from a background check: a decision, so it looks like one. */
+.proposal-card { grid-column: 2; width: min(610px, 100%); margin-top: var(--s2); padding: var(--s4); border: 1px solid var(--border-strong); border-left: 3px solid var(--warn); border-radius: var(--r-md); background: var(--surface-2); }
+.proposal-head { color: var(--warn); font-size: var(--t-caption); text-transform: uppercase; letter-spacing: .7px; }
+.proposal-card p { margin: var(--s2) 0 var(--s4); color: var(--text-soft); font-size: var(--t-body); line-height: 1.5; }
+.proposal-actions { display: flex; gap: var(--s2); }

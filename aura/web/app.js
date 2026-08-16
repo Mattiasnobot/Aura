@@ -280,6 +280,53 @@ function attachTaskCard(article, task) {
   article.append(card);
 }
 
+async function showPendingProposals() {
+  // A proposal that arrived while the window was shut comes back from the
+  // conversation as plain text, with no way to answer it. The buttons are what
+  // make it a decision, so they are restored on load rather than only when the
+  // event happens to be live.
+  const result = await callApi("list_proposals");
+  if (!result.ok) return;
+  for (const proposal of result.proposals || []) {
+    const message = addMessage("assistant", "Still waiting on you:");
+    attachProposal(message?.article, proposal);
+  }
+}
+
+function attachProposal(article, proposal) {
+  // A proposal is a decision, so it gets buttons rather than a paragraph the
+  // user has to answer in prose.
+  if (!article || !proposal) return;
+  const card = document.createElement("div");
+  card.className = "proposal-card";
+  const head = document.createElement("div");
+  head.className = "proposal-head";
+  head.textContent = "Nothing has been changed yet";
+  const body = document.createElement("p");
+  body.textContent = proposal.request;
+  const actions = document.createElement("div");
+  actions.className = "proposal-actions";
+  const approve = document.createElement("button");
+  approve.className = "control-button";
+  approve.textContent = "Do it";
+  approve.addEventListener("click", async () => {
+    const result = await callApi("approve_proposal", proposal.id);
+    if (!result.ok) return toast(result.error, true);
+    card.remove();
+  });
+  const dismiss = document.createElement("button");
+  dismiss.className = "control-button";
+  dismiss.textContent = "Leave it";
+  dismiss.addEventListener("click", async () => {
+    const result = await callApi("dismiss_proposal", proposal.id);
+    if (!result.ok) return toast(result.error, true);
+    card.remove();
+  });
+  actions.append(approve, dismiss);
+  card.append(head, body, actions);
+  article.append(card);
+}
+
 function attachRecallNote(article, recalled) {
   if (!article || !(recalled || []).length) return;
   const note = document.createElement("details");
@@ -578,6 +625,7 @@ async function handleEvent(event) {
         completedMessage = addMessage("assistant", event.text);
       }
       attachTaskCard(completedMessage?.article, event.task);
+      attachProposal(completedMessage?.article, event.proposal);
       attachRecallNote(completedMessage?.article, event.recalled);
       updateSuggestions(event.text, event.task);
       announce(event.text);
@@ -625,6 +673,13 @@ async function handleEvent(event) {
     case "network": renderNetworkStatus(event); break;
     case "autonomy": renderAutonomyStatus(event); break;
     case "approval": showApproval(event); break;
+    case "approval_closed":
+      // Answered elsewhere — Stop, an emergency stop, or shutdown.
+      if (!currentApproval || currentApproval === event.approval_id) {
+        currentApproval = null;
+        elements.approvalModal.classList.add("hidden");
+      }
+      break;
     case "settings_saved": toast("Settings saved locally."); break;
     case "memory_learned": {
       const learned = event.memories || [];
@@ -2905,6 +2960,7 @@ async function initialize() {
     const previewPath = new URLSearchParams(window.location.search).get("preview");
     if (previewPath) await openWorkspaceExplorer(previewPath);
     if (!bootstrap.onboarded) startOnboarding(bootstrap.workspace);
+    await showPendingProposals();
     await callApi("check_provider");
     eventPollTimer = setInterval(pollEvents, pollIntervalMs);
   } catch (error) {

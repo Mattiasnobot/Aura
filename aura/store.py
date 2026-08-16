@@ -91,6 +91,20 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
 );
 CREATE INDEX IF NOT EXISTS scheduled_due ON scheduled_tasks (enabled, next_run);
 
+-- Work a background check would like to do but must not do on its own. A
+-- proposal never runs by itself: it waits here until the user approves it, and
+-- is then submitted as an ordinary foreground request.
+CREATE TABLE IF NOT EXISTS proposals (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    finding TEXT NOT NULL,
+    request TEXT NOT NULL,
+    created TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS proposals_status ON proposals (status, created);
+
 CREATE TABLE IF NOT EXISTS external_changes (
     id TEXT PRIMARY KEY,
     path TEXT NOT NULL,
@@ -153,6 +167,10 @@ class Database:
         # that needs to know whether this database has schedules can ask, rather
         # than probing for a table. The mechanism becomes load-bearing the first
         # time a *column* changes, which no `IF NOT EXISTS` can do for us.
+        (),
+        # 3 — `proposals` arrived, on the same terms as 2: the table reaches an
+        # existing database through SCHEMA, and the version is what lets code
+        # ask whether this database understands proposals.
         (),
     )
 
@@ -424,6 +442,38 @@ class Database:
         start = max(0, found - width // 3)
         end = min(len(flat), start + width)
         return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
+
+
+    # ------------------------------------------------------------- proposals
+
+    def add_proposal(self, source: str, finding: str, request: str) -> dict:
+        identifier = uuid4().hex[:12]
+        self._execute(
+            "INSERT INTO proposals (id, source, finding, request, created, status) "
+            "VALUES (?, ?, ?, ?, ?, 'pending')",
+            (identifier, str(source), str(finding)[:600], str(request)[:1200], _now()))
+        return self.proposal(identifier)
+
+    def proposal(self, identifier: str) -> dict | None:
+        rows = self._query("SELECT * FROM proposals WHERE id = ?", (str(identifier),))
+        return dict(rows[0]) if rows else None
+
+    def proposals(self, status: str = "pending", limit: int = 20) -> list[dict]:
+        rows = self._query(
+            "SELECT * FROM proposals WHERE (? = '' OR status = ?) "
+            "ORDER BY created DESC LIMIT ?", (str(status), str(status), int(limit)))
+        return [dict(row) for row in rows]
+
+    def pending_proposal_for(self, source: str, request: str) -> dict | None:
+        """So a repeating check does not stack the same proposal every hour."""
+        rows = self._query(
+            "SELECT * FROM proposals WHERE status = 'pending' AND source = ? AND request = ?",
+            (str(source), str(request)[:1200]))
+        return dict(rows[0]) if rows else None
+
+    def decide_proposal(self, identifier: str, status: str) -> None:
+        self._execute("UPDATE proposals SET status = ?, decided_at = ? WHERE id = ?",
+                      (str(status), _now(), str(identifier)))
 
     # ------------------------------------------------------------- schedules
 

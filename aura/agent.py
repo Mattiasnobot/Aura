@@ -29,6 +29,7 @@ from .commands import CommandAgent
 from .config import ConfigStore
 from .memory import MemoryStore
 from .provider import LMStudioProvider, MockProvider, Provider, ProviderContext, ToolCall
+from . import checks
 from . import services
 from . import toolkit
 from .toolkit import tool
@@ -649,7 +650,18 @@ class AuraAgent:
                     token(retry.notice)
                 messages.append({"role": "system", "content": retry.instruction})
                 continue
-            if state_of_turn.empty_response:
+            if state_of_turn.empty_response and state_of_turn.successful_tools:
+                # The work happened; only the closing sentence did not. Raising
+                # here threw away the truth — a live run removed a broken link
+                # and then reported "I couldn't complete that safely", which is
+                # the opposite of what occurred. Aura writes the report herself
+                # from what she actually did.
+                response.content = self._format_silent_completion(state_of_turn)
+                state_of_turn.record_unconfirmed(
+                    "the model stopped responding before summarising, so this "
+                    "description was assembled from the recorded actions")
+                state_of_turn.empty_response = False
+            elif state_of_turn.empty_response:
                 raise RuntimeError(
                     "the model kept returning an empty response. Check that a model "
                     "is loaded in LM Studio, or try a shorter request")
@@ -718,6 +730,20 @@ class AuraAgent:
                 turn.validation_evidence = dict(result)
                 turn.validation_scope = requested_path
         turn.verification_needed = bool(turn.pending_verifications)
+
+    def _format_silent_completion(self, turn: TurnState) -> str:
+        """Say what was done when the model stops before saying it itself.
+
+        Only facts Aura recorded: the tools that succeeded and the files it read
+        back. Nothing here guesses at intent.
+        """
+        task = self.tasks.task(self.current_task_id) if self.current_task_id else None
+        done = [str(name) for name in (task or {}).get("tools", []) if name]
+        summary = ", ".join(f"`{name}`" for name in list(dict.fromkeys(done))[:8]) if done else ""
+        lines = ["I finished the work but stopped before describing it."]
+        if summary:
+            lines.append(f"What actually ran: {summary}.")
+        return "\n\n".join(lines)
 
     def _gate_empty_response(self, turn: TurnState, response) -> GateResult:
         """An empty completion is usually a stumble, not a verdict.
@@ -950,6 +976,9 @@ class AuraAgent:
         if includes("remind", "reminder", "later", "in an hour", "tomorrow",
                     "don't let me forget", "meelde"):
             names.add("set_reminder")
+        if includes("keep an eye", "watch for", "check regularly", "every day",
+                    "notice when", "let me know if"):
+            names.add("set_check")
         if includes("zip", "archive", "compress"):
             names.update({"create_archive", "extract_archive", "list_files"})
         if includes("open", "launch", "preview"):
@@ -1802,6 +1831,29 @@ class AuraAgent:
     def _tool_recent_tasks(self, name, args, approve, call):
         result = {"tasks": self.tasks.recent(max(1, min(int(args.get("limit", 5)), 20)))}
         return result
+
+    @tool('set_check',
+          "Watch something in the workspace on a schedule and speak only when there is "
+          "something worth saying. Read-only: a check never changes anything.",
+          {'check': {'type': 'string', 'enum': checks.names(),
+                     'description': 'Which check to run'},
+           'every_minutes': {'type': 'integer', 'minimum': 15, 'maximum': 20160,
+                             'description': 'How often, at least every 15 minutes'}},
+          ['check', 'every_minutes'])
+    def _tool_set_check(self, name, args, approve, call):
+        wanted = str(args.get("check", "")).strip()
+        if checks.get(wanted) is None:
+            raise ValueError(f"unknown check {wanted!r}; choose one of {', '.join(checks.names())}")
+        every = max(15, min(int(args.get("every_minutes", 1440)), 20160))
+        existing = [task for task in self.db.scheduled_tasks(include_disabled=False)
+                    if task.get("kind") == "check" and task.get("request") == wanted]
+        if existing:
+            return {"check": wanted, "already_scheduled": True,
+                    "next_run": existing[0]["next_run"]}
+        due = datetime.now(timezone.utc) + timedelta(minutes=every)
+        task = self.db.add_scheduled("check", wanted, every_minutes=every,
+                                     next_run=due.isoformat())
+        return {"check": wanted, "every_minutes": every, "next_run": task["next_run"]}
 
     #: A reminder only ever shows a message, so the model may set one. It may
     #: not schedule anything else: this tool hard-codes the kind, so nothing it

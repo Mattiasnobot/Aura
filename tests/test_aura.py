@@ -3,6 +3,7 @@ import io
 import json
 import math
 import os
+import queue
 import re
 import sqlite3
 import struct
@@ -24,6 +25,7 @@ from urllib.request import Request, urlopen
 import package
 import aura_app
 from aura import __version__ as aura_version
+from aura import checks
 from aura import services
 from aura import toolkit
 from aura.turn import PASS, TurnState
@@ -1894,6 +1896,30 @@ class LMStudioProviderTests(unittest.TestCase):
             self.assertEqual(provider.complete.call_count, 2)
             self.assertIn("completely empty", nudges[-1]["content"])
 
+    def test_work_that_succeeded_is_not_reported_as_a_failure(self):
+        """From a live run: she removed a broken link, then went silent, and
+        Aura said "I couldn't complete that safely" — the opposite of the truth.
+        The work happened; only the closing sentence did not."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            replies = iter([
+                ProviderReply("", [ToolCall("1", "write_file",
+                                            {"path": "page.html", "content": "<h1>fixed</h1>"})]),
+                ProviderReply("", []), ProviderReply("", []),
+                ProviderReply("", []), ProviderReply("", []),
+            ])
+            provider.complete = unittest.mock.Mock(
+                side_effect=lambda *a, **k: next(replies, ProviderReply("", [])))
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            answer = agent.handle("Fix the broken reference in page.html")
+            self.assertNotIn("couldn’t complete", answer)
+            self.assertIn("stopped before describing it", answer)
+            self.assertIn("write_file", answer)
+            # And it says plainly that the description is Aura's, not the model's.
+            self.assertIn("Not confirmed", answer)
+            self.assertEqual(agent.sandbox.read_file("page.html"), "<h1>fixed</h1>")
+            self.assertEqual(agent.tasks.recent(1)[0]["status"], "completed")
+
     def test_a_model_that_never_answers_is_reported_plainly(self):
         with tempfile.TemporaryDirectory() as temporary:
             provider = LMStudioProvider(model="local-model")
@@ -2705,6 +2731,31 @@ class WebBridgeTests(unittest.TestCase):
         self.assertIn("**You**", text)
         self.assertIn("**Aura**", text)
         self.assertFalse(self.bridge.export_conversation("does-not-exist")["ok"])
+
+    def test_stopping_closes_the_dialog_it_refuses(self):
+        """Found by looking at the screen, not the API: Stop unblocked the
+        waiting thread but left the approval card on display with nothing
+        behind it, and Escape then answered a dead approval instead of closing.
+        """
+        waiting = queue.Queue(maxsize=1)
+        with self.bridge._approval_lock:
+            self.bridge._approvals["abc123"] = waiting
+        self.bridge.stop()
+        self.assertEqual(waiting.get_nowait(), "deny")
+        closed = [event for event in self.bridge.events
+                  if event.get("type") == "approval_closed"]
+        self.assertEqual([event["approval_id"] for event in closed], ["abc123"])
+        self.assertEqual(self.bridge._approvals, {})
+
+    def test_an_emergency_stop_also_closes_a_waiting_dialog(self):
+        waiting = queue.Queue(maxsize=1)
+        with self.bridge._approval_lock:
+            self.bridge._approvals["xyz789"] = waiting
+        self.bridge.emergency_stop()
+        self.assertEqual(waiting.get_nowait(), "deny")
+        self.assertTrue(any(event.get("type") == "approval_closed"
+                            and event.get("approval_id") == "xyz789"
+                            for event in self.bridge.events))
 
     def test_bridge_streams_structured_events_without_exposing_raw_tools(self):
         self.assertTrue(self.bridge.submit("hello")["ok"])
@@ -3688,6 +3739,216 @@ class AutonomyGuardTests(unittest.TestCase):
         self.assertIsNone(self.guard.next_opening(self.at(12)))
 
 
+class ProposalTests(unittest.TestCase):
+    """Nothing changes on its own. A proposal waits to be seen, then runs in
+    the foreground like any other request."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        agent.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00")
+        self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+        self.bridge.scheduler.stop()
+        self.agent = agent
+        self.agent.sandbox.write_file(
+            "page.html", '<html><head><title>t</title></head><body>'
+                         '<img src="gone.png" alt="x"></body></html>')
+
+    def tearDown(self):
+        self.bridge.shutdown()
+        self.temp.cleanup()
+
+    def run_check(self, check="broken_links"):
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        self.agent.db.add_scheduled("check", check, every_minutes=60, next_run=past)
+        return self.bridge.scheduler.tick()
+
+    def test_a_fixable_finding_produces_a_proposal_and_changes_nothing(self):
+        before = self.agent.sandbox.read_file("page.html")
+        self.run_check()
+        pending = self.bridge.list_proposals()["proposals"]
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["source"], "broken_links")
+        self.assertIn("gone.png", pending[0]["request"])
+        # The point of the whole phase: nothing was touched.
+        self.assertEqual(self.agent.sandbox.read_file("page.html"), before)
+        self.assertEqual(self.agent.sandbox.list_files(), ["page.html"])
+
+    def test_the_proposal_is_offered_in_the_conversation(self):
+        self.run_check()
+        said = self.agent.memory.data["conversation"][-1]["text"]
+        self.assertIn("While you were away", said)
+        self.assertIn("I can fix that if you want", said)
+
+    def test_a_repeating_check_does_not_stack_the_same_proposal(self):
+        self.run_check()
+        self.run_check()
+        self.assertEqual(len(self.bridge.list_proposals()["proposals"]), 1)
+
+    def test_approving_runs_it_as_an_ordinary_foreground_request(self):
+        """Not a special execution path: it goes through submit, so every gate,
+        approval dialog and snapshot applies as usual."""
+        self.run_check()
+        proposal = self.bridge.list_proposals()["proposals"][0]
+        with patch.object(self.bridge, "submit", return_value={"ok": True}) as submit:
+            result = self.bridge.approve_proposal(proposal["id"])
+        self.assertTrue(result["ok"])
+        submit.assert_called_once_with(proposal["request"])
+        self.assertEqual(self.bridge.list_proposals()["proposals"], [])
+        self.assertEqual(self.agent.db.proposal(proposal["id"])["status"], "approved")
+
+    def test_a_refused_submit_leaves_the_proposal_waiting(self):
+        self.run_check()
+        proposal = self.bridge.list_proposals()["proposals"][0]
+        with patch.object(self.bridge, "submit",
+                          return_value={"ok": False, "error": "Aura is already working."}):
+            result = self.bridge.approve_proposal(proposal["id"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(len(self.bridge.list_proposals()["proposals"]), 1)
+
+    def test_dismissing_removes_it_without_doing_anything(self):
+        self.run_check()
+        proposal = self.bridge.list_proposals()["proposals"][0]
+        self.assertTrue(self.bridge.dismiss_proposal(proposal["id"])["ok"])
+        self.assertEqual(self.bridge.list_proposals()["proposals"], [])
+        self.assertEqual(self.agent.db.proposal(proposal["id"])["status"], "dismissed")
+        self.assertEqual(self.agent.sandbox.list_files(), ["page.html"])
+
+    def test_a_decided_proposal_cannot_be_decided_again(self):
+        self.run_check()
+        proposal = self.bridge.list_proposals()["proposals"][0]
+        self.bridge.dismiss_proposal(proposal["id"])
+        self.assertFalse(self.bridge.approve_proposal(proposal["id"])["ok"])
+        self.assertFalse(self.bridge.dismiss_proposal(proposal["id"])["ok"])
+
+    def test_a_finding_without_a_fix_proposes_nothing(self):
+        """A repeated failure is worth knowing about; what to do about it is
+        judgement Aura does not have."""
+        for _ in range(3):
+            self.agent.log.record("request", "error", error="LM Studio timed out")
+        self.run_check("recent_failures")
+        self.assertEqual(self.bridge.list_proposals()["proposals"], [])
+        self.assertIn("failed 3 times", self.agent.memory.data["conversation"][-1]["text"])
+
+    def test_no_tool_lets_the_model_approve_its_own_proposal(self):
+        offered = {item["function"]["name"] for item in self.agent.tool_definitions()}
+        for forbidden in ("approve_proposal", "dismiss_proposal", "list_proposals"):
+            self.assertNotIn(forbidden, offered)
+
+
+class RecurringCheckTests(unittest.TestCase):
+    """Read-only, deterministic, and quiet unless there is something to say."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        agent.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00")
+        self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+        self.bridge.scheduler.stop()
+        self.agent = agent
+
+    def tearDown(self):
+        self.bridge.shutdown()
+        self.temp.cleanup()
+
+    def schedule(self, check="validate_workspace", every=60):
+        return self.agent._execute_tool(
+            ToolCall("1", "set_check", {"check": check, "every_minutes": every}), None)
+
+    def run_now(self):
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        self.agent.db._execute("UPDATE scheduled_tasks SET next_run = ?", (past,))
+        return self.bridge.scheduler.tick()
+
+    def test_a_clean_workspace_is_checked_and_says_nothing(self):
+        """Silence is the normal outcome; a check that says 'all fine' daily
+        teaches its reader to ignore it."""
+        self.schedule()
+        said_before = len(self.agent.memory.data["conversation"])
+        self.run_now()
+        self.assertEqual(len(self.agent.memory.data["conversation"]), said_before)
+        task = self.agent.db.scheduled_tasks()[0]
+        self.assertIn("nothing to report", task["last_outcome"])
+        self.assertEqual(task["runs"], 1)
+
+    def test_a_real_problem_is_spoken(self):
+        self.agent.sandbox.write_file("broken.json", "{ not json at all")
+        self.schedule()
+        self.run_now()
+        said = self.agent.memory.data["conversation"][-1]["text"]
+        self.assertIn("While you were away", said)
+        self.assertIn("Validation is failing", said)
+
+    def test_a_broken_link_is_found(self):
+        self.agent.sandbox.write_file(
+            "page.html", '<html><head><title>t</title></head><body>'
+                         '<img src="missing.png" alt="x"></body></html>')
+        self.schedule("broken_links")
+        self.run_now()
+        said = self.agent.memory.data["conversation"][-1]["text"]
+        self.assertIn("broken local reference", said)
+        self.assertIn("missing.png", said)
+
+    def test_a_repeated_failure_becomes_a_pattern_worth_mentioning(self):
+        """One failure is an event; the same one three times is a pattern —
+        exactly what the diagnostics export made visible by hand."""
+        for _ in range(3):
+            self.agent.log.record("request", "error", error="LM Studio timed out")
+        self.schedule("recent_failures")
+        self.run_now()
+        said = self.agent.memory.data["conversation"][-1]["text"]
+        self.assertIn("failed 3 times", said)
+        self.assertIn("timed out", said)
+
+    def test_one_failure_is_not_a_pattern(self):
+        self.agent.log.record("request", "error", error="a one-off blip")
+        self.schedule("recent_failures")
+        self.run_now()
+        self.assertNotIn("blip", str(self.agent.memory.data["conversation"]))
+
+    def test_a_check_repeats_rather_than_retiring(self):
+        self.schedule(every=30)
+        self.run_now()
+        still = self.bridge.list_scheduled()["scheduled"]
+        self.assertEqual(len(still), 1)
+        self.assertGreater(still[0]["next_run"], datetime.now(timezone.utc).isoformat())
+
+    def test_the_same_check_is_not_scheduled_twice(self):
+        self.schedule()
+        second = self.schedule()
+        self.assertTrue(second["already_scheduled"])
+        self.assertEqual(len(self.bridge.list_scheduled()["scheduled"]), 1)
+
+    def test_only_a_known_check_can_be_scheduled(self):
+        """The vocabulary is fixed on purpose: free text here would turn a check
+        into an arbitrary background agent turn."""
+        refused = self.agent._execute_tool(
+            ToolCall("1", "set_check", {"check": "rm -rf everything", "every_minutes": 60}), None)
+        self.assertFalse(refused["ok"])
+        self.assertIn("unknown check", refused["error"])
+        self.assertEqual(self.agent.db.scheduled_tasks(), [])
+
+    def test_a_check_never_writes_anything(self):
+        self.agent.sandbox.write_file("keep.txt", "untouched")
+        before = {path: self.agent.sandbox.read_file(path)
+                  for path in self.agent.sandbox.list_files()}
+        for name in checks.names():
+            self.schedule(name)
+        self.run_now()
+        after = {path: self.agent.sandbox.read_file(path)
+                 for path in self.agent.sandbox.list_files()}
+        self.assertEqual(before, after)
+
+    def test_the_user_can_see_and_cancel_what_is_scheduled(self):
+        self.schedule()
+        listed = self.bridge.list_scheduled()
+        self.assertEqual(len(listed["scheduled"]), 1)
+        self.assertTrue(any(item["name"] == "validate_workspace"
+                            for item in listed["available_checks"]))
+        self.assertTrue(self.bridge.cancel_scheduled(listed["scheduled"][0]["id"])["ok"])
+        self.assertEqual(self.bridge.list_scheduled()["scheduled"], [])
+
+
 class ReminderTests(unittest.TestCase):
     """The first real handler: it proves 48.1 and 48.2 work together."""
 
@@ -3926,10 +4187,10 @@ class AutonomyControlTests(unittest.TestCase):
         """It knows exactly the kinds that have been built and nothing else.
 
         This asserted an empty registry while 48.2 was the whole of the
-        scheduler; 48.3 added the first handler, so the assertion moved with the
-        code rather than being dropped.
+        scheduler; 48.3 added reminders and 48.4 added checks, so the assertion
+        moves with the code each time rather than being dropped.
         """
-        self.assertEqual(set(self.bridge.scheduler.handlers), {"reminder"})
+        self.assertEqual(set(self.bridge.scheduler.handlers), {"reminder", "check"})
 
     def test_the_bootstrap_carries_the_envelope(self):
         autonomy = self.bridge.get_bootstrap()["autonomy"]

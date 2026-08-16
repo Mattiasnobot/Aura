@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from . import __version__
+from . import checks
 from .agent import AuraAgent
 from .graph_model import build_mind_graph
 from .preview_server import PreviewServer
@@ -81,6 +82,7 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         self.scheduler = Scheduler(self.agent.db, self.agent.autonomy,
                                    self.agent.log, busy=self._is_busy)
         self.scheduler.register("reminder", self._deliver_reminder)
+        self.scheduler.register("check", self._run_check)
         self.scheduler.start()
 
     def _deliver_reminder(self, task: dict) -> str:
@@ -99,6 +101,81 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
             threading.Thread(target=lambda: self.speech.speak(spoken),
                              daemon=True, name="aura-reminder-voice").start()
         return f"delivered: {text[:80]}"
+
+    def _run_check(self, task: dict) -> str:
+        """Run one read-only check and speak only if it found something.
+
+        Silence is the normal outcome and is recorded as such. A recurring check
+        that says "all fine" every day teaches its reader to skip it, and then
+        the once it matters it gets skipped too.
+        """
+        wanted = str(task.get("request", ""))
+        check = checks.get(wanted)
+        if check is None:
+            raise ValueError(f"unknown check {wanted!r}")
+        finding = check.run(self.agent)
+        if not finding:
+            return f"{wanted}: nothing to report"
+        spoken = f"While you were away — {finding.message}"
+        proposal = None
+        if finding.proposal:
+            # Stored, not done. The whole phase rests on this: an approval has
+            # to be given for a situation the user has actually seen, and a
+            # background run has not been seen by anyone.
+            proposal = (self.agent.db.pending_proposal_for(wanted, finding.proposal)
+                        or self.agent.db.add_proposal(wanted, finding.message, finding.proposal))
+            spoken += '\n\nI can fix that if you want: ' + finding.proposal
+        self.agent._remember("assistant", spoken)
+        self._push("reply", text=spoken, streamed=False, check=wanted,
+                   proposal=proposal)
+        return f"{wanted}: {finding.message[:120]}"
+
+    def list_proposals(self) -> dict:
+        return {"ok": True, "proposals": self.agent.db.proposals("pending")}
+
+    def approve_proposal(self, proposal_id: str) -> dict:
+        """Run a proposal now, in the foreground, as if the user had typed it.
+
+        Deliberately not a special execution path: it goes through `submit`, so
+        every completion gate, approval dialog, and recoverable snapshot applies
+        exactly as it would to any other request.
+        """
+        proposal = self.agent.db.proposal(str(proposal_id))
+        if not proposal or proposal.get("status") != "pending":
+            return {"ok": False, "error": "That proposal is no longer waiting."}
+        started = self.submit(str(proposal["request"]))
+        if not started.get("ok"):
+            return started
+        self.agent.db.decide_proposal(str(proposal_id), "approved")
+        self.agent.log.record("approve_proposal", "ok", proposal_id=str(proposal_id),
+                              source=proposal.get("source"))
+        self._push("proposals_changed", pending=len(self.agent.db.proposals("pending")))
+        return {"ok": True, "request": proposal["request"]}
+
+    def dismiss_proposal(self, proposal_id: str) -> dict:
+        proposal = self.agent.db.proposal(str(proposal_id))
+        if not proposal or proposal.get("status") != "pending":
+            return {"ok": False, "error": "That proposal is no longer waiting."}
+        self.agent.db.decide_proposal(str(proposal_id), "dismissed")
+        self.agent.log.record("dismiss_proposal", "ok", proposal_id=str(proposal_id))
+        self._push("proposals_changed", pending=len(self.agent.db.proposals("pending")))
+        return {"ok": True}
+
+    def list_scheduled(self) -> dict:
+        """Everything waiting to happen on its own, reminders and checks alike."""
+        tasks = self.agent.db.scheduled_tasks(include_disabled=False)
+        return {"ok": True, "scheduled": tasks,
+                "available_checks": [{"name": name, "description": checks.get(name).description}
+                                     for name in checks.names()]}
+
+    def cancel_scheduled(self, task_id: str) -> dict:
+        task = self.agent.db.scheduled_task(str(task_id))
+        if not task:
+            return {"ok": False, "error": "That is no longer scheduled."}
+        self.agent.db.delete_scheduled_task(str(task_id))
+        self.agent.log.record("cancel_scheduled", "ok", task_id=str(task_id),
+                              kind=task.get("kind"))
+        return {"ok": True}
 
     def list_reminders(self) -> dict:
         reminders = [task for task in self.agent.db.scheduled_tasks(include_disabled=False)
@@ -412,14 +489,22 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         return {"ok": True}
 
     def _deny_pending_approvals(self) -> None:
+        """Refuse everything waiting, and tell the browser so.
+
+        Unblocking the waiting thread is only half of it: without the event the
+        card stayed on screen with nothing behind it, and because the client
+        still believed an approval was live, Escape went to answering that
+        instead of closing anything. Pressing Stop left a dead dialog.
+        """
         with self._approval_lock:
-            pending = list(self._approvals.values())
+            pending = list(self._approvals.items())
             self._approvals.clear()
-        for reply in pending:
+        for approval_id, reply in pending:
             try:
                 reply.put_nowait("deny")
             except queue.Full:
                 pass
+            self._push("approval_closed", approval_id=approval_id)
 
 
     NEURAL_VOICE_FOLDER = "aura-voices"
