@@ -24,6 +24,7 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .action_log import ActionLog
+from .autonomy import AutonomyGuard
 from .commands import CommandAgent
 from .config import ConfigStore
 from .memory import MemoryStore
@@ -99,6 +100,9 @@ class AuraAgent:
         # Every external URL actually fetched in the current turn, so a reply
         # that used the network can name what it read.
         self.fetched_sources: list[str] = []
+        # The envelope for anything done unasked. Built before the
+        # scheduler that will use it, so nothing can be scheduled first.
+        self.autonomy = AutonomyGuard(self.config, self.log)
         self.session_id = str(self.config.data.get("current_session") or "") or uuid4().hex[:12]
         self.config.update(current_session=self.session_id)
         # No session row is written here: `add_message` creates one on the first

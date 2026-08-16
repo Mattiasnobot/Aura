@@ -28,6 +28,7 @@ from aura import services
 from aura import toolkit
 from aura.turn import PASS, TurnState
 from aura.action_log import ActionLog
+from aura.autonomy import AutonomyGuard
 from aura.agent import AuraAgent, TaskCancelled
 from aura.errors import AuraError
 from aura.memory import MemoryStore
@@ -3591,6 +3592,143 @@ class SchemaVersionTests(unittest.TestCase):
         """A shipped migration must never be edited or renumbered, so the list
         may only grow; entry 1 is the baseline that existing databases match."""
         self.assertEqual(Database.MIGRATIONS[0], ())
+
+
+class AutonomyGuardTests(unittest.TestCase):
+    """The one piece whose job is to say no, so it is tested exhaustively."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.config = ConfigStore(root / "config.json")
+        self.log = ActionLog(root / "aura.db")
+        self.guard = AutonomyGuard(self.config, self.log)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def at(self, hour, minute=0):
+        return datetime(2026, 8, 16, hour, minute)
+
+    def test_a_window_that_crosses_midnight_is_handled(self):
+        """22:00–08:00 is the normal case and the one a naive comparison breaks."""
+        self.config.update(quiet_hours_start="22:00", quiet_hours_end="08:00")
+        for hour in (22, 23, 0, 3, 7):
+            self.assertTrue(self.guard.in_quiet_hours(self.at(hour)), f"{hour}:00 should be quiet")
+        for hour in (8, 12, 18, 21):
+            self.assertFalse(self.guard.in_quiet_hours(self.at(hour)), f"{hour}:00 should be open")
+
+    def test_a_daytime_window_also_works(self):
+        self.config.update(quiet_hours_start="09:00", quiet_hours_end="17:00")
+        self.assertTrue(self.guard.in_quiet_hours(self.at(12)))
+        self.assertFalse(self.guard.in_quiet_hours(self.at(20)))
+        self.assertFalse(self.guard.in_quiet_hours(self.at(3)))
+
+    def test_an_empty_window_means_never_quiet(self):
+        self.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00")
+        self.assertFalse(self.guard.in_quiet_hours(self.at(3)))
+
+    def test_nonsense_hours_fall_back_instead_of_opening_the_night(self):
+        self.config.update(quiet_hours_start="25:99", quiet_hours_end="")
+        self.assertTrue(self.guard.in_quiet_hours(self.at(23)))
+        self.assertFalse(self.guard.in_quiet_hours(self.at(12)))
+
+    def test_pausing_refuses_everything_and_says_so(self):
+        self.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00")
+        self.guard.pause("emergency stop")
+        verdict = self.guard.may_run(self.at(12))
+        self.assertFalse(verdict)
+        self.assertIn("paused", verdict.reason)
+        self.guard.resume()
+        self.assertTrue(self.guard.may_run(self.at(12)))
+
+    def test_the_daily_allowance_is_counted_from_the_durable_log(self):
+        self.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00",
+                           autonomy_daily_runs=3)
+        for index in range(3):
+            self.guard.note_run(f"check {index}")
+        verdict = self.guard.may_run(self.at(12))
+        self.assertFalse(verdict)
+        self.assertIn("limit of 3", verdict.reason)
+        # A restart must not hand back a fresh allowance.
+        restarted = AutonomyGuard(self.config, ActionLog(Path(self.temp.name) / "aura.db"))
+        self.assertFalse(restarted.may_run(self.at(12)))
+
+    def test_a_zero_cap_means_no_background_work_at_all(self):
+        self.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00",
+                           autonomy_daily_runs=0)
+        self.assertFalse(self.guard.may_run(self.at(12)))
+
+    def test_budgets_are_clamped_however_they_are_configured(self):
+        self.config.update(autonomy_run_seconds=99999, autonomy_daily_runs=99999)
+        self.assertEqual(self.guard.run_seconds(), AutonomyGuard.HARD_RUN_SECONDS)
+        self.assertEqual(self.guard.daily_cap(), AutonomyGuard.HARD_DAILY_CAP)
+        self.config.update(autonomy_run_seconds=1)
+        self.assertEqual(self.guard.run_seconds(), 10)
+
+    def test_a_refusal_always_explains_itself(self):
+        """A background run that silently does not happen is worse than one that
+        says why."""
+        for setup in ({"autonomy_paused": True},
+                      {"autonomy_daily_runs": 0},
+                      {"quiet_hours_start": "00:00", "quiet_hours_end": "23:59"}):
+            self.config.update(autonomy_paused=False, autonomy_daily_runs=12,
+                               quiet_hours_start="22:00", quiet_hours_end="08:00")
+            self.config.update(**setup)
+            verdict = self.guard.may_run(self.at(12))
+            self.assertFalse(verdict, setup)
+            self.assertTrue(verdict.reason.strip(), setup)
+
+    def test_it_can_say_when_the_window_reopens(self):
+        self.config.update(quiet_hours_start="22:00", quiet_hours_end="08:00")
+        opening = self.guard.next_opening(self.at(23, 30))
+        self.assertEqual((opening.hour, opening.minute), (8, 0))
+        self.assertEqual(opening.day, 17)                    # the following morning
+        self.assertIsNone(self.guard.next_opening(self.at(12)))
+
+
+class AutonomyControlTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+
+    def tearDown(self):
+        self.bridge.shutdown()
+        self.temp.cleanup()
+
+    def test_the_interface_can_see_what_is_allowed_and_why_not(self):
+        self.bridge.agent.config.update(quiet_hours_start="00:00", quiet_hours_end="23:59")
+        status = self.bridge.autonomy_status()["autonomy"]
+        self.assertFalse(status["allowed"])
+        self.assertIn("quiet hours", status["reason"])
+        self.assertIn("quiet_hours", status)
+        self.assertEqual(status["runs_today"], 0)
+
+    def test_pausing_and_resuming_round_trip(self):
+        self.assertTrue(self.bridge.pause_autonomy(True)["autonomy"]["paused"])
+        self.assertTrue(self.bridge.agent.config.data["autonomy_paused"])
+        self.assertFalse(self.bridge.pause_autonomy(False)["autonomy"]["paused"])
+
+    def test_emergency_stop_also_cancels_what_is_running(self):
+        """Pausing alone would let an in-flight run finish, which is not what
+        anybody means by a stop control."""
+        self.bridge.agent.cancel_event.clear()
+        status = self.bridge.emergency_stop()["autonomy"]
+        self.assertTrue(status["paused"])
+        self.assertTrue(self.bridge.agent.cancel_event.is_set())
+        self.assertTrue(any(event.get("action") == "emergency_stop"
+                            for event in self.bridge.agent.log.recent(20)))
+
+    def test_the_bootstrap_carries_the_envelope(self):
+        autonomy = self.bridge.get_bootstrap()["autonomy"]
+        self.assertIn("paused", autonomy)
+        self.assertIn("daily_cap", autonomy)
+
+    def test_no_tool_lets_the_model_widen_its_own_envelope(self):
+        offered = {item["function"]["name"] for item in self.bridge.agent.tool_definitions()}
+        for forbidden in ("pause_autonomy", "emergency_stop", "autonomy_status"):
+            self.assertNotIn(forbidden, offered)
 
 
 class FilePlanTests(unittest.TestCase):

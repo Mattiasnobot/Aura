@@ -18,6 +18,14 @@ DEFAULTS = {
     "vision_probe": {},
     "current_session": None,
     "onboarded": False,
+    # The envelope around anything Aura does unasked. Off-hours by default and a
+    # modest daily allowance, so background work has to be widened deliberately
+    # rather than discovered later.
+    "autonomy_paused": False,
+    "quiet_hours_start": "22:00",
+    "quiet_hours_end": "08:00",
+    "autonomy_daily_runs": 12,
+    "autonomy_run_seconds": 120,
     "speak_responses": False,
     "speech_engine": "piper",
     "speech_model": "aura-voices/en_US-lessac-medium.onnx",

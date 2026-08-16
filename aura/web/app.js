@@ -5,7 +5,7 @@ const elements = {
   app: $("#app"), sidebar: $("#sidebar"), sidebarResizer: $("#sidebarResizer"),
   main: $(".main-panel"), face: $("#faceWrap"), state: $("#stateLabel"),
   activity: $("#activityText"), provider: $("#providerLabel"), power: $("#powerLabel"),
-  networkLabel: $("#networkLabel"), conversation: $("#conversation"),
+  networkLabel: $("#networkLabel"), pauseAutonomy: $("#pauseAutonomy"), conversation: $("#conversation"),
   composer: $("#composer"), send: $("#sendButton"), stop: $("#stopButton"),
   actionPanel: $("#actionPanel"), actionLog: $("#actionLog"), logResizer: $("#logResizer"),
   logCount: $("#logCount"), toggleLog: $("#toggleLogButton"), workspacePath: $("#workspacePath"),
@@ -600,6 +600,7 @@ async function handleEvent(event) {
                                   event.source || "timing", lastEventAgeMs);
       break;
     case "network": renderNetworkStatus(event); break;
+    case "autonomy": renderAutonomyStatus(event); break;
     case "approval": showApproval(event); break;
     case "settings_saved": toast("Settings saved locally."); break;
     case "memory_learned": {
@@ -1511,6 +1512,19 @@ async function grantDomainAccess(event) {
   $("#domainName").value = "";
   toast(`Aura may now read ${result.grant.root}`);
   await openPermissions(false);
+}
+
+function renderAutonomyStatus(status) {
+  if (!status) return;
+  const paused = Boolean(status.paused);
+  elements.pauseAutonomy.textContent = paused ? "Background: paused" : "Background: on";
+  elements.pauseAutonomy.classList.toggle("paused", paused);
+  elements.pauseAutonomy.setAttribute("aria-pressed", String(paused));
+  // The reason matters more than the state: a background run that quietly does
+  // not happen is worse than one that says why.
+  elements.pauseAutonomy.title = status.allowed
+    ? `Background work is allowed. ${status.runs_today}/${status.daily_cap} runs used today, quiet hours ${status.quiet_hours}.`
+    : status.reason || "Background work is not allowed right now.";
 }
 
 function renderNetworkStatus(network) {
@@ -2635,6 +2649,19 @@ function bindControls() {
   $("#newSessionButton").addEventListener("click", startNewSession);
   $("#permissionGrant").addEventListener("submit", grantFolderAccess);
   $("#domainGrant").addEventListener("submit", grantDomainAccess);
+  elements.pauseAutonomy.addEventListener("click", async () => {
+    const paused = elements.pauseAutonomy.classList.contains("paused");
+    const result = await callApi("pause_autonomy", !paused);
+    if (!result.ok) return toast(result.error, true);
+    renderAutonomyStatus(result.autonomy);
+    toast(paused ? "Background work resumed." : "Background work paused.");
+  });
+  $("#emergencyStop").addEventListener("click", async () => {
+    const result = await callApi("emergency_stop");
+    if (!result.ok) return toast(result.error, true);
+    renderAutonomyStatus(result.autonomy);
+    toast("Stopped. Background work is paused and anything running was cancelled.", true);
+  });
   $("#permissionRevokeAll").addEventListener("click", revokeAllPermissions);
   $("#settingsButton").addEventListener("click", openSettings);
   $("#workspaceButton").addEventListener("click", async () => {
@@ -2815,6 +2842,7 @@ async function initialize() {
     elements.workspacePath.title = bootstrap.workspace;
     updatePowerStatus(bootstrap.capabilities || {});
     renderNetworkStatus(bootstrap.network);
+    renderAutonomyStatus(bootstrap.autonomy);
     clearConversation();
     logEvents = [...(bootstrap.actions || [])];
     setLogMode("activity");

@@ -114,6 +114,7 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
             "version": __version__,
             "onboarded": bool(config["onboarded"]),
             "network": self.network_status()["network"],
+            "autonomy": self.autonomy_status()["autonomy"],
             "session_id": self.agent.session_id,
             "workspace": str(self.agent.sandbox.root),
             "conversation": conversation,

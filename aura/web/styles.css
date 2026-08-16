@@ -222,6 +222,11 @@ button { color: inherit; }
 .provider-label.offline { color: #f98383; }
 .power-label { margin-top: -5px; color: var(--text-dim); font-size: var(--t-micro); text-align: center; letter-spacing: .15px; }
 .network-label { margin-top: 2px; color: var(--text-dim); font-size: var(--t-micro); text-align: center; letter-spacing: .15px; }
+.autonomy-row { display: flex; gap: var(--s1); margin-top: var(--s2); }
+.autonomy-toggle, .autonomy-stop { flex: 1 1 auto; border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--s1) var(--s2); background: var(--surface-2); color: var(--text-muted); font-size: var(--t-micro); cursor: pointer; }
+.autonomy-toggle:hover, .autonomy-stop:hover { color: var(--text); border-color: var(--border-strong); }
+.autonomy-toggle.paused { color: var(--warn); border-color: rgba(255, 180, 84, .4); }
+.autonomy-stop { flex: 0 0 auto; color: var(--danger-soft); border-color: var(--danger-border); background: var(--danger-surface); }
 .network-label.online { color: var(--aura); }
 .permission-hint { margin: 0 22px 10px; color: var(--text-dim); font-size: var(--t-label); }
 

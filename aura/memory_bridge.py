@@ -98,6 +98,48 @@ class MemoryBridge:
                                   error=str(exc))
             return {"ok": False, "error": str(exc)}
 
+    def autonomy_status(self) -> dict:
+        """What background work is allowed right now, and why not when it is not."""
+        guard = self.agent.autonomy
+        verdict = guard.may_run()
+        start, end = guard.quiet_window()
+        return {"ok": True, "autonomy": {
+            "paused": guard.paused(),
+            "allowed": bool(verdict),
+            "reason": verdict.reason,
+            "quiet_hours": f"{start // 60:02d}:{start % 60:02d}–{end // 60:02d}:{end % 60:02d}",
+            "in_quiet_hours": guard.in_quiet_hours(),
+            "runs_today": guard.runs_today(),
+            "daily_cap": guard.daily_cap(),
+            "run_seconds": guard.run_seconds(),
+        }}
+
+    def pause_autonomy(self, paused: bool = True) -> dict:
+        """Pause or resume background work. Only the user calls this."""
+        if paused:
+            self.agent.autonomy.pause("paused from the interface")
+        else:
+            self.agent.autonomy.resume()
+        status = self.autonomy_status()
+        self._push("autonomy", **status["autonomy"])
+        return status
+
+    def emergency_stop(self) -> dict:
+        """Stop everything now: pause background work *and* cancel what is running.
+
+        Pausing alone would let an in-flight run finish, which is not what
+        anybody means when they reach for a stop control.
+        """
+        self.agent.autonomy.pause("emergency stop")
+        self.agent.cancel_current()
+        self._deny_pending_approvals()
+        self.speech.stop()
+        self.agent.log.record("emergency_stop", "ok")
+        status = self.autonomy_status()
+        self._push("autonomy", **status["autonomy"])
+        self._push("state", value="idle")
+        return status
+
     def network_status(self) -> dict:
         """Whether Aura can reach anything at all, and exactly what."""
         domains = sorted({str(grant.get("root", "")) for grant in self.agent.permissions.active()
