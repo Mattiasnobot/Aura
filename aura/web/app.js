@@ -2038,8 +2038,24 @@ async function quitAura() {
 function showApproval(event) {
   currentApproval = event.approval_id;
   const kind = event.command?.[0];
-  $("#approvalTitle").textContent = kind === "HTTP GET" ? "Network approval" : kind === "OPEN" ? "Open application" : "Command approval";
-  elements.approvalCommand.textContent = event.command.map(part => /\s/.test(part) ? JSON.stringify(part) : part).join(" ");
+  const plan = kind === "PLAN";
+  $("#approvalTitle").textContent = plan ? "Before Aura builds this"
+    : kind === "HTTP GET" ? "Network approval"
+    : kind === "OPEN" ? "Open application" : "Command approval";
+  // A plan is a list to read, not a command to scan, so it keeps its line breaks
+  // and the wording asks about the shape of the work rather than permission.
+  $("#approvalLead").textContent = plan
+    ? "These are the files she would create. Approving is cheaper than undoing:"
+    : "Aura wants to use a capability that needs your permission:";
+  $("#approvalNote").textContent = plan
+    ? "Denying stops before anything is written, and you can describe a different list."
+    : "“Allow identical for task” covers only this exact command or URL until the current task ends.";
+  $("#allowTaskApproval").classList.toggle("hidden", plan);
+  $("#allowApproval").textContent = plan ? "Build these" : "Allow once";
+  $("#denyApproval").textContent = plan ? "Stop" : "Deny";
+  elements.approvalCommand.textContent = plan
+    ? event.command.slice(1).join("\n")
+    : event.command.map(part => /\s/.test(part) ? JSON.stringify(part) : part).join(" ");
   openModal(elements.approvalModal);
 }
 

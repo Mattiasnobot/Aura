@@ -3593,6 +3593,86 @@ class SchemaVersionTests(unittest.TestCase):
         self.assertEqual(Database.MIGRATIONS[0], ())
 
 
+class FilePlanTests(unittest.TestCase):
+    """A multi-file build agrees its file list before creating anything."""
+
+    def _agent(self, temporary, replies):
+        provider = LMStudioProvider(model="local-model")
+        provider.complete = unittest.mock.Mock(side_effect=lambda *a, **k: next(replies))
+        return AuraAgent(Path(temporary) / "workspace", provider=provider), provider
+
+    def test_a_multi_file_build_asks_before_writing_anything(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            replies = iter([
+                ProviderReply("site/index.html - the page\nsite/style.css - styling", []),
+                ProviderReply("", [ToolCall("1", "create_file",
+                                            {"path": "site/index.html", "content": "<h1>Hi</h1>"})]),
+                ProviderReply("", [ToolCall("2", "create_file",
+                                            {"path": "site/style.css", "content": "h1{}"})]),
+                ProviderReply("Both files are in place.", []),
+            ])
+            agent, provider = self._agent(temporary, replies)
+            asked = []
+            agent.handle("Build a site in the site folder with index.html and style.css",
+                         approve=lambda request: asked.append(request) or True)
+            self.assertEqual(asked[0][0], "PLAN")
+            self.assertIn("index.html", asked[0][1])
+            self.assertIn("style.css", asked[0][1])
+            self.assertTrue(agent.sandbox.path("site/index.html").is_file())
+            # The plan is handed to the model as already approved.
+            instructions = "".join(str(m) for call in provider.complete.call_args_list
+                                   for m in call.args[0] if m.get("role") == "system")
+            self.assertIn("already approved this exact file plan", instructions)
+
+    def test_declining_the_plan_creates_nothing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            replies = iter([ProviderReply("site/index.html - page\nsite/style.css - css", [])])
+            agent, provider = self._agent(temporary, replies)
+            answer = agent.handle("Build a site in the site folder with index.html and style.css",
+                                  approve=lambda request: False)
+            self.assertIn("stopped before creating anything", answer)
+            self.assertEqual(agent.sandbox.list_files(), [])
+            # One call for the plan, and nothing after it.
+            self.assertEqual(provider.complete.call_count, 1)
+
+    def test_a_single_file_request_is_not_worth_a_plan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            replies = iter([
+                ProviderReply("", [ToolCall("1", "create_file",
+                                            {"path": "notes.txt", "content": "hi"})]),
+                ProviderReply("Created notes.txt.", []),
+            ])
+            agent, _ = self._agent(temporary, replies)
+            asked = []
+            agent.handle("Create a file called notes.txt with the text hi",
+                         approve=lambda request: asked.append(request) or True)
+            self.assertEqual(asked, [])
+
+    def test_a_read_only_request_is_never_planned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            replies = iter([ProviderReply("Both files look fine.", [])])
+            agent, _ = self._agent(temporary, replies)
+            asked = []
+            agent.handle("Read index.html and style.css and tell me what they do",
+                         approve=lambda request: asked.append(request) or True)
+            self.assertEqual(asked, [])
+
+    def test_a_failed_plan_does_not_cost_the_user_their_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            calls = {"n": 0}
+            def complete(*args, **kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise RuntimeError("LM Studio timed out while generating a response.")
+                return ProviderReply("I built what you asked for.", [])
+            provider.complete = unittest.mock.Mock(side_effect=complete)
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            answer = agent.handle("Build a site in the site folder with index.html and style.css",
+                                  approve=lambda request: True)
+            self.assertIn("built what you asked", answer)
+
+
 class CompletionGateTests(unittest.TestCase):
     """Each gate can now be asked its verdict on its own, which the single
     344-line function made impossible."""

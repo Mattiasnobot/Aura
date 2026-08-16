@@ -504,9 +504,24 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
    - **Gate:** met — an approved lookup works, cites what it read, and Aura is fully functional with no grants at all.
 
 48. **Proactive companion — Planned (P2)**
-   - Add queued and scheduled work, reminders, recurring checks, quiet hours, and three autonomy modes: suggest, ask, and act-within-grants.
-   - Surface proposals before execution, enforce retry/time/cost budgets, and provide pause and emergency-stop controls.
-   - **Gate:** a scheduled local task runs only within its saved permissions and produces a concise notification and audit record.
+
+   The original entry put three things on one line that carry very different risk, and building them together would have smuggled the third in behind the first two:
+
+   1. **reminders** — Aura says something at an agreed time; touches the interface only;
+   2. **recurring checks** — she reads, validates, and reports; changes nothing;
+   3. **acting while you are away** — she changes files with nobody watching.
+
+   **Decided with the user (2026-08-16): a scheduled run may read and prepare, and must ask before changing anything.** This is not caution for its own sake. The whole project rests on a grant being given deliberately, never widened by the model, and phase 43 settled that approvals do not carry across a restart or into a resumed task. Unattended mutation breaks exactly that: the approval would have to be given in advance, for a situation nobody has seen yet. So you come back not to a changed workspace but to *"I found three broken links and the fix is ready — apply it?"* — still proactive, honest about who decides.
+
+   A distinction worth writing down, because it could easily be misread: the user has often told Claude to work autonomously. That was about Claude working while the user was present and able to interrupt. Aura acting on the machine while nobody is there is a different thing, and is not covered by it.
+
+   - **48.1 — The safety envelope, first.** Quiet hours, a per-run time budget, a cap on runs per day, and a visible pause plus emergency stop. These are not features to add afterwards; nothing is allowed to be scheduled until they exist and are tested.
+   - **48.2 — The schedule store.** A `scheduled_tasks` table in `aura.db` (owner, request, cadence, next run, last outcome, enabled) and one scheduler thread that wakes, claims what is due, and sleeps. This is **the first real use of the schema versioning from 50.5** — a new table is migration 2, applied to a database that already holds the user's data.
+   - **48.3 — Reminders.** The zero-risk case, and the one that proves the loop end to end: a message at a time, shown in the conversation, recorded like any other event.
+   - **48.4 — Recurring checks.** Read-only work on a cadence — validate a project, look for broken local links, summarise what changed since yesterday — reported as a short digest rather than a wall of output.
+   - **48.5 — Proposals instead of unattended changes.** When a scheduled run reaches something it would have to mutate, it stops, writes a proposal (what it would do, to which paths, and why), and waits. Approving it runs the work as an ordinary foreground task, with every existing gate and the usual recoverable snapshot.
+   - **Notifications stay inside the app** (also decided with the user): the conversation, the activity log, and a badge on the window. No OS toast, so none of the phase 46 notification work is pulled in and no new permission is asked of Windows.
+   - **Gate:** a scheduled check runs on time inside its budget and quiet hours, reports what it found, and — when it wants to change something — produces a proposal that does nothing until approved; pause and emergency stop are provable while a run is in flight.
 
 49. **UX consolidation and release readiness — In progress (P3)**
    - **Done — conversation sessions.** Every message is kept in `aura.db` against a session id, while `memory.data["conversation"]` stays the current session's view so the provider context, bootstrap, and Aura Mind read it unchanged. **New** starts a fresh conversation without destroying the old one; **Conversations** lists them, titled by their first message; opening one restores it as the live context. A session row is written on the first message, so launching Aura and saying nothing leaves no empty conversation behind. **Archive** hides a conversation and **Show archived** brings it back; the live conversation is refused, since archiving what is still collecting messages would hide it mid-use. Conversations are user content and are not touched by the 30-day recovery sweep.
@@ -521,7 +536,7 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
    - Add sticky modal actions, keyboard focus handling, screen-reader summaries, contrast/reduced-motion checks, diagnostics export, first-run onboarding, and dependable packaging/updating.
    - **Gate:** a new user can install, connect LM Studio, choose voice and permissions, complete a first project, understand failures, and recover without opening source files.
 
-50. **Backend structure — In progress (P1)**
+50. **Backend structure — Complete (P1)**
 
    Measured before proposing anything, so this is about what the code does rather than how it looks:
 
@@ -546,6 +561,27 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
    - **50.6 (original entry).** `memory.data["preferences"]` (a flat key/value dict, written by `set_preference` and the `remember_preference` tool) and `profile_memories` with category `preference` (written by `remember_personal_fact`, and the only one that is editable, revertable, confirmable, and exportable) hold the same kind of fact in two places. That is what made Aura Mind draw one preference as two unrelated nodes, and phase 49 papered over it in the graph rather than in the data. The fix is to make `preference` a profile memory everywhere and migrate the existing dict, keeping a read path for anything that still expects the old shape. Deferred out of 50.2 because it changes stored data and needs a migration, not because it is optional.
    - **Deliberately not touched:** the safety model. Sandbox, permissions, and the refusals around them are the strongest part of the project.
    - **Gate:** every step lands separately with the suite green and unmodified, and phases 50.2 and 50.3 are additionally exercised in the running app.
+
+51. **Interface design system — Mostly complete (P2)**
+
+   Same method as phase 50: measure first, then change how something is expressed rather than how it looks.
+
+   | | before | after |
+   |---|---|---|
+   | distinct hex colours | 215 | 120 |
+   | distinct radii | 18 | 12 |
+   | distinct gaps | 13 | 7 |
+   | token uses | 87 | 549 |
+
+   The starting measurement is the argument for the whole phase: **215 colours across 280 uses**, meaning most shades were invented once and never reused. Two borders differing by one step in one channel each appeared five times.
+
+   - **Colour becomes role.** 96 neutral blue-greys collapsed onto seven tokens — four surfaces, two borders, four text levels — plus named meaning (`--accent`, `--ok`, `--warn`, `--danger`, `--info`). Old names (`--panel`, `--line`, `--muted`) stayed as aliases so unmigrated rules keep working; this did not have to be one enormous step.
+   - **Shape, spacing, and type become scales.** 276 declarations moved onto three radii, a seven-step spacing scale, and a seven-step type scale. The steps were taken from what the layout already used, so the density barely moved — **honestly, a handful of values shifted by up to 2px to land on a step**, most visibly the sidebar, which reads slightly calmer for it. 8px text disappeared; the smallest real text is now 9px.
+   - **One base for small control buttons.** Memory cards, task cards, file rows, and the workspace toolbar each carried their own copy of the same four declarations, and each restated the same three colours for their destructive variant. They share one base now, and the variant says only what differs. Verified by computed style: a control button resolves to exactly what each site declared separately before, so nothing moved visually — 25 buttons in the tasks panel now resolve to three shapes on one radius.
+   - **Two real contrast failures found on the way**, in the workspace explorer — a view the phase 49 accessibility pass never opened. File sizes were **2.04:1**, using a *border* colour as text; three toolbar buttons sat at 4.49:1. Both fixed, then re-measured: **738 text nodes across six views, none below 4.5:1**.
+   - **Deliberately untouched:** the avatar's per-state colours, gradients, and rgba washes. Those are Aura's expressions, not interface furniture, and tokenising them would have taken her character away. Roughly 120 raw colours and 27 raw pixel values remain, mostly where a number means something specific — an icon's size, the avatar frame — and those should stay raw.
+   - **Not verified by eye:** the browser pane stopped compositing during the final button change, so the last state was checked through computed styles, the contrast audit, and the suite rather than a screenshot.
+   - **Gate:** met for colour, shape, spacing, and control buttons; the sidebar and composer still carry bespoke rules that could join the system later.
 
 ### Recommended execution sequence
 

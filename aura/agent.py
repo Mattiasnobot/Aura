@@ -408,6 +408,51 @@ class AuraAgent:
         self.sandbox.active_task_id = None
         return response
 
+    #: Returned when the user rejected the plan, which is not the same as no plan.
+    PLAN_DECLINED = object()
+
+    def _plan_files(self, message: str, expected_paths: list[str], requires_mutation: bool,
+                    approve: Callable[[list[str]], bool] | None,
+                    state: Callable[[str], None]) -> object | str:
+        """Agree the file list before creating anything.
+
+        The journal is unambiguous about where this model fails, and it is not
+        knowledge — it is tool calling. Three attempts at "Create a file called X"
+        produced no tool calls at all; "Use create_file to make X" worked at once.
+        A plan turns one large vague instruction into a short list of small
+        concrete ones, and gives the user somewhere to correct the shape of the
+        work before any file exists, which is cheaper than undoing it afterwards.
+
+        Only for a build that names several files, and only when there is
+        somebody to approve it: a plan nobody can confirm would just be an extra
+        round trip.
+        """
+        if len(expected_paths) < 2 or not requires_mutation or approve is None:
+            return ""
+        state("thinking")
+        asked = list(self.provider.start_messages(message, self._context(message)))
+        asked.append({"role": "system", "content":
+            "Do not create anything yet. List only the files you would create for this "
+            "request, one per line, as `path - one short line on what it holds`. Use "
+            "exactly these paths: " + json.dumps(expected_paths) +
+            ". No preamble, no code, no explanation after the list."})
+        try:
+            drafted = self.provider.complete(asked, [])
+        except Exception:
+            # A failed plan must not cost the user their request.
+            return ""
+        lines = [line.strip(" -*\t") for line in str(drafted.content or "").splitlines()]
+        listed = [line for line in lines
+                  if line and any(path.split("/")[-1] in line for path in expected_paths)]
+        if not listed:
+            listed = [f"{path} - part of the requested build" for path in expected_paths]
+        plan = "\n".join(f"- {line}" for line in listed[:20])
+        self.log.record("file_plan", "ok", files=len(listed))
+        if not approve(["PLAN", plan]):
+            self.log.record("file_plan", "declined", files=len(listed))
+            return self.PLAN_DECLINED
+        return plan
+
     def _reply_without_tools(self, message: str, approve: Callable[[list[str]], bool] | None,
                              set_state: Callable[[str], None]) -> str:
         """Answer when the configured provider cannot call tools at all.
@@ -477,6 +522,17 @@ class AuraAgent:
             # a workspace contract can only ever fail. This one was reached three
             # times in a row on the same request before it was rephrased.
             expected_paths = []
+        plan = self._plan_files(message, expected_paths,
+                                self._requires_mutation(routing_request), approve, state)
+        if plan is self.PLAN_DECLINED:
+            return ("I stopped before creating anything. Tell me what the file list "
+                    "should be instead and I'll follow that.")
+        if plan:
+            messages.insert(1, {"role": "system", "content":
+                "The user has already approved this exact file plan:\n" + plan +
+                "\nCreate these files one at a time, one create_file call per file, in "
+                "this order. Do not batch them, do not add files that are not listed, "
+                "and read each one back before reporting completion."})
         host = "Windows" if os.name == "nt" else "a POSIX operating system"
         messages.insert(1, {"role": "system", "content":
             f"Host platform: {host}. run_command executes an argument array directly without a shell. "
