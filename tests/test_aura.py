@@ -13,6 +13,7 @@ import wave
 import zlib
 import zipfile
 from array import array
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
@@ -32,6 +33,7 @@ from aura.preview_server import PreviewServer
 from aura.provider import (LMStudioProvider, MockProvider, ProviderContext, ProviderError,
                            ProviderReply, ToolCall)
 from aura.speech import SpeechOutput
+from aura.store import Database
 from aura.tasks import TaskJournal
 from aura.validation import check_accessibility, check_broken_assets
 from aura.voice import VoiceInput
@@ -357,6 +359,20 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(removed["value"], "HTML for interfaces")
         self.assertEqual(self.agent.memory.profile_memories(), [])
 
+    def test_the_memory_cap_never_evicts_a_pinned_or_confirmed_memory(self):
+        # The cap used to slice the list blindly, so a memory the user had
+        # deliberately pinned could disappear once 250 was reached.
+        memory = self.agent.memory
+        kept = memory.learn_fact("preference", "Pinned and important", source="t",
+                                 confidence=.9, explicit=True)
+        memory.update_profile_memory(kept["id"], pinned=True)
+        for index in range(300):
+            memory.learn_fact("interest", f"Casual interest number {index}",
+                              source="chat", confidence=.5)
+        values = {item["value"] for item in memory.profile_memories()}
+        self.assertIn("Pinned and important", values)
+        self.assertLessEqual(len(memory.profile_memories()), memory.MAX_MEMORIES)
+
     def test_relevant_memories_stamp_and_persist_last_used(self):
         item = self.agent.memory.learn_fact(
             "preference", "HTML interfaces", source="test", confidence=.9, explicit=True)
@@ -592,7 +608,9 @@ class VisionTests(unittest.TestCase):
         task = journal.start("look")
         journal.record_tool(task, "look_at_image", {"path": "shot.png"}, attachment)
         self.assertNotIn("content", journal.recent(1)[0]["tool_details"][0]["result"])
-        self.assertNotIn("base64", journal.path.read_text(encoding="utf-8"))
+        stored = journal.db._query("SELECT result FROM task_events WHERE result IS NOT NULL")
+        self.assertTrue(stored)
+        self.assertFalse(any("base64" in row["result"] for row in stored))
 
     def test_non_image_and_oversized_files_are_refused(self):
         self.agent.sandbox.write_file("notes.txt", "not an image")
@@ -1196,48 +1214,133 @@ class WorkspaceIndexTests(unittest.TestCase):
         self.assertEqual(self.index.refresh(), 1)
 
 
-class LogGrowthTests(unittest.TestCase):
+class RetentionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.box = WorkspaceSandbox(Path(self.temp.name) / "workspace")
 
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_action_log_reads_only_the_tail_of_a_large_file(self):
-        log = ActionLog(self.root / "action-log.jsonl")
-        line = json.dumps({"time": "2026-08-15T00:00:00+00:00", "action": "write_file",
-                           "status": "ok"}) + "\n"
-        log.path.write_text(line * 40_000, encoding="utf-8")
-        log.path.write_text(log.path.read_text(encoding="utf-8")
-                            + json.dumps({"time": "2026-08-15T00:00:01+00:00",
-                                          "action": "last_one", "status": "ok"}) + "\n",
-                            encoding="utf-8")
-        events = log.recent(5)
-        self.assertEqual(events[-1]["action"], "last_one")
-        # Every returned line must be complete JSON, never a fragment.
-        self.assertTrue(all(isinstance(event, dict) for event in events))
+    def _age_change(self, change_id, days):
+        old = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        self.box.db._execute("UPDATE changes SET time = ? WHERE id = ?", (old, change_id))
 
-    def test_action_log_is_capped_and_cut_on_a_line_boundary(self):
-        log = ActionLog(self.root / "action-log.jsonl")
-        log.MAX_BYTES, log.KEEP_BYTES = 20_000, 8_000
-        for index in range(2_000):
-            log.record("write_file", path=f"file{index}.py", filler="x" * 40)
-        self.assertLess(log.path.stat().st_size, 40_000)
-        first = log.path.read_text(encoding="utf-8").splitlines()[0]
-        json.loads(first)  # a truncated first line would raise here
+    def latest_change_id(self):
+        return self.box.db.change_history(1)[0]["id"]
 
-    def test_task_journal_trim_keeps_every_remaining_line_valid(self):
-        journal = TaskJournal(self.root / "tasks.jsonl")
-        journal.path.write_text("".join(
-            json.dumps({"event": "tool", "task_id": f"t{i}", "tool": "write_file",
-                        "arguments": {}, "result": {"ok": True}, "filler": "y" * 200}) + "\n"
-            for i in range(4_000)), encoding="utf-8")
-        journal._trim_if_large(max_bytes=50_000, keep_bytes=20_000)
-        lines = journal.path.read_text(encoding="utf-8").splitlines()
-        self.assertLess(journal.path.stat().st_size, 60_000)
-        for line in lines:
-            json.loads(line)
+    def test_an_undone_change_can_never_be_undone_twice(self):
+        # The whole reason for moving off flat files: an undo used to be a
+        # separate row that retention could delete, resurrecting the change.
+        self.box.write_file("note.txt", "first")
+        self.box.write_file("note.txt", "second")
+        self.box.undo_last_change()
+        self.assertEqual(self.box.read_file("note.txt"), "first")
+        self.box.undo_last_change()          # undoes the *creation*
+        with self.assertRaises(FileNotFoundError):
+            self.box.undo_last_change()      # nothing undoable is left
+
+    def test_sweeping_expires_a_change_with_its_items_and_backups(self):
+        self.box.write_file("keep.txt", "v1")
+        self.box.write_file("keep.txt", "v2")          # this one has a backup
+        old_id = self.latest_change_id()
+        backups = {item for item in self.box.db.referenced_backups()}
+        self.assertTrue(backups)
+        self._age_change(old_id, days=90)
+
+        summary = self.box.db.sweep(self.box.history, self.box.trash, days=30)
+        self.assertGreaterEqual(summary["changes_expired"], 1)
+        self.assertGreaterEqual(summary["backups_freed"], 1)
+        for name in backups:
+            self.assertFalse((self.box.history / name).exists())
+        # Items went with their change rather than being orphaned.
+        rows = self.box.db._query("SELECT * FROM change_items WHERE change_id = ?", (old_id,))
+        self.assertEqual(rows, [])
+
+    def test_a_recent_change_still_undoes_after_a_sweep(self):
+        self.box.write_file("fresh.txt", "one")
+        self.box.write_file("fresh.txt", "two")
+        self.box.db.sweep(self.box.history, self.box.trash, days=30)
+        self.box.undo_last_change()
+        self.assertEqual(self.box.read_file("fresh.txt"), "one")
+
+    def test_a_backup_used_by_an_external_change_survives_the_sweep(self):
+        # history/ has two writers; sweeping must consult both indexes.
+        (self.box.history / "ext_shared.bak").write_text("external", encoding="utf-8")
+        self.box.db.add_external_change({
+            "id": "e1", "path": str(Path(self.temp.name) / "outside.txt"),
+            "backup": "ext_shared.bak", "created": False, "task_id": None,
+            "time": datetime.now(timezone.utc).isoformat(), "undone": False})
+        self.box.db.sweep(self.box.history, self.box.trash, days=30)
+        self.assertTrue((self.box.history / "ext_shared.bak").exists())
+
+    def test_undo_displaced_files_in_trash_are_kept_until_genuinely_old(self):
+        # An undo moves the displaced file into trash without a trash row, so a
+        # reference-based sweep would delete something still recoverable.
+        self.box.write_file("doc.txt", "before")
+        self.box.write_file("doc.txt", "after")
+        self.box.undo_last_change()
+        displaced = list(self.box.trash.iterdir())
+        self.assertTrue(displaced)
+        self.box.db.sweep(self.box.history, self.box.trash, days=30)
+        self.assertTrue(all(item.exists() for item in displaced))
+
+    def test_the_change_cap_keeps_only_the_newest_changes(self):
+        for index in range(12):
+            self.box.write_file(f"f{index}.txt", "x")
+        self.box.db.sweep(self.box.history, self.box.trash, days=3650, max_changes=5)
+        self.assertLessEqual(len(self.box.db.change_history(100)), 5)
+
+
+class MigrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.meta = Path(self.temp.name) / ".aura"
+        self.meta.mkdir(parents=True)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write_jsonl(self, name, rows):
+        (self.meta / name).write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+            encoding="utf-8")
+
+    def test_old_tombstones_become_undone_at_and_originals_are_kept(self):
+        self.write_jsonl("changes.jsonl", [
+            {"id": "c1", "operation": "write_file", "time": "2026-08-01T00:00:00+00:00",
+             "task_id": "t1", "items": [{"path": "a.txt", "backup": "c1_0.bak"}]},
+            {"id": "c2", "operation": "write_file", "time": "2026-08-02T00:00:00+00:00",
+             "task_id": "t1", "items": [{"path": "b.txt", "backup": None}]},
+            {"id": "u1", "operation": "undo", "undo_of": "c2",
+             "time": "2026-08-03T00:00:00+00:00", "items": []},
+        ])
+        self.write_jsonl("action-log.jsonl", [
+            {"time": "2026-08-01T00:00:00+00:00", "action": "write_file", "status": "ok",
+             "path": "a.txt"}])
+        self.write_jsonl("trash.jsonl", [
+            {"trash_name": "x__a.txt", "original_path": "a.txt", "kind": "file",
+             "deleted_at": "2026-08-01T00:00:00+00:00"}])
+
+        db = Database(self.meta / "aura.db")
+        counts = db.migrate_jsonl(self.meta)
+        self.assertEqual(counts.get("changes"), 2)
+        self.assertEqual(counts.get("undone"), 1)
+
+        history = {entry["id"]: entry for entry in db.change_history(10)}
+        self.assertFalse(history["c1"]["undone"])
+        self.assertTrue(history["c2"]["undone"])
+        self.assertEqual(db.last_undoable_change()["id"], "c1")
+        self.assertEqual(db.recent_actions(5)[0]["path"], "a.txt")
+        self.assertIn("x__a.txt", db.trash_entries())
+
+        # The originals are renamed, never deleted, so the old data is provable.
+        self.assertFalse((self.meta / "changes.jsonl").exists())
+        self.assertTrue((self.meta / "changes.jsonl.migrated").is_file())
+
+    def test_migration_is_skipped_when_there_is_nothing_to_import(self):
+        db = Database(self.meta / "aura.db")
+        self.assertEqual(db.migrate_jsonl(self.meta), {})
 
 
 class TaskJournalTests(unittest.TestCase):
@@ -2050,6 +2153,25 @@ class WebBridgeTests(unittest.TestCase):
     def tearDown(self):
         self.bridge.shutdown()
         self.temp.cleanup()
+
+    def test_the_bridge_survives_an_agent_that_logs_while_being_built(self):
+        # Migration and the retention sweep log during AuraAgent.__init__, so
+        # those events reach _on_log before the bridge has finished its own
+        # __init__. Aura used to crash on startup with AttributeError here.
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            meta = workspace / ".aura"
+            meta.mkdir(parents=True)
+            (meta / "changes.jsonl").write_text(json.dumps({
+                "id": "c1", "operation": "write_file", "time": "2026-08-01T00:00:00+00:00",
+                "items": [{"path": "a.txt", "backup": None}]}) + "\n", encoding="utf-8")
+            agent = AuraAgent(workspace, provider=MockProvider())
+            bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+            try:
+                self.assertTrue(any(event.get("type") == "log" for event in bridge.events)
+                                or bridge.get_bootstrap()["app"] == "Aura")
+            finally:
+                bridge.shutdown()
 
     def test_bridge_streams_structured_events_without_exposing_raw_tools(self):
         self.assertTrue(self.bridge.submit("hello")["ok"])

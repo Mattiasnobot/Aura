@@ -1,46 +1,43 @@
 from __future__ import annotations
 
-import json
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from .store import Database
+
 
 class TaskJournal:
-    """Append-only records of requests, tool work, and outcomes."""
+    """Records of requests, tool work, and outcomes, stored in the local database."""
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+    def __init__(self, path: Path | Database) -> None:
+        if isinstance(path, Database):
+            self.db = path
+            self._owns_db = False
+        else:
+            self.db = Database(Path(path).parent / "aura.db")
+            self._owns_db = True
 
     def start(self, request: str) -> str:
         task_id = uuid4().hex[:12]
-        self._append({"event": "started", "task_id": task_id, "time": self._now(),
-                      "request": request[:4000]})
+        self.db.add_task_event({"event": "started", "task_id": task_id, "time": self._now(),
+                                "request": request[:4000]})
         return task_id
 
     def record_tool(self, task_id: str, name: str, arguments: dict, result: dict) -> None:
         safe_result = {key: value for key, value in result.items() if key != "content"}
-        self._append({"event": "tool", "task_id": task_id, "time": self._now(),
-                      "tool": name, "arguments": arguments, "result": safe_result})
+        self.db.add_task_event({"event": "tool", "task_id": task_id, "time": self._now(),
+                                "tool": name, "arguments": arguments, "result": safe_result})
 
     def finish(self, task_id: str, status: str, summary: str) -> None:
-        self._append({"event": "finished", "task_id": task_id, "time": self._now(),
-                      "status": status, "summary": summary[:4000]})
+        self.db.add_task_event({"event": "finished", "task_id": task_id, "time": self._now(),
+                                "status": status, "summary": summary[:4000]})
 
     def recent(self, limit: int = 10, *, only_actionable: bool = False,
                active_task_id: str | None = None) -> list[dict]:
-        if not self.path.exists():
-            return []
         tasks: dict[str, dict] = {}
         order: list[str] = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for event in self.db.task_events(max(1, int(limit))):
             task_id = event.get("task_id")
             if not task_id:
                 continue
@@ -92,31 +89,6 @@ class TaskJournal:
             if "/" in normalized:
                 return normalized.split("/", 1)[0]
         return None
-
-    def _append(self, event: dict) -> None:
-        with self._lock:
-            self._trim_if_large()
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
-
-    def _trim_if_large(self, max_bytes: int = 2_000_000, keep_bytes: int = 1_000_000) -> None:
-        """Keep the journal from growing without bound; recent() only ever needs the tail.
-
-        Trimming cuts on a line boundary: slicing by character count left a
-        half-written JSON object as the first line, which was then silently
-        discarded on every read.
-        """
-        try:
-            size = self.path.stat().st_size if self.path.exists() else 0
-            if size <= max_bytes:
-                return
-            with self.path.open("rb") as handle:
-                handle.seek(size - keep_bytes)
-                handle.readline()  # drop the partial line
-                kept = handle.read()
-            self.path.write_bytes(kept)
-        except OSError:
-            pass
 
     @staticmethod
     def _now() -> str:

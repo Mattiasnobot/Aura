@@ -8,13 +8,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from .store import Database
+
 
 class SandboxViolation(ValueError):
     """Raised when an operation attempts to leave the Aura workspace."""
 
 
 class WorkspaceSandbox:
-    def __init__(self, root: str | Path = "aura-workspace") -> None:
+    def __init__(self, root: str | Path = "aura-workspace",
+                 database: "Database | None" = None) -> None:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.trash = self.root / ".aura-trash"
@@ -23,8 +26,7 @@ class WorkspaceSandbox:
         self.meta.mkdir(exist_ok=True)
         self.history = self.meta / "history"
         self.history.mkdir(exist_ok=True)
-        self.change_log = self.meta / "changes.jsonl"
-        self.trash_index = self.meta / "trash.jsonl"
+        self.db = database or Database(self.meta / "aura.db")
         self.active_task_id: str | None = None
 
     def path(self, relative: str | Path, *, allow_meta: bool = False) -> Path:
@@ -206,14 +208,7 @@ class WorkspaceSandbox:
         return moved
 
     def list_trash(self) -> list[dict]:
-        index = {}
-        if self.trash_index.exists():
-            for line in self.trash_index.read_text(encoding="utf-8").splitlines():
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                index[entry.get("trash_name")] = entry
+        index = self.db.trash_entries()
         items = []
         for child in self.trash.iterdir():
             entry = index.get(child.name)
@@ -224,6 +219,7 @@ class WorkspaceSandbox:
                 "kind": entry.get("kind") if entry else ("folder" if child.is_dir() else "file"),
                 "deleted_at": entry.get("deleted_at") if entry else None,
                 "size": stat.st_size if child.is_file() else None,
+
             })
         items.sort(key=lambda item: item["trash_name"], reverse=True)
         return items
@@ -235,15 +231,8 @@ class WorkspaceSandbox:
         trashed = self.trash / name
         if not trashed.exists():
             raise FileNotFoundError(trash_name)
-        original_path = None
-        if self.trash_index.exists():
-            for line in self.trash_index.read_text(encoding="utf-8").splitlines():
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if entry.get("trash_name") == name:
-                    original_path = entry.get("original_path")
+        entry = self.db.trash_entries().get(name)
+        original_path = entry.get("original_path") if entry else None
         if not original_path:
             raise ValueError(f"Cannot determine the original location for {trash_name}")
         target = self.path(original_path)
@@ -270,12 +259,10 @@ class WorkspaceSandbox:
                 "different": bool(difference), "truncated": truncated}
 
     def _record_trash(self, trashed: Path, original_path: str, kind: str) -> None:
-        entry = {
+        self.db.add_trash({
             "trash_name": trashed.name, "original_path": original_path, "kind": kind,
             "deleted_at": datetime.now(timezone.utc).isoformat(),
-        }
-        with self.trash_index.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        })
 
     def _prune_empty_dirs(self, start: Path) -> None:
         """Remove now-empty ancestor directories left behind after archiving a file to trash."""
@@ -345,19 +332,13 @@ class WorkspaceSandbox:
         return [target for _, target in extracted]
 
     def undo_last_change(self) -> dict:
-        entries = self._read_changes()
-        undone = {entry.get("undo_of") for entry in entries if entry.get("operation") == "undo"}
-        change = next((entry for entry in reversed(entries)
-                       if entry.get("operation") != "undo" and entry.get("id") not in undone), None)
+        change = self.db.last_undoable_change()
         if not change:
             raise FileNotFoundError("There are no workspace changes to undo")
         return self._restore_change(change)
 
     def rollback_task(self, task_id: str) -> dict:
-        entries = self._read_changes()
-        undone = {entry.get("undo_of") for entry in entries if entry.get("operation") == "undo"}
-        changes = [entry for entry in entries if entry.get("operation") != "undo"
-                   and entry.get("task_id") == task_id and entry.get("id") not in undone]
+        changes = self.db.undoable_task_changes(task_id)
         if not changes:
             raise FileNotFoundError(f"Task {task_id} has no active workspace changes")
         restored: list[str] = []
@@ -386,21 +367,13 @@ class WorkspaceSandbox:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(backup_path, target)
             restored.append(item["path"])
-        self._append_change({
-            "id": uuid4().hex, "operation": "undo", "undo_of": change["id"],
-            "time": datetime.now(timezone.utc).isoformat(), "items": [],
-        })
+        # Marking the change itself, rather than appending a separate undo
+        # record, is what makes a change impossible to undo twice.
+        self.db.mark_change_undone(change["id"])
         return {"undid": change["operation"], "paths": restored}
 
     def change_history(self, limit: int = 20) -> list[dict]:
-        entries = self._read_changes()
-        undone = {entry.get("undo_of") for entry in entries if entry.get("operation") == "undo"}
-        changes = [{
-            "id": entry.get("id"), "operation": entry.get("operation"),
-            "time": entry.get("time"), "paths": [item.get("path") for item in entry.get("items", [])],
-            "undone": entry.get("id") in undone, "task_id": entry.get("task_id"),
-        } for entry in entries if entry.get("operation") != "undo"]
-        return list(reversed(changes[-max(1, min(limit, 100)):]))
+        return self.db.change_history(max(1, min(limit, 100)))
 
     def _snapshot(self, operation: str, targets: list[Path]) -> None:
         change_id = uuid4().hex
@@ -414,23 +387,9 @@ class WorkspaceSandbox:
                 backup_name = f"{change_id}_{index}.bak"
                 shutil.copy2(target, self.history / backup_name)
             items.append({"path": relative, "backup": backup_name})
-        self._append_change({
+        self.db.add_change({
             "id": change_id, "operation": operation,
             "time": datetime.now(timezone.utc).isoformat(), "items": items,
             "task_id": self.active_task_id,
         })
 
-    def _append_change(self, change: dict) -> None:
-        with self.change_log.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(change, ensure_ascii=False) + "\n")
-
-    def _read_changes(self) -> list[dict]:
-        if not self.change_log.exists():
-            return []
-        entries = []
-        for line in self.change_log.read_text(encoding="utf-8").splitlines():
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        return entries

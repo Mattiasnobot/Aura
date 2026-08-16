@@ -72,7 +72,7 @@ With Piper, mouth opening follows the amplitude envelope measured directly from 
 - **Ctrl+M** opens Aura Mind.
 - **Ctrl+O** opens the safe workspace.
 - **Ctrl+,** opens Settings.
-- **Hide/Show action log** gives the conversation more room. **Activity** shows friendly events from the current Aura session, while **Diagnostics** exposes the corresponding technical names and details; the durable JSONL audit history is still preserved locally.
+- **Hide/Show action log** gives the conversation more room. **Activity** shows friendly events from the current Aura session, while **Diagnostics** exposes the corresponding technical names and details; the durable audit history is still preserved locally in `aura.db`.
 - Use the **+** button or drag up to five files anywhere over Aura to copy them into the protected workspace.
 
 ### Interactive workspace
@@ -139,7 +139,8 @@ This checks Python, the local HTML service and assets, the LM Studio server, and
 - Deleted files move to `aura-workspace/.aura-trash`.
 - Commands use argument arrays (no command shell), run with the workspace as their working directory, capture output, and time out.
 - Version checks, Python `compileall`/`py_compile`/`json.tool`, and Node syntax checks can be auto-approved when they only target workspace paths. Project runtimes, test suites, package scripts/installers, external HTTP requests, and desktop launches require visible confirmation.
-- Actions are appended to `aura-workspace/.aura/action-log.jsonl`; memory lives beside it in `memory.json`.
+- Actions, tasks, workspace changes, and trash records live in `aura-workspace/.aura/aura.db`; settings, personal memory, and permissions stay as readable JSON beside it.
+- Recovery is kept for 30 days or 500 changes, whichever ends first. Expiring a change removes its backups in the same transaction, and Aura never deletes a backup another record still needs.
 
 ## Tests
 
@@ -167,6 +168,7 @@ The suite currently contains 187 checks, including real PCM level metering, stre
 - `aura/config.py` — persistent local settings
 - `aura/speech.py` — local Piper neural speech with Windows SAPI fallback
 - `aura/memory.py` — JSON preferences and recent conversation
-- `aura/action_log.py` — persistent JSON-lines audit trail
+- `aura/store.py` — one local SQLite file behind the journals and recovery records
+- `aura/action_log.py` — persistent audit trail
 
 Generated project files remain inside `aura-workspace`; use **Open workspace** to inspect them in Explorer. **Clear** only clears the visible chat and does not erase memory or files.

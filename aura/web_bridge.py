@@ -49,6 +49,10 @@ class AuraWebBridge:
         self._event_lock = threading.Lock()
         self._event_sequence = 0
         self._legacy_event_cursor = 0
+        # Every field `_push` touches must exist before the agent is built: the
+        # agent logs during construction (migration and retention), and those
+        # events arrive through `_on_log` before __init__ has finished.
+        self._closing = False
         self.agent = agent or AuraAgent(on_log=self._on_log)
         self.agent.log.on_event = self._on_log
         config = self.agent.config.data
@@ -70,7 +74,6 @@ class AuraWebBridge:
         self._state_lock = threading.Lock()
         self._busy = False
         self._voice_active = False
-        self._closing = False
         self._approvals: dict[str, queue.Queue[str]] = {}
         self._task_approved_exact: dict[str, set[str]] = {}
         self._approval_lock = threading.Lock()

@@ -539,3 +539,58 @@ A deliberate hunt for defects across the project, not tied to one phase.
 - Every `subprocess.run` passes a timeout; the one `Popen` is terminated in a `finally`.
 - Worker threads are daemons; both HTTP servers are closed on shutdown.
 - `aura_diagnostics.py` runs clean against the live setup.
+
+## Local storage moved to SQLite — 2026-08-15
+
+The retention question from the project review turned out to be a correctness problem, not
+a disk-space one, so the storage moved rather than being patched.
+
+**Why.** `_restore_change()` recorded an undo by *appending a tombstone row*, and
+`undo_last_change()` treated a change as undone only while that row existed. Trimming
+`changes.jsonl` by age or size could delete a tombstone and make an already-undone change
+undoable again — Aura would move the current, correct file to trash and copy a stale backup
+over it. A change, its undo record, and its backups had to expire together across two index
+files and a blob folder; hand-rolling that on flat files would have been fragile code thrown
+away by any later migration.
+
+**What changed.** `aura/store.py` holds one `aura.db` (stdlib `sqlite3`, no dependency, an
+embedded file rather than the "database server" the README rules out). Five journals moved
+into it: the action log, task events, workspace changes, the trash index, and external
+changes. `config.json`, `memory.json`, and `permissions.json` deliberately stayed JSON —
+small, hand-editable, and memory export is a user-facing feature.
+
+**The bug is now unrepresentable.** An undo is `undone_at` on the change itself, not a
+separate row, so there is nothing that retention could delete to resurrect a change.
+`change_items` cascade with their change.
+
+**Retention.** `Database.sweep()` expires changes older than 30 days or beyond the newest
+500, in one transaction, then deletes only backups that *neither* recovery table still
+references — `history/` has two writers. `.aura-trash` is swept by age alone, because an
+undo moves the displaced file there without recording a row, so a reference-based sweep
+would delete something still recoverable. Revoked permission grants are dropped after 90
+days. It runs once per launch, wrapped so it can never block startup.
+
+**Public APIs were kept identical** so the pre-existing tests could pass unchanged — that,
+not new tests, is the evidence behaviour was preserved. Only tests that asserted the old
+*file format* were rewritten to query the database instead.
+
+**Three bugs found while doing it.**
+1. The first version kept one open connection, so Windows could not delete the workspace
+   and 153 tests errored. Connections are now opened per operation, which also removes the
+   cross-thread question entirely.
+2. `ORDER BY` inside a `UNION` arm applies to the whole compound select in SQLite; the
+   expiry query became two plain statements.
+3. **Aura would not start.** The agent now logs during construction (migration, sweep), and
+   those events reached the bridge's `_on_log` before `__init__` had set `_closing`.
+   Caught by launching the real app, not by the suite. `_closing` is now initialised before
+   the agent is built, with a regression test.
+
+**Migration.** On first run the JSONL files are imported in one transaction, old tombstones
+folded into `undone_at`, and the originals renamed `*.jsonl.migrated` — kept, not deleted.
+Verified on a copy of the real workspace first: 152 actions, 279 task events, 33 changes,
+2 tombstones converted, and an explicit check that no backup a surviving record still needed
+was deleted. Then verified live: Recent tasks, Workspace history, and a real undo through
+the interface.
+
+**Also fixed:** the 250-memory cap evicted the oldest entry even when the user had pinned or
+confirmed it. It now only drops memories the user never vouched for.

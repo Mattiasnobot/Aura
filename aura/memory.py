@@ -198,9 +198,29 @@ class MemoryStore:
                 "last_used": None,
             }
             memories.append(item)
-            self.data["profile_memories"] = memories[-250:]
+            self.data["profile_memories"] = self._within_cap(memories)
             self.save()
             return {**item, "learning_status": "learned"}
+
+    MAX_MEMORIES = 250
+
+    @classmethod
+    def _within_cap(cls, memories: list[dict]) -> list[dict]:
+        """Enforce the cap by dropping only what the user has not vouched for.
+
+        Slicing the list blindly evicted the oldest entry even when it was
+        pinned or user-confirmed, so a memory the user had deliberately kept
+        could vanish once the cap was reached.
+        """
+        if len(memories) <= cls.MAX_MEMORIES:
+            return memories
+        protected = [item for item in memories
+                     if item.get("pinned") or item.get("confirmed")]
+        droppable = [item for item in memories
+                     if not (item.get("pinned") or item.get("confirmed"))]
+        room = max(0, cls.MAX_MEMORIES - len(protected))
+        keep = set(id(item) for item in protected) | {id(item) for item in droppable[-room:]}
+        return [item for item in memories if id(item) in keep]
 
     def learn_from_message(self, message: str, project: str | None = None) -> list[dict]:
         """Learn only explicit, non-sensitive first-person statements."""

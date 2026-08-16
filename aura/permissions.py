@@ -4,9 +4,11 @@ import json
 import os
 import shutil
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
+
+from .store import Database
 
 
 CAPABILITIES = {"read_folder", "write_folder"}
@@ -201,6 +203,32 @@ class PermissionStore:
                 self.save()
             return count
 
+    def forget_old_revocations(self, days: int = 90) -> int:
+        """Drop long-revoked grants. They carry no recovery value, but the
+        window is generous so the audit trail stays useful for a while."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
+        with self._lock:
+            keep = []
+            removed = 0
+            for grant in self._grants:
+                revoked_at = grant.get("revoked_at")
+                if grant.get("revoked") and revoked_at:
+                    try:
+                        when = datetime.fromisoformat(str(revoked_at))
+                    except ValueError:
+                        keep.append(grant)
+                        continue
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=timezone.utc)
+                    if when < cutoff:
+                        removed += 1
+                        continue
+                keep.append(grant)
+            if removed:
+                self._grants = keep
+                self.save()
+            return removed
+
     def active(self) -> list[dict]:
         with self._lock:
             return [dict(grant) for grant in self._grants if self._live(grant)]
@@ -264,12 +292,16 @@ class ExternalWriter:
     CAPABILITY = "write_folder"
 
     def __init__(self, permissions: PermissionStore, history: Path,
-                 change_log: Path) -> None:
+                 change_log) -> None:
         self.permissions = permissions
         self.history = Path(history)
-        self.change_log = Path(change_log)
         self.history.mkdir(parents=True, exist_ok=True)
-        self.change_log.parent.mkdir(parents=True, exist_ok=True)
+        # A Database keeps every external write in the same transactional store
+        # as workspace changes; a Path is accepted so older callers still work.
+        if isinstance(change_log, Database):
+            self.db = change_log
+        else:
+            self.db = Database(Path(change_log).parent / "aura.db")
         self._lock = threading.RLock()
 
     def _allowed(self, target: str | Path, project: str | None) -> Path:
@@ -301,34 +333,22 @@ class ExternalWriter:
                 shutil.copy2(final, self.history / backup)
             final.parent.mkdir(parents=True, exist_ok=True)
             final.write_text(data, encoding="utf-8")
-            record = {
+            self.db.add_external_change({
                 "id": change_id, "path": str(final), "backup": backup,
                 "created": not existed, "task_id": task_id,
                 "time": datetime.now(timezone.utc).isoformat(),
                 "undone": False,
-            }
-            with self.change_log.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            })
             return {"path": str(final), "bytes": len(data.encode("utf-8")),
                     "created": not existed, "change_id": change_id}
 
     def changes(self, limit: int = 20) -> list[dict]:
-        if not self.change_log.exists():
-            return []
-        entries: list[dict] = []
-        for line in self.change_log.read_text(encoding="utf-8").splitlines():
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        return entries[-max(1, int(limit)):]
+        return self.db.external_changes(max(1, int(limit)))
 
     def undo_last(self) -> dict:
         """Restore the newest external write that has not been undone yet."""
         with self._lock:
-            entries = self.changes(limit=10_000)
-            target_entry = next((entry for entry in reversed(entries)
-                                 if not entry.get("undone")), None)
+            target_entry = self.db.last_external_change()
             if target_entry is None:
                 raise ValueError("There is no external change left to undo.")
             path = Path(str(target_entry["path"]))
@@ -341,8 +361,6 @@ class ExternalWriter:
                 if path.is_file():
                     path.unlink()
                 restored = "removed"
-            target_entry["undone"] = True
-            lines = [json.dumps(entry, ensure_ascii=False) for entry in entries]
-            self.change_log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self.db.mark_external_undone(str(target_entry["id"]))
             return {"path": str(path), "action": restored,
                     "change_id": target_entry.get("id")}

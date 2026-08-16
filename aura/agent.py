@@ -50,11 +50,20 @@ class AuraAgent:
     MAX_WRITE_BYTES = 1_000_000
     MAX_HTTP_BYTES = 250_000
     ROUND_LIMITS = {"fast": 16, "balanced": 30, "deep": 48}
+    # Recovery stays available for 30 days or 500 changes, whichever ends first.
+    RETENTION_DAYS = 30
+    RETENTION_CHANGES = 500
 
     def __init__(self, workspace: str | Path = "aura-workspace", provider: Provider | None = None,
                  on_log: Callable[[dict], None] | None = None) -> None:
         self.sandbox = WorkspaceSandbox(workspace)
-        self.log = ActionLog(self.sandbox.meta / "action-log.jsonl", on_log)
+        # One database shared by every journal, so an undo and its audit entry
+        # are written through the same connection and transaction rules.
+        self.db = self.sandbox.db
+        migrated = self.db.migrate_jsonl(self.sandbox.meta)
+        self.log = ActionLog(self.db, on_log)
+        if migrated:
+            self.log.record("store_migrated", "ok", **migrated)
         self.memory = MemoryStore(self.sandbox.meta / "memory.json")
         self.config = ConfigStore(self.sandbox.meta / "config.json")
         self.provider = provider or LMStudioProvider(
@@ -70,13 +79,28 @@ class AuraAgent:
         self.permissions = PermissionStore(self.sandbox.meta / "permissions.json")
         self.external = ExternalReader(self.permissions)
         self.external_writer = ExternalWriter(
-            self.permissions, self.sandbox.history,
-            self.sandbox.meta / "external-changes.jsonl")
-        self.tasks = TaskJournal(self.sandbox.meta / "tasks.jsonl")
+            self.permissions, self.sandbox.history, self.db)
+        self.tasks = TaskJournal(self.db)
         self.cancel_event = threading.Event()
         self.current_task_id: str | None = None
         self.last_learned: list[dict] = []
         self.last_recalled: list[dict] = []
+        self._sweep_retention()
+
+    def _sweep_retention(self) -> None:
+        """Expire old recovery records once per launch.
+
+        Wrapped completely: a retention problem must never stop Aura starting.
+        """
+        try:
+            summary = self.db.sweep(self.sandbox.history, self.sandbox.trash,
+                                    days=self.RETENTION_DAYS,
+                                    max_changes=self.RETENTION_CHANGES)
+            self.permissions.forget_old_revocations()
+            if any(summary.values()):
+                self.log.record("retention_sweep", "ok", **summary)
+        except Exception as exc:
+            self.log.record("retention_sweep", "error", error=str(exc)[:300])
 
     def _bind_provider_recovery(self, provider: Provider) -> None:
         if isinstance(provider, LMStudioProvider):
