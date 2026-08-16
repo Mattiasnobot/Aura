@@ -17,6 +17,7 @@ DEFAULTS = {
     "vision_mode": "auto",
     "vision_probe": {},
     "current_session": None,
+    "onboarded": False,
     "speak_responses": False,
     "speech_engine": "piper",
     "speech_model": "aura-voices/en_US-lessac-medium.onnx",

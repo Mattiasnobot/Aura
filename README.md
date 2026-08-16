@@ -66,6 +66,8 @@ Aura's browser frame is responsive: drag either divider to resize the sidebar, c
 
 With Piper, mouth opening follows the amplitude envelope measured directly from Aura's locally generated WAV. The Windows SAPI fallback uses local phoneme-timing estimates because SAPI does not expose its output samples. Nothing is sent away from the computer. Motion style, intensity, and automatic/high/lower detail can be changed under **Settings → Presence**.
 
+On the first launch a short guide explains what Aura is, helps connect LM Studio and pick a model, and points out where permissions, undo, and the diagnostics report live. It can be skipped without changing any setting, and reopened later from **Settings → Show first-run guide**.
+
 - **Enter** sends a message; **Shift+Enter** inserts a new line.
 - **Escape** stops the current task.
 - **Ctrl+L** clears the visible conversation.

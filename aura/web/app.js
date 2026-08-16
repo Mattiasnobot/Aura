@@ -24,6 +24,7 @@ const elements = {
   previewAsk: $("#previewAsk"), previewOpen: $("#previewOpen"), previewCompare: $("#previewCompare"),
   settingsModal: $("#settingsModal"), tasksModal: $("#tasksModal"), memoryModal: $("#memoryModal"),
   permissionsModal: $("#permissionsModal"), sessionsModal: $("#sessionsModal"),
+  welcomeModal: $("#welcomeModal"),
   memoryList: $("#memoryList"),
   promptModal: $("#promptModal"), promptForm: $("#promptForm"), promptTitle: $("#promptTitle"),
   promptHint: $("#promptHint"), promptInput: $("#promptInput"), promptStatus: $("#promptStatus"),
@@ -1217,6 +1218,60 @@ function renderConversation(messages) {
   }
 }
 
+const WELCOME_STEPS = 3;
+let welcomeStep = 1;
+
+function showWelcomeStep(step) {
+  welcomeStep = Math.min(Math.max(step, 1), WELCOME_STEPS);
+  for (const section of elements.welcomeModal.querySelectorAll(".welcome-step")) {
+    section.classList.toggle("hidden", Number(section.dataset.step) !== welcomeStep);
+  }
+  $("#welcomeStepCount").textContent = `Step ${welcomeStep} of ${WELCOME_STEPS}`;
+  $("#welcomeBack").classList.toggle("hidden", welcomeStep === 1);
+  $("#welcomeNext").textContent = welcomeStep === WELCOME_STEPS ? "Start using Aura" : "Next";
+}
+
+function startOnboarding(workspace) {
+  $("#welcomeWorkspace").textContent =
+    workspace || elements.workspacePath.textContent || "this computer";
+  $("#welcomeStatus").className = "modal-status";
+  $("#welcomeStatus").textContent = "";
+  showWelcomeStep(1);
+  openModal(elements.welcomeModal);
+}
+
+async function checkWelcomeConnection() {
+  const status = $("#welcomeStatus");
+  status.className = "modal-status";
+  status.textContent = "Looking for LM Studio…";
+  const result = await callApi("get_models", $("#welcomeUrl").value);
+  if (!result.ok) {
+    status.className = "modal-status error";
+    // The address is the part a person can actually act on.
+    status.textContent = `${result.error} Check that LM Studio is running and its local server is on.`;
+    return false;
+  }
+  const select = $("#welcomeModel");
+  select.replaceChildren(new Option("Automatic selection", ""));
+  for (const model of result.models) select.add(new Option(model, model));
+  setSelectValue(select, result.models.find(model => !model.toLowerCase().includes("embed")) || "");
+  status.className = "modal-status";
+  status.textContent = result.models.length
+    ? `Connected. ${result.models.length} model(s) available.`
+    : "Connected, but no model is loaded yet. Load one in LM Studio.";
+  return true;
+}
+
+async function finishOnboarding(skipped = false) {
+  const connected = !skipped && $("#welcomeModel").options.length > 1;
+  const result = await callApi("complete_onboarding",
+    connected ? $("#welcomeUrl").value : "",
+    connected ? $("#welcomeModel").value : "");
+  if (!result.ok) return toast(result.error, true);
+  closeModal(elements.welcomeModal);
+  if (!skipped) toast("Aura is ready. Ask her for something.");
+}
+
 async function startNewSession() {
   const result = await callApi("new_session");
   if (!result.ok) return toast(result.error, true);
@@ -2363,6 +2418,21 @@ function bindControls() {
   elements.toggleLog.addEventListener("click", () => { logVisible = !logVisible; applyLayout(); scheduleUiSave(); });
   elements.activityLogTab.addEventListener("click", () => setLogMode("activity"));
   elements.diagnosticsLogTab.addEventListener("click", () => setLogMode("diagnostics"));
+  $("#welcomeNext").addEventListener("click", async () => {
+    // Checking the connection is offered, never demanded: someone who starts
+    // LM Studio afterwards must still be able to get through the guide.
+    if (welcomeStep === 2 && $("#welcomeModel").options.length <= 1) await checkWelcomeConnection();
+    if (welcomeStep === WELCOME_STEPS) return finishOnboarding();
+    showWelcomeStep(welcomeStep + 1);
+  });
+  $("#welcomeBack").addEventListener("click", () => showWelcomeStep(welcomeStep - 1));
+  $("#welcomeCheck").addEventListener("click", checkWelcomeConnection);
+  $("#welcomeSkip").addEventListener("click", () => finishOnboarding(true));
+  $("#showWelcome").addEventListener("click", async () => {
+    await callApi("restart_onboarding");
+    closeModal(elements.settingsModal);
+    startOnboarding();
+  });
   $("#exportDiagnostics").addEventListener("click", async () => {
     const written = await callApi("export_diagnostics");
     if (!written.ok) return toast(written.error, true);
@@ -2538,6 +2608,7 @@ async function initialize() {
     elements.composer.focus();
     const previewPath = new URLSearchParams(window.location.search).get("preview");
     if (previewPath) await openWorkspaceExplorer(previewPath);
+    if (!bootstrap.onboarded) startOnboarding(bootstrap.workspace);
     await callApi("check_provider");
     eventPollTimer = setInterval(pollEvents, 140);
   } catch (error) {

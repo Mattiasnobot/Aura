@@ -304,6 +304,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .modal-x { width: 32px; height: 32px; border: 1px solid var(--line); border-radius: 9px; background: transparent; cursor: pointer; font-size: 20px; }
 .modal-card > footer { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 14px 22px 20px; }
 .inline-check { display: flex; align-items: center; gap: 6px; margin-right: auto; color: var(--muted); font-size: 11px; cursor: pointer; }
+.welcome-card { width: min(560px, 94vw); }
+.welcome-step { padding: 4px 22px 2px; color: #b8cbdd; font-size: 13px; line-height: 1.65; }
+.welcome-step p { margin: 0 0 12px; }
+.welcome-note { color: var(--muted); font-size: 12px; }
+.welcome-note code { color: var(--aura); font-size: 11px; word-break: break-all; }
+.welcome-field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; color: #95a4b8; font-size: 11px; }
+.welcome-field input, .welcome-field select { padding: 9px 10px; border: 1px solid #29425d; border-radius: 8px; outline: 0; background: #07111e; color: white; font: inherit; }
+.welcome-field input:focus, .welcome-field select:focus { box-shadow: 0 0 0 2px rgba(var(--aura-rgb), .15); }
+.welcome-actions { display: flex; gap: 8px; margin-bottom: 8px; }
+.welcome-list { margin: 0 0 12px; padding-left: 18px; }
+.welcome-list li { margin-bottom: 8px; }
+.welcome-list strong { color: #dbe8f4; }
+#welcomeSkip, #showWelcome { margin-right: auto; }
 .session-search { padding: 0 22px 12px; }
 .session-search input { width: 100%; padding: 9px 10px; border: 1px solid #29425d; border-radius: 8px; outline: 0; background: #07111e; color: white; }
 .session-search input:focus { box-shadow: 0 0 0 2px rgba(var(--aura-rgb), .15); }

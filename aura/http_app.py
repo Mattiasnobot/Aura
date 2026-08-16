@@ -23,6 +23,7 @@ PREVIEW_PREFIX = "/workspace-preview/"
 API_METHODS = {
     "get_bootstrap", "poll_events", "submit", "stop", "resolve_approval",
     "check_provider", "get_settings", "save_settings", "get_models", "get_voices",
+    "complete_onboarding", "restart_onboarding",
     "start_voice", "stop_voice", "get_microphones", "calibrate_voice", "preview_voice",
     "open_workspace", "recent_tasks", "rollback_task",
     "get_mind_graph", "save_ui_state", "workspace_snapshot", "preview_workspace_file",

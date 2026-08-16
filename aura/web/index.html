@@ -175,6 +175,45 @@
   </div>
 
 
+  <div id="welcomeModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="welcomeTitle">
+    <div class="modal-card welcome-card">
+      <header><div><h2 id="welcomeTitle">Welcome to Aura</h2><p id="welcomeStepCount">Step 1 of 3</p></div></header>
+
+      <section class="welcome-step" data-step="1">
+        <p>Aura is a companion that runs entirely on this computer. She answers using a model you run yourself in LM Studio, and she works inside one protected folder.</p>
+        <p class="welcome-note">Her workspace is <code id="welcomeWorkspace">…</code>. Everything she writes goes there, and everything she remembers stays on this machine. There is no account, no cloud service, and no API key.</p>
+      </section>
+
+      <section class="welcome-step hidden" data-step="2">
+        <p>Aura needs LM Studio running with a model loaded. Start LM Studio, load a model, and turn on its local server — then check the connection here.</p>
+        <label class="welcome-field">LM Studio address
+          <input id="welcomeUrl" type="text" spellcheck="false" value="http://127.0.0.1:1234/v1">
+        </label>
+        <label class="welcome-field">Model
+          <select id="welcomeModel"><option value="">Automatic selection</option></select>
+        </label>
+        <div class="welcome-actions"><button id="welcomeCheck" type="button">Check connection</button></div>
+        <p id="welcomeStatus" class="modal-status"></p>
+      </section>
+
+      <section class="welcome-step hidden" data-step="3">
+        <p>You are ready. A few things worth knowing:</p>
+        <ul class="welcome-list">
+          <li><strong>Ask her to build something.</strong> She creates and edits files in her workspace, and every change can be undone.</li>
+          <li><strong>She cannot reach the rest of your computer</strong> until you grant a folder under <strong>Permissions</strong>. She can never grant it to herself.</li>
+          <li><strong>Anything risky asks first</strong> — running a project, installing packages, or reaching the network.</li>
+          <li><strong>If something misbehaves</strong>, use <strong>Export report</strong> under the action log; it describes the problem without including anything you said.</li>
+        </ul>
+      </section>
+
+      <footer>
+        <button id="welcomeSkip" type="button">Skip for now</button>
+        <button id="welcomeBack" type="button" class="hidden">Back</button>
+        <button id="welcomeNext" class="primary-button" type="button">Next</button>
+      </footer>
+    </div>
+  </div>
+
   <div id="sessionsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="sessionsTitle">
     <div class="modal-card memory-card">
       <header><div><h2 id="sessionsTitle">Conversations</h2><p>Every conversation is kept locally. Open one to continue it.</p></div><button class="modal-x" data-close="sessionsModal">×</button></header>
@@ -241,7 +280,7 @@
         <div class="voice-setting-actions wide"><button id="previewVoice" type="button">Preview Aura’s voice</button><span>Use this to check the selected output before saving.</span></div>
       </div>
       <div id="settingsStatus" class="modal-status">Ready.</div>
-      <footer><button class="ghost-button" data-close="settingsModal">Cancel</button><button id="saveSettings" class="primary-button">Save settings</button></footer>
+      <footer><button id="showWelcome" type="button" class="ghost-button">Show first-run guide</button><button class="ghost-button" data-close="settingsModal">Cancel</button><button id="saveSettings" class="primary-button">Save settings</button></footer>
     </div>
   </div>
 

@@ -2435,6 +2435,24 @@ class WebBridgeTests(unittest.TestCase):
             [item["id"] for item in self.bridge.list_sessions(30, True)["sessions"]],
             [current])
 
+    def test_the_first_run_guide_appears_once_and_can_be_asked_for_again(self):
+        self.assertFalse(self.bridge.get_bootstrap()["onboarded"])
+        self.assertTrue(self.bridge.complete_onboarding()["ok"])
+        self.assertTrue(self.bridge.get_bootstrap()["onboarded"])
+        # It stays gone across a restart, and Settings can bring it back.
+        restarted = AuraAgent(self.bridge.agent.sandbox.root, provider=MockProvider())
+        self.assertTrue(restarted.config.data["onboarded"])
+        self.bridge.restart_onboarding()
+        self.assertFalse(self.bridge.get_bootstrap()["onboarded"])
+
+    def test_skipping_the_guide_leaves_the_model_settings_untouched(self):
+        """Skipping must never quietly repoint Aura at a different server."""
+        before = dict(self.bridge.agent.config.data)
+        self.assertTrue(self.bridge.complete_onboarding()["ok"])
+        after = self.bridge.agent.config.data
+        self.assertEqual(after["lm_studio_url"], before["lm_studio_url"])
+        self.assertEqual(after["model"], before["model"])
+
     def test_diagnostics_report_describes_the_install_without_private_content(self):
         agent = self.bridge.agent
         agent.memory.set_name("Maya")

@@ -116,6 +116,7 @@ class AuraWebBridge:
             event_cursor = self._event_sequence
         return {
             "app": "Aura",
+            "onboarded": bool(config["onboarded"]),
             "session_id": self.agent.session_id,
             "workspace": str(self.agent.sandbox.root),
             "conversation": conversation,
@@ -514,6 +515,41 @@ class AuraWebBridge:
                     "voice": self.voice.capabilities()}
         except (TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
+
+    def complete_onboarding(self, url: str = "", model: str = "") -> dict:
+        """Finish the first-run guide, optionally keeping the model chosen there.
+
+        Called with nothing when the guide is skipped: the guide stops appearing
+        either way, so it can never stand between someone and their first
+        message. Settings are only touched when a URL was actually confirmed.
+        """
+        with self._state_lock:
+            if self._busy:
+                return {"ok": False, "error": "Finish or stop the current task first."}
+        try:
+            chosen = str(url).strip()
+            if chosen:
+                provider = LMStudioProvider(
+                    chosen, str(model or "").strip() or None,
+                    float(self.agent.config.data["timeout"]),
+                    float(self.agent.config.data["temperature"]),
+                    int(self.agent.config.data["max_tokens"]))
+                self.agent.config.update(lm_studio_url=provider.base_url,
+                                         model=provider.model)
+                self.agent.set_provider(provider)
+            self.agent.config.update(onboarded=True)
+            self.agent.log.record("complete_onboarding", "ok",
+                                  connected=bool(chosen))
+            if chosen:
+                self.check_provider()
+            return {"ok": True, "model": self.agent.config.data["model"]}
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def restart_onboarding(self) -> dict:
+        """Let someone open the guide again from Settings."""
+        self.agent.config.update(onboarded=False)
+        return {"ok": True}
 
     def get_models(self, url: str) -> dict:
         try:
