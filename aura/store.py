@@ -115,6 +115,37 @@ class Database:
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(SCHEMA)
+            self._migrate(connection)
+
+    #: Ordered, append-only. Each entry is applied once, in order, to a database
+    #: whose `user_version` is below its index+1, and `user_version` is then set
+    #: to that number in the same transaction. `CREATE TABLE IF NOT EXISTS` gets
+    #: a *new* database to the current shape but says nothing about changing one
+    #: that already holds the user's data — that is what this is for.
+    #:
+    #: Rules: never edit a migration that has shipped, never renumber, and add
+    #: only statements that are safe to run against real data.
+    MIGRATIONS: tuple[tuple[str, ...], ...] = (
+        # 1 — baseline. Everything up to this point was created by SCHEMA, so
+        # this records the version without changing anything.
+        (),
+    )
+
+    def _migrate(self, connection: sqlite3.Connection) -> int:
+        current = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        target = len(self.MIGRATIONS)
+        if current >= target:
+            return current
+        for index in range(current, target):
+            for statement in self.MIGRATIONS[index]:
+                connection.execute(statement)
+        # PRAGMA does not accept a bound parameter, and `target` is a length.
+        connection.execute(f"PRAGMA user_version = {int(target)}")
+        return target
+
+    def schema_version(self) -> int:
+        with self._connect() as connection:
+            return int(connection.execute("PRAGMA user_version").fetchone()[0])
 
     @contextmanager
     def _connect(self):

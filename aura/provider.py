@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .errors import AuraError
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import json
@@ -39,7 +41,7 @@ class Provider(ABC):
         raise NotImplementedError
 
 
-class ProviderError(RuntimeError):
+class ProviderError(AuraError, RuntimeError):
     """A concise, user-facing provider connection error."""
 
 

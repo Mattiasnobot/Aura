@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .errors import AuraError
+
 import difflib
 import json
 import shutil
@@ -11,7 +13,7 @@ from uuid import uuid4
 from .store import Database
 
 
-class SandboxViolation(ValueError):
+class SandboxViolation(AuraError, ValueError):
     """Raised when an operation attempts to leave the Aura workspace."""
 
 

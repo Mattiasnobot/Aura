@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .errors import AuraError
+
 import ast
 import base64
 import hashlib
@@ -27,6 +29,9 @@ from .config import ConfigStore
 from .memory import MemoryStore
 from .provider import LMStudioProvider, MockProvider, Provider, ProviderContext, ToolCall
 from . import services
+from . import toolkit
+from .toolkit import tool
+from .turn import PASS, GateResult, TurnState
 from .image_diff import compare_images
 from .permissions import (ExternalReader, ExternalWriter, PermissionRefused,
                           PermissionStore, reject_unsafe_host)
@@ -45,7 +50,7 @@ EXTERNAL_TOOLS = {
 }
 
 
-class TaskCancelled(RuntimeError):
+class TaskCancelled(AuraError, RuntimeError):
     pass
 
 
@@ -101,11 +106,10 @@ class AuraAgent:
         # empty conversation behind.
         self._sweep_retention()
 
-    MUTATING_TOOL_NAMES = {
-        "create_folder", "create_file", "write_file", "write_files", "append_file",
-        "replace_in_file", "apply_edits", "copy_file", "move_file", "safe_delete_file",
-        "create_archive", "extract_archive", "import_file", "write_external_file",
-    }
+    #: Filled in below the class: the `@tool` decorators that mark a tool as
+    #: mutating only run while the class body is being evaluated, so the
+    #: registry is still empty at this point.
+    MUTATING_TOOL_NAMES: set[str] = set()
 
     def _remember(self, role: str, text: str) -> None:
         """Keep a message in the live context and in durable session history.
@@ -376,35 +380,17 @@ class AuraAgent:
         status = "completed"
         try:
             set_state("thinking")
-            if isinstance(self.provider, MockProvider) and re.search(
-                    r"(create|build|make).*(hello[ -]?world).*(python|app)", lower):
-                response = self.build_hello_world(approve, set_state)
-            elif lower.startswith("list files") or "what files" in lower:
-                files = self.sandbox.list_files()
-                response = "Workspace files:\n" + ("\n".join(f"• {f}" for f in files) if files else "(empty)")
-            elif lower.startswith("read file "):
-                name = message[len("read file "):].strip()
-                response = f"Contents of {name}:\n\n{self.sandbox.read_file(name)}"
-                self.log.record("read_file", path=name)
-            elif lower.startswith("remember my name is "):
-                name = message[len("remember my name is "):].strip()
-                self.memory.set_name(name)
-                response = f"I’ll remember that your name is {name}."
-            elif lower.startswith("remember preference ") and "=" in message:
-                pair = message[len("remember preference "):]
-                key, value = pair.split("=", 1)
-                self.memory.set_preference(key, value)
-                response = f"Remembered: {key.strip()} = {value.strip()}."
-            elif self._is_greeting(message):
+            if self._is_greeting(message):
                 # A greeting must be instant and must never replay a previous
                 # build task.  Substantive conversation still goes to the
                 # configured provider; this tiny social acknowledgement does
-                # not need a 4K-token model round-trip.
+                # not need a 4K-token model round-trip. Unlike the fallbacks
+                # below, no tool duplicates this, so it stays on the main path.
                 response = self._greeting_response(message)
             elif isinstance(self.provider, LMStudioProvider):
                 response = self._tool_conversation(message, approve, set_state, token)
             else:
-                response = self.provider.reply(message, self._context(message))
+                response = self._reply_without_tools(message, approve, set_state)
             set_state("success")
         except TaskCancelled:
             status = "cancelled"
@@ -421,6 +407,37 @@ class AuraAgent:
         self.current_task_id = None
         self.sandbox.active_task_id = None
         return response
+
+    def _reply_without_tools(self, message: str, approve: Callable[[list[str]], bool] | None,
+                             set_state: Callable[[str], None]) -> str:
+        """Answer when the configured provider cannot call tools at all.
+
+        These phrase matches used to sit *ahead* of the tool loop, so with a real
+        model "list files" and "remember my name is …" never reached the tools
+        that already do exactly that — one capability with two implementations,
+        and the phrasing decided which one ran. They belong here, where there is
+        genuinely no tool to call, and nowhere else.
+        """
+        lower = message.casefold().strip()
+        if isinstance(self.provider, MockProvider) and re.search(
+                r"(create|build|make).*(hello[ -]?world).*(python|app)", lower):
+            return self.build_hello_world(approve, set_state)
+        if lower.startswith("list files") or "what files" in lower:
+            files = self.sandbox.list_files()
+            return "Workspace files:\n" + ("\n".join(f"• {f}" for f in files) if files else "(empty)")
+        if lower.startswith("read file "):
+            name = message[len("read file "):].strip()
+            self.log.record("read_file", path=name)
+            return f"Contents of {name}:\n\n{self.sandbox.read_file(name)}"
+        if lower.startswith("remember my name is "):
+            name = message[len("remember my name is "):].strip()
+            self.memory.set_name(name)
+            return f"I’ll remember that your name is {name}."
+        if lower.startswith("remember preference ") and "=" in message:
+            key, value = message[len("remember preference "):].split("=", 1)
+            self.memory.set_preference(key, value)
+            return f"Remembered: {key.strip()} = {value.strip()}."
+        return self.provider.reply(message, self._context(message))
 
     def cancel_current(self) -> None:
         self.cancel_event.set()
@@ -483,22 +500,6 @@ class AuraAgent:
                 "Deterministic artifact contract: all of these exact workspace-relative files must exist before "
                 "completion: " + json.dumps(expected_paths) +
                 (f". Validate the project at path {expected_base!r}." if expected_base else ".")})
-        verification_needed = False
-        # One budget for every completion gate. Four independent counters
-        # allowed up to nine extra rounds, each re-answering from scratch.
-        retries_left = self.MAX_COMPLETION_RETRIES
-        validation_attempted = False
-        unconfirmed: list[str] = []
-        successful_tools = 0
-        external_written: set[str] = set()
-        external_activity = False
-        workspace_mutation = False
-        mutation_performed = False
-        validation_succeeded = False
-        validation_evidence: dict | None = None
-        validation_scope: str | None = None
-        verified_final_paths: set[str] = set()
-        pending_verifications: dict[str, str] = {}
         requires_mutation = self._requires_mutation(routing_request)
         # Asking to validate is a request in itself and stands on its own.
         # Merely mentioning a build word does not: "how does my project look?"
@@ -532,7 +533,15 @@ class AuraAgent:
              "run ", "test"))
         action_expected = (bool(selected_tools) and asks_for_work
                            and not (auto_learning_only or memory_read_question))
-        verification_tools = {"read_file", "read_many_files", "file_info", "inspect_code"}
+        state_of_turn = TurnState(
+            expected_paths=list(expected_paths), expected_base=expected_base,
+            requires_mutation=requires_mutation, action_expected=action_expected,
+            validation_asked=validation_asked, build_words=build_words,
+            selected_tools=list(selected_tools),
+            # One budget for every gate. Four independent counters once allowed
+            # up to nine extra rounds, each re-answering from scratch.
+            retries_left=self.MAX_COMPLETION_RETRIES,
+        )
         def emit(piece: str) -> None:
             self._check_cancelled()
             if token:
@@ -554,226 +563,276 @@ class AuraAgent:
                     "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
                 } for call in response.tool_calls]
             messages.append(assistant)
-            if not response.tool_calls:
-                if not response.content:
-                    # An empty completion is usually a stumble, not a verdict —
-                    # it was the single most frequent failure in real use. Spend
-                    # one retry asking plainly before giving up on the turn.
-                    if retries_left > 0:
-                        retries_left -= 1
-                        messages.append({"role": "system", "content":
-                            "Your last response was completely empty. Answer the user in plain "
-                            "text now, or call exactly one tool. Never reply with nothing."})
-                        continue
-                    raise RuntimeError(
-                        "the model kept returning an empty response. Check that a model "
-                        "is loaded in LM Studio, or try a shorter request")
-                missing_action = action_expected and successful_tools == 0
-                missing_mutation = requires_mutation and not mutation_performed
-                # Work in a granted folder can never satisfy a workspace
-                # artifact contract, so requiring one there nags forever.
-                missing_artifacts = [] if external_activity else [
-                    path for path in expected_paths
-                    if not self.sandbox.path(path).is_file()
-                    and posixpath.basename(self._normalize_path(path)) not in external_written]
-                if missing_artifacts and retries_left > 0:
-                    retries_left -= 1
-                    if token:
-                        token("Aura is checking the requested deliverables and continuing…\n\n")
-                    # Name the tool. The journal shows this model ignoring
-                    # "create a file called X" three times in a row, then obeying
-                    # "use create_file to make X" immediately — naming the tool
-                    # is what the user had to do by hand.
-                    messages.append({"role": "system", "content":
-                        "The artifact contract is not satisfied. Call the tool create_file once for "
-                        "each of these exact paths, with the content the user asked for: " +
-                        json.dumps(missing_artifacts) +
-                        ". Do not answer in prose until every one of them exists; "
-                        "then read them back before reporting completion."})
-                    continue
-                if missing_artifacts:
-                    # Report rather than raise: the model's work is still worth
-                    # showing, but Aura must not imply it was verified.
-                    unconfirmed.append(
-                        "these files were requested but not found: "
-                        + ", ".join(f"`{path}`" for path in missing_artifacts[:8]))
-                validation_path = expected_base or self._validation_root(pending_verifications)
-                # A build word alone only demands validation once the workspace
-                # actually changed; an explicit "validate" always does.
-                validation_required = validation_asked or (build_words and workspace_mutation)
-                # ...except for work done entirely in a granted folder, where
-                # validating the workspace would prove nothing about it.
-                if external_activity and not workspace_mutation:
-                    validation_required = False
-                # Only one model attempt here: Aura can validate deterministically
-                # itself, so further rounds would spend the user's time asking the
-                # model for something the backend is about to do anyway.
-                if (validation_required and not validation_succeeded
-                        and not validation_attempted and retries_left > 0):
-                    validation_attempted = True
-                    retries_left -= 1
-                    if token:
-                        token("Aura is validating the completed project…\n\n")
-                    messages.append({"role": "system", "content":
-                        "The requested project has not passed validate_project at the required path. "
-                        f"Run validate_project with path {validation_path!r}, fix every issue, and validate again."})
-                    continue
-                if validation_required and not validation_succeeded:
-                    automatic = self._validate_project(validation_path)
-                    self._record_automatic_validation(validation_path, automatic)
-                    if not automatic["valid"]:
-                        first = automatic["issues"][0] if automatic["issues"] else {"error": "unknown issue"}
-                        unconfirmed.append(
-                            "validation of `" + str(validation_path) + "` failed: "
-                            + str(first.get("error", "unknown issue")))
-                    validation_succeeded = automatic["valid"]
-                    validation_evidence = dict(automatic)
-                    validation_scope = validation_path
-                    self._clear_verified_scope(pending_verifications, validation_path)
-                    verification_needed = bool(pending_verifications)
-                    if successful_tools == 0 and not requires_mutation:
-                        # A local model may describe the correct action yet decline
-                        # to call a harmless read-only tool. Aura can perform this
-                        # deterministic validation itself and report only facts.
-                        successful_tools += 1
-                        missing_action = False
-                        response.content = self._format_validation_report(
-                            validation_path, automatic,
-                            self.sandbox.list_files(validation_path),
-                        )
-                if (missing_action or missing_mutation) and retries_left > 0:
-                    retries_left -= 1
-                    if token:
-                        token("Aura noticed the requested action was not completed and is correcting it…\n\n")
-                    # Same lesson as the artifact nudge: offer the names, not a
-                    # description. "Use the relevant tool" is exactly the kind of
-                    # instruction this model answers with prose.
-                    offered = [item["function"]["name"] for item in selected_tools]
-                    candidates = [name for name in offered
-                                  if name in self.MUTATING_TOOL_NAMES] if missing_mutation else offered
-                    naming = (" Call one of these tools by name: "
-                              + ", ".join(candidates[:6]) + ".") if candidates else ""
-                    requirement = ("perform the requested workspace mutation" if missing_mutation
-                                   else "use the relevant tool")
-                    messages.append({"role": "system", "content":
-                        f"The user requested an actionable operation, but no successful tool has fulfilled it. "
-                        f"Do not claim completion or inability: {requirement} now, inspect the result, "
-                        f"and report only confirmed facts.{naming}"})
-                    continue
-                if missing_action or missing_mutation:
-                    if missing_action and not missing_mutation and not requires_mutation:
-                        selected_names = {
-                            item["function"]["name"] for item in selected_tools
-                        }
-                        if "list_files" in selected_names:
-                            # Add the facts to the reply instead of replacing it.
-                            # Returning the listing threw away a perfectly good
-                            # answer whenever the model chose not to call a tool.
-                            list_path = expected_base or "."
-                            files = self.sandbox.list_files(list_path)
-                            self.log.record("list_files", "ok", path=list_path, automatic=True)
-                            if self.current_task_id:
-                                self.tasks.record_tool(
-                                    self.current_task_id, "list_files",
-                                    {"path": list_path, "automatic": True},
-                                    {"ok": True, "files": files},
-                                )
-                            successful_tools += 1
-                            missing_action = False
-                            if not response.content:
-                                response.content = self._format_file_report(list_path, files)
-                    if missing_action or missing_mutation:
-                        unconfirmed.append(
-                            "no tool actually performed the requested change, so this "
-                            "answer describes intent rather than confirmed work")
-                if verification_needed and retries_left > 0:
-                    retries_left -= 1
-                    if token:
-                        token("Aura is verifying the files it just changed…\n\n")
-                    messages.append({"role": "system", "content":
-                        "A workspace mutation occurred after the last verification. Do not finish yet. "
-                        "Use read_file/file_info, validate_project, or a successful validation command to verify the final state, "
-                        "fix any problem, and then give the final report."})
-                    continue
-                if verification_needed:
-                    verification_errors = self._verify_pending(pending_verifications)
-                    if verification_errors:
-                        unconfirmed.append(
-                            "the final state could not be verified: "
-                            + "; ".join(verification_errors[:3]))
-                    paths = sorted(pending_verifications)
-                    verified_final_paths.update(paths)
-                    self.log.record("verify_final_state", paths=paths, automatic=True)
-                    if self.current_task_id:
-                        self.tasks.record_tool(
-                            self.current_task_id, "verify_final_state", {"paths": paths},
-                            {"ok": True, "automatic": True},
-                        )
-                    pending_verifications.clear()
-                    verification_needed = False
-                missing = set(missing_artifacts)
-                present = [path for path in expected_paths if path not in missing]
-                return self._format_completion_evidence(
-                    response.content, validation_scope, validation_evidence,
-                    sorted(verified_final_paths), present, unconfirmed,
-                    list(self.fetched_sources),
-                )
-            if response.content and token:
-                token("\n\n")
-            state("working")
-            for call in response.tool_calls:
-                self._check_cancelled()
-                result = self._execute_tool(call, approve)
-                # An attached image cannot travel inside a tool result, which is
-                # plain text. Lift it out and send it as a real multimodal turn.
-                attachment = result.pop("content", None) if call.name == "look_at_image" else None
-                messages.append({"role": "tool", "tool_call_id": call.id,
-                                 "content": json.dumps(result, ensure_ascii=False)})
-                if attachment:
-                    messages.append({"role": "user", "content": [
-                        {"type": "text",
-                         "text": f"Here is the image {result.get('path')} you asked to look at."},
-                        {"type": "image_url", "image_url": {"url": attachment}},
-                    ]})
-                if result.get("ok"):
-                    successful_tools += 1
-                    if call.name in EXTERNAL_TOOLS:
-                        external_activity = True
-                    if call.name in {"write_external_file", "undo_external_change"}:
-                        # Counts as fulfilling the request even though the file
-                        # lives outside the sandbox entirely.
-                        if result.get("path"):
-                            external_written.add(Path(str(result["path"])).name)
-                        mutation_performed = True
-                    if call.name in mutation_tools:
-                        mutation_performed = True
-                        workspace_mutation = True
-                        pending_verifications.update(self._mutation_expectations(call, result))
-                        validation_succeeded = False
-                        validation_evidence = None
-                        validation_scope = None
-                    elif call.name in verification_tools:
-                        verified_paths = []
-                        if call.name == "read_many_files":
-                            verified_paths = [str(item.get("path", "")) for item in result.get("files", [])
-                                              if isinstance(item, dict)]
-                        else:
-                            verified_paths = [str(result.get("path") or call.arguments.get("path", ""))]
-                        for verified_path in verified_paths:
-                            normalized = self._normalize_path(verified_path)
-                            if normalized:
-                                verified_final_paths.add(normalized)
-                            pending_verifications.pop(normalized, None)
-                    if call.name == "validate_project" and result.get("valid"):
-                        requested_path = self._normalize_path(str(call.arguments.get("path", ".")))
-                        self._clear_verified_scope(pending_verifications, requested_path)
-                        if self._validation_satisfies(requested_path, expected_base, expected_paths):
-                            validation_succeeded = True
-                            validation_evidence = dict(result)
-                            validation_scope = requested_path
-                verification_needed = bool(pending_verifications)
-            state("thinking")
+
+            if response.tool_calls:
+                if response.content and token:
+                    token('\n\n')
+                state("working")
+                for call in response.tool_calls:
+                    self._check_cancelled()
+                    self._run_one_tool(call, approve, messages, state_of_turn)
+                state("thinking")
+                continue
+
+            # No tool calls: the model believes it is finished. The gates decide
+            # whether it may be, in a fixed order, sharing one retry budget.
+            retry = None
+            for gate in self.COMPLETION_GATES:
+                verdict = gate(self, state_of_turn, response)
+                if verdict.note:
+                    state_of_turn.record_unconfirmed(verdict.note)
+                if verdict.wants_retry and state_of_turn.spend_retry():
+                    retry = verdict
+                    break
+            if retry is not None:
+                if retry.notice and token:
+                    token(retry.notice)
+                messages.append({"role": "system", "content": retry.instruction})
+                continue
+            if state_of_turn.empty_response:
+                raise RuntimeError(
+                    "the model kept returning an empty response. Check that a model "
+                    "is loaded in LM Studio, or try a shorter request")
+
+            missing = set(state_of_turn.missing_artifacts)
+            present = [path for path in state_of_turn.expected_paths if path not in missing]
+            return self._format_completion_evidence(
+                response.content, state_of_turn.validation_scope,
+                state_of_turn.validation_evidence,
+                sorted(state_of_turn.verified_final_paths), present,
+                state_of_turn.unconfirmed, list(self.fetched_sources),
+            )
         raise RuntimeError("the model exceeded the tool-operation limit; ask it to continue in a new message")
+
+    # ------------------------------------------------------------------ turn
+
+    def _run_one_tool(self, call: ToolCall, approve: Callable[[list[str]], bool] | None,
+                      messages: list[dict], turn: TurnState) -> None:
+        """Execute one tool call and record what it proves about the turn."""
+        result = self._execute_tool(call, approve)
+        # An attached image cannot travel inside a tool result, which is plain
+        # text. Lift it out and send it as a real multimodal turn.
+        attachment = result.pop("content", None) if call.name == "look_at_image" else None
+        messages.append({"role": "tool", "tool_call_id": call.id,
+                         "content": json.dumps(result, ensure_ascii=False)})
+        if attachment:
+            messages.append({"role": "user", "content": [
+                {"type": "text",
+                 "text": f"Here is the image {result.get('path')} you asked to look at."},
+                {"type": "image_url", "image_url": {"url": attachment}},
+            ]})
+        if not result.get("ok"):
+            return
+        turn.successful_tools += 1
+        if call.name in EXTERNAL_TOOLS:
+            turn.external_activity = True
+        if call.name in {"write_external_file", "undo_external_change"}:
+            # Counts as fulfilling the request even though the file lives
+            # outside the sandbox entirely.
+            if result.get("path"):
+                turn.external_written.add(Path(str(result["path"])).name)
+            turn.mutation_performed = True
+        if call.name in self.STATE_CHANGING_TOOLS:
+            turn.mutation_performed = True
+            turn.workspace_mutation = True
+            turn.pending_verifications.update(self._mutation_expectations(call, result))
+            turn.validation_succeeded = False
+            turn.validation_evidence = None
+            turn.validation_scope = None
+        elif call.name in self.VERIFICATION_TOOLS:
+            if call.name == "read_many_files":
+                verified_paths = [str(item.get("path", "")) for item in result.get("files", [])
+                                  if isinstance(item, dict)]
+            else:
+                verified_paths = [str(result.get("path") or call.arguments.get("path", ""))]
+            for verified_path in verified_paths:
+                normalized = self._normalize_path(verified_path)
+                if normalized:
+                    turn.verified_final_paths.add(normalized)
+                turn.pending_verifications.pop(normalized, None)
+        if call.name == "validate_project" and result.get("valid"):
+            requested_path = self._normalize_path(str(call.arguments.get("path", ".")))
+            self._clear_verified_scope(turn.pending_verifications, requested_path)
+            if self._validation_satisfies(requested_path, turn.expected_base, turn.expected_paths):
+                turn.validation_succeeded = True
+                turn.validation_evidence = dict(result)
+                turn.validation_scope = requested_path
+        turn.verification_needed = bool(turn.pending_verifications)
+
+    def _gate_empty_response(self, turn: TurnState, response) -> GateResult:
+        """An empty completion is usually a stumble, not a verdict.
+
+        It was the single most frequent failure in real use, and it used to end
+        the turn outright while the shared budget sat unused beside it.
+        """
+        turn.empty_response = not response.content
+        if response.content:
+            return PASS
+        return GateResult(instruction=(
+            "Your last response was completely empty. Answer the user in plain "
+            "text now, or call exactly one tool. Never reply with nothing."))
+
+    def _gate_artifacts(self, turn: TurnState, response) -> GateResult:
+        """Every file the user named this turn must actually exist."""
+        if turn.empty_response:
+            return PASS
+        # Work in a granted folder can never satisfy a workspace artifact
+        # contract, so requiring one there nags forever.
+        turn.missing_artifacts = [] if turn.external_activity else [
+            path for path in turn.expected_paths
+            if not self.sandbox.path(path).is_file()
+            and posixpath.basename(self._normalize_path(path)) not in turn.external_written]
+        if not turn.missing_artifacts:
+            return PASS
+        if turn.retries_left > 0:
+            # Name the tool. The journal shows this model ignoring "create a file
+            # called X" three times in a row, then obeying "use create_file to
+            # make X" immediately — naming the tool is what the user had to do
+            # by hand.
+            return GateResult(
+                notice="Aura is checking the requested deliverables and continuing…\n\n",
+                instruction=(
+                    "The artifact contract is not satisfied. Call the tool create_file once for "
+                    "each of these exact paths, with the content the user asked for: "
+                    + json.dumps(turn.missing_artifacts)
+                    + ". Do not answer in prose until every one of them exists; "
+                      "then read them back before reporting completion."))
+        # Report rather than raise: the model's work is still worth showing, but
+        # Aura must not imply it was verified.
+        return GateResult(note="these files were requested but not found: "
+                               + ", ".join(f"`{path}`" for path in turn.missing_artifacts[:8]))
+
+    def _gate_validation(self, turn: TurnState, response) -> GateResult:
+        """A build that changed the workspace has to pass validation."""
+        if turn.empty_response:
+            return PASS
+        validation_path = turn.expected_base or self._validation_root(turn.pending_verifications)
+        # A build word alone only demands validation once the workspace actually
+        # changed; an explicit "validate" always does. Work done entirely in a
+        # granted folder is exempt, since validating the workspace would prove
+        # nothing about it.
+        required = turn.validation_asked or (turn.build_words and turn.workspace_mutation)
+        if turn.external_activity and not turn.workspace_mutation:
+            required = False
+        if not required or turn.validation_succeeded:
+            return PASS
+        if not turn.validation_attempted and turn.retries_left > 0:
+            # Only one model attempt: Aura can validate deterministically itself,
+            # so further rounds would spend the user's time asking the model for
+            # something the backend is about to do anyway.
+            turn.validation_attempted = True
+            return GateResult(
+                notice="Aura is validating the completed project…\n\n",
+                instruction=(
+                    "The requested project has not passed validate_project at the required path. "
+                    f"Run validate_project with path {validation_path!r}, fix every issue, "
+                    "and validate again."))
+        automatic = self._validate_project(validation_path)
+        self._record_automatic_validation(validation_path, automatic)
+        note = ""
+        if not automatic["valid"]:
+            first = automatic["issues"][0] if automatic["issues"] else {"error": "unknown issue"}
+            note = ("validation of `" + str(validation_path) + "` failed: "
+                    + str(first.get("error", "unknown issue")))
+        turn.validation_succeeded = automatic["valid"]
+        turn.validation_evidence = dict(automatic)
+        turn.validation_scope = validation_path
+        self._clear_verified_scope(turn.pending_verifications, validation_path)
+        turn.verification_needed = bool(turn.pending_verifications)
+        if turn.successful_tools == 0 and not turn.requires_mutation:
+            # A local model may describe the correct action yet decline to call a
+            # harmless read-only tool. Aura can perform this deterministic
+            # validation itself and report only facts.
+            turn.successful_tools += 1
+            turn.missing_action = False
+            response.content = self._format_validation_report(
+                validation_path, automatic, self.sandbox.list_files(validation_path))
+        return GateResult(note=note)
+
+    def _gate_action(self, turn: TurnState, response) -> GateResult:
+        """Something must actually have been done, not merely described."""
+        if turn.empty_response:
+            return PASS
+        turn.missing_action = turn.action_expected and turn.successful_tools == 0
+        turn.missing_mutation = turn.requires_mutation and not turn.mutation_performed
+        if not (turn.missing_action or turn.missing_mutation):
+            return PASS
+        if turn.retries_left > 0:
+            # Same lesson as the artifact nudge: offer the names, not a
+            # description. "Use the relevant tool" is exactly the kind of
+            # instruction this model answers with prose.
+            offered = turn.tool_names
+            candidates = ([name for name in offered if name in self.MUTATING_TOOL_NAMES]
+                          if turn.missing_mutation else offered)
+            naming = (" Call one of these tools by name: " + ", ".join(candidates[:6]) + ".") \
+                if candidates else ""
+            requirement = ("perform the requested workspace mutation" if turn.missing_mutation
+                           else "use the relevant tool")
+            return GateResult(
+                notice="Aura noticed the requested action was not completed and is correcting it…\n\n",
+                instruction=(
+                    "The user requested an actionable operation, but no successful tool has fulfilled it. "
+                    f"Do not claim completion or inability: {requirement} now, inspect the result, "
+                    f"and report only confirmed facts.{naming}"))
+        if turn.missing_action and not turn.missing_mutation and not turn.requires_mutation \
+                and "list_files" in turn.tool_names:
+            # Add the facts to the reply instead of replacing it. Returning the
+            # listing threw away a perfectly good answer whenever the model
+            # chose not to call a tool.
+            list_path = turn.expected_base or "."
+            files = self.sandbox.list_files(list_path)
+            self.log.record("list_files", "ok", path=list_path, automatic=True)
+            if self.current_task_id:
+                self.tasks.record_tool(self.current_task_id, "list_files",
+                                       {"path": list_path, "automatic": True},
+                                       {"ok": True, "files": files})
+            turn.successful_tools += 1
+            turn.missing_action = False
+            if not response.content:
+                response.content = self._format_file_report(list_path, files)
+        if turn.missing_action or turn.missing_mutation:
+            return GateResult(note="no tool actually performed the requested change, so this "
+                                   "answer describes intent rather than confirmed work")
+        return PASS
+
+    def _gate_verification(self, turn: TurnState, response) -> GateResult:
+        """Files changed after the last look must be read back before finishing."""
+        if turn.empty_response or not turn.verification_needed:
+            return PASS
+        if turn.retries_left > 0:
+            return GateResult(
+                notice="Aura is verifying the files it just changed…\n\n",
+                instruction=(
+                    "A workspace mutation occurred after the last verification. Do not finish yet. "
+                    "Use read_file/file_info, validate_project, or a successful validation command "
+                    "to verify the final state, fix any problem, and then give the final report."))
+        errors = self._verify_pending(turn.pending_verifications)
+        note = ("the final state could not be verified: " + "; ".join(errors[:3])) if errors else ""
+        paths = sorted(turn.pending_verifications)
+        turn.verified_final_paths.update(paths)
+        self.log.record("verify_final_state", paths=paths, automatic=True)
+        if self.current_task_id:
+            self.tasks.record_tool(self.current_task_id, "verify_final_state",
+                                   {"paths": paths}, {"ok": True, "automatic": True})
+        turn.pending_verifications.clear()
+        turn.verification_needed = False
+        return GateResult(note=note)
+
+    #: Order matters and is the same order the single long function used: answer
+    #: at all, then deliverables, then validation, then action, then verification.
+    COMPLETION_GATES = (_gate_empty_response, _gate_artifacts, _gate_validation,
+                        _gate_action, _gate_verification)
+
+    #: Tools whose success means this turn changed something the user asked to
+    #: change. Deliberately wider than MUTATING_TOOL_NAMES, which is only about
+    #: recoverable *file* mutations: undoing and remembering change state too.
+    STATE_CHANGING_TOOLS = {
+        "create_folder", "create_file", "write_file", "write_files", "append_file",
+        "replace_in_file", "apply_edits", "copy_file", "move_file", "safe_delete_file",
+        "create_archive", "extract_archive", "undo_last_change", "rollback_task",
+        "remember_name", "remember_preference", "remember_personal_fact",
+        "forget_personal_fact", "correct_personal_fact"}
+    VERIFICATION_TOOLS = {"read_file", "read_many_files", "file_info", "inspect_code"}
 
     @classmethod
     def select_tool_definitions(cls, message: str, autonomy: str = "balanced",
@@ -1177,498 +1236,535 @@ class AuraAgent:
 
     @staticmethod
     def tool_definitions() -> list[dict]:
-        def tool(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
-            return {"type": "function", "function": {"name": name, "description": description,
-                    "parameters": {"type": "object", "properties": properties,
-                                   "required": required or [], "additionalProperties": False}}}
-        path = {"type": "string", "description": "Workspace-relative path; never absolute and never use .."}
-        return [
-            tool("list_files", "List files recursively inside a workspace folder.",
-                 {"path": {**path, "default": "."}}),
-            tool("create_folder", "Create an empty workspace folder and missing parent folders. Use this instead of mkdir.",
-                 {"path": path}, ["path"]),
-            tool("read_file", "Read a UTF-8 text file or a focused line range from the workspace.",
-                 {"path": path, "start_line": {"type": "integer", "minimum": 1, "default": 1},
-                  "end_line": {"type": "integer", "minimum": 1}}, ["path"]),
-            tool("read_many_files", "Read several related UTF-8 workspace files in one call with bounded output.",
-                 {"paths": {"type": "array", "minItems": 1, "maxItems": 20,
-                            "items": path},
-                  "max_lines_each": {"type": "integer", "minimum": 20, "maximum": 1000,
-                                     "default": 300}}, ["paths"]),
-            tool("file_info", "Inspect a file's size, line count, and modification time.",
-                 {"path": path}, ["path"]),
-            tool("create_file", "Create a new UTF-8 file; fails if it already exists.",
-                 {"path": path, "content": {"type": "string"}}, ["path", "content"]),
-            tool("write_file", "Create or replace a UTF-8 file in the workspace.",
-                 {"path": path, "content": {"type": "string"}}, ["path", "content"]),
-            tool("write_files", "Create or replace up to 20 related UTF-8 files in one batch. Every file remains recoverable.",
-                 {"files": {"type": "array", "minItems": 1, "maxItems": 20,
-                            "items": {"type": "object", "properties": {
-                                "path": path, "content": {"type": "string"}},
-                                "required": ["path", "content"], "additionalProperties": False}}},
-                 ["files"]),
-            tool("append_file", "Append UTF-8 text to a workspace file, creating it if needed.",
-                 {"path": path, "content": {"type": "string"}}, ["path", "content"]),
-            tool("replace_in_file", "Precisely replace exact text in an existing UTF-8 file. Fails if the match count is unexpected.",
-                 {"path": path, "old_text": {"type": "string"}, "new_text": {"type": "string"},
-                  "expected_count": {"type": "integer", "minimum": 1, "default": 1}},
-                 ["path", "old_text", "new_text"]),
-            tool("apply_edits", "Atomically apply several exact text replacements to one file with one recovery snapshot.",
-                 {"path": path, "edits": {"type": "array", "minItems": 1, "maxItems": 50,
-                  "items": {"type": "object", "properties": {
-                      "old_text": {"type": "string"}, "new_text": {"type": "string"},
-                      "expected_count": {"type": "integer", "minimum": 1, "default": 1}},
-                      "required": ["old_text", "new_text"], "additionalProperties": False}}},
-                 ["path", "edits"]),
-            tool("search_files", "Search file names and UTF-8 contents in the workspace.",
-                 {"query": {"type": "string"}, "path": {**path, "default": "."}}, ["query"]),
-            tool("search_text", "Return matching lines with file names and line numbers.",
-                 {"query": {"type": "string"}, "path": {**path, "default": "."},
-                  "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}}, ["query"]),
-            tool("list_granted_folders",
-                 "List folders outside the workspace that the user has granted Aura "
-                 "permission to read. Aura cannot grant itself access; only the user "
-                 "can, from the Permissions panel.", {}, []),
-            tool("list_external_folder",
-                 "List files inside a folder the user has already granted. Fails if "
-                 "there is no active permission for that folder.",
-                 {"path": {"type": "string"},
-                  "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200}},
-                 ["path"]),
-            tool("read_external_file",
-                 "Read a UTF-8 text file inside a folder the user has already granted. "
-                 "Fails if there is no active permission for that file's folder.",
-                 {"path": {"type": "string"}}, ["path"]),
-            tool("write_external_file",
-                 "Write a UTF-8 text file inside a folder the user granted for writing. "
-                 "The previous version is saved first, so the change can be undone. "
-                 "A read grant is not enough; writing needs its own permission.",
-                 {"path": {"type": "string"}, "content": {"type": "string"}},
-                 ["path", "content"]),
-            tool("undo_external_change",
-                 "Undo Aura's most recent write outside the workspace, restoring the "
-                 "previous version or removing a file it created.", {}, []),
-            tool("check_accessibility",
-                 "Report accessibility problems in workspace HTML: images without alt "
-                 "text, form controls without labels, empty links or buttons, a missing "
-                 "lang or title, and skipped heading levels. Structural checks only — "
-                 "it does not evaluate colour contrast.",
-                 {"path": {**path, "default": "."}}, []),
-            tool("compare_images",
-                 "Measure exactly how two workspace PNG images differ: percentage of "
-                 "changed pixels and the region that changed. Use it to check a render "
-                 "against a reference or to detect a layout regression between two "
-                 "screenshots. This is a real pixel measurement, not an impression.",
-                 {"first": path, "second": path,
-                  "tolerance": {"type": "integer", "minimum": 0, "maximum": 128,
-                                "default": 8}},
-                 ["first", "second"]),
-            tool("capture_page",
-                 "Render a workspace HTML page in a local headless browser and save a "
-                 "PNG screenshot of it into the workspace. Use this to see how a page "
-                 "actually looks, then call look_at_image on the saved screenshot. "
-                 "Needs the user's approval because it launches a browser.",
-                 {"path": path,
-                  "width": {"type": "integer", "minimum": 320, "maximum": 2560, "default": 1200},
-                  "height": {"type": "integer", "minimum": 240, "maximum": 2000, "default": 800}},
-                 ["path"]),
-            tool("look_at_image",
-                 "Actually look at a workspace image (PNG/JPEG/GIF/WebP/BMP). The image "
-                 "is attached to the conversation so you can describe or compare what it "
-                 "shows. Call this whenever the user asks what an image contains or looks "
-                 "like — listing or reading the file cannot answer that, because its "
-                 "pixels are only visible through this tool.",
-                 {"path": path}, ["path"]),
-            tool("find_relevant_files",
-                 "Rank workspace files by relevance to a described topic or question. "
-                 "Use this when you do not know the exact wording to search for; use "
-                 "search_files or search_text when you need an exact string. Matches "
-                 "words, not synonyms.",
-                 {"query": {"type": "string"}, "path": {**path, "default": "."},
-                  "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}, ["query"]),
-            tool("copy_file", "Copy a workspace file.",
-                 {"source": path, "destination": path}, ["source", "destination"]),
-            tool("move_file", "Move or rename a workspace file.",
-                 {"source": path, "destination": path}, ["source", "destination"]),
-            tool("safe_delete_file", "Move a file into Aura's recoverable trash.",
-                 {"path": path}, ["path"]),
-            tool("undo_last_change", "Undo Aura's most recent file mutation using its protected snapshot history.", {}, []),
-            tool("rollback_task", "Undo every still-active file mutation belonging to a specific Aura task ID.",
-                 {"task_id": {"type": "string"}}, ["task_id"]),
-            tool("change_history", "List recent recoverable workspace mutations and whether they were undone.",
-                 {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}}),
-            tool("workspace_summary", "Summarize workspace file count, size, extensions, and largest files.", {}, []),
-            tool("inspect_code", "Outline symbols, imports, and structure in a Python, JavaScript, or TypeScript file without executing it.",
-                 {"path": path}, ["path"]),
-            tool("compare_files", "Produce a bounded unified diff between two UTF-8 workspace files.",
-                 {"left": path, "right": path,
-                  "context_lines": {"type": "integer", "minimum": 0, "maximum": 20, "default": 3}},
-                 ["left", "right"]),
-            tool("calculate", "Evaluate arithmetic and common math functions locally without running code.",
-                 {"expression": {"type": "string"}}, ["expression"]),
-            tool("system_info", "Inspect non-sensitive local runtime facts such as OS, Python, CPU count, and workspace disk space.", {}, []),
-            tool("validate_project", "Safely validate every project file, including Python, JSON, TOML, HTML, CSS, JavaScript/TypeScript, XML, and UTF-8 text, without executing project code.",
-                 {"path": {**path, "default": "."}}, []),
-            tool("run_command", "Run an actual program, test, build, or project runtime inside the workspace. Commands use a direct argument array with no shell. Never use this for file/folder operations; create_file and write_file create parent folders. Use python for Python; unsafe commands require approval.",
-                 {"command": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                  "timeout": {"type": "number", "minimum": 1, "maximum": 60, "default": 15}}, ["command"]),
-            tool("http_get", "Fetch a bounded HTTP(S) text response. Localhost is direct; any other domain must already be granted by the user under Permissions, and cannot be requested from here.",
-                 {"url": {"type": "string"},
-                  "timeout": {"type": "number", "minimum": 1, "maximum": 20, "default": 10}}, ["url"]),
-            tool("open_workspace_item", "Open a workspace file or folder in its normal desktop application after approval.",
-                 {"path": path}, ["path"]),
-            tool("create_archive", "Create a recoverable ZIP archive from a workspace file or folder.",
-                 {"source": path, "destination": path}, ["source", "destination"]),
-            tool("extract_archive", "Safely extract a workspace ZIP with traversal, link, file-count, and size protection.",
-                 {"archive": path, "destination": path}, ["archive", "destination"]),
-            tool("capability_summary", "List Aura's currently available tools and autonomy policy.", {}, []),
-            tool("remember_name", "Remember the user's preferred name.",
-                 {"name": {"type": "string"}}, ["name"]),
-            tool("remember_preference", "Remember one durable user preference.",
-                 {"key": {"type": "string"}, "value": {"type": "string"}}, ["key", "value"]),
-            tool("remember_personal_fact", "Remember one clear, non-sensitive fact the user explicitly stated about their preferences, interests, goals, projects, tools, or working style.",
-                 {"category": {"type": "string", "enum": sorted(MemoryStore.PROFILE_CATEGORIES)},
-                  "value": {"type": "string"}}, ["category", "value"]),
-            tool("list_personal_memory", "Review the editable personal facts Aura currently remembers about the user.",
-                 {"query": {"type": "string", "default": ""}}, []),
-            tool("forget_personal_fact", "Forget one personal memory matching the user's description. Ambiguous matches are returned without deleting anything.",
-                 {"query": {"type": "string"}}, ["query"]),
-            tool("correct_personal_fact", "Correct one unambiguous personal memory and mark the corrected value as user-confirmed.",
-                 {"query": {"type": "string"}, "new_value": {"type": "string"},
-                  "category": {"type": "string", "enum": sorted(MemoryStore.PROFILE_CATEGORIES)}},
-                 ["query", "new_value"]),
-            tool("recent_tasks", "Review Aura's recent persistent task outcomes and tools used.",
-                 {"limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5}}),
-            # Registered services append themselves here, so a new integration
-            # never means editing this list or the tool loop below.
-            *(service.tool_definition() for service in services.services()),
-        ]
+        """Every tool the model may see, generated from where each is implemented.
+
+        Declaration and dispatch used to live in two places that could drift
+        apart with nothing to catch it; both now come from one registration.
+        """
+        return toolkit.definitions() + [service.tool_definition()
+                                        for service in services.services()]
+
+    @tool('list_files', 'List files recursively inside a workspace folder.',
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..', 'default': '.'}}, [])
+    def _tool_list_files(self, name, args, approve, call):
+        result = {"files": self.sandbox.list_files(str(args.get("path", ".")))[:1000]}
+        return result
+
+    @tool('create_folder', 'Create an empty workspace folder and missing parent folders. Use this instead of mkdir.',
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['path'], mutating=True)
+    def _tool_create_folder(self, name, args, approve, call):
+        target = self.sandbox.create_folder(str(args["path"]))
+        result = {"path": target.relative_to(self.sandbox.root).as_posix()}
+        return result
+
+    @tool('read_file', 'Read a UTF-8 text file or a focused line range from the workspace.',
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'start_line': {'type': 'integer', 'minimum': 1, 'default': 1}, 'end_line': {'type': 'integer', 'minimum': 1}}, ['path'])
+    def _tool_read_file(self, name, args, approve, call):
+        content = self.sandbox.read_file(str(args["path"]))
+        lines = content.splitlines(keepends=True)
+        start = max(1, int(args.get("start_line", 1)))
+        end = min(len(lines), int(args.get("end_line", start + 399)))
+        selected = "".join(lines[start - 1:end])
+        result = {"path": args["path"], "content": selected,
+                  "start_line": start, "end_line": end, "total_lines": len(lines),
+                  "truncated": end < len(lines)}
+        return result
+
+    @tool('read_many_files', 'Read several related UTF-8 workspace files in one call with bounded output.',
+          {'paths': {'type': 'array', 'minItems': 1, 'maxItems': 20, 'items': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, 'max_lines_each': {'type': 'integer', 'minimum': 20, 'maximum': 1000, 'default': 300}}, ['paths'])
+    def _tool_read_many_files(self, name, args, approve, call):
+        paths = args.get("paths")
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 20:
+            raise ValueError("paths must contain between 1 and 20 files")
+        max_lines = max(20, min(int(args.get("max_lines_each", 300)), 1000))
+        files = []
+        output_chars = 0
+        for raw_path in paths:
+            path = str(raw_path)
+            content = self.sandbox.read_file(path)
+            lines = content.splitlines(keepends=True)
+            selected = "".join(lines[:max_lines])
+            output_chars += len(selected)
+            if output_chars > 250_000:
+                raise ValueError("combined read exceeds Aura's 250,000 character context limit")
+            files.append({"path": path, "content": selected, "total_lines": len(lines),
+                          "truncated": len(lines) > max_lines})
+        result = {"files": files, "count": len(files)}
+        return result
+
+    @tool('file_info', "Inspect a file's size, line count, and modification time.",
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['path'])
+    def _tool_file_info(self, name, args, approve, call):
+        target = self.sandbox.path(str(args["path"]))
+        if not target.is_file():
+            raise FileNotFoundError(str(args["path"]))
+        stat = target.stat()
+        try:
+            line_count = len(target.read_text(encoding="utf-8").splitlines())
+        except UnicodeDecodeError:
+            line_count = None
+        result = {"path": args["path"], "bytes": stat.st_size,
+                  "lines": line_count, "modified": stat.st_mtime}
+        return result
+
+    @tool('create_file', 'Create a new UTF-8 file; fails if it already exists.',
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'content': {'type': 'string'}}, ['path', 'content'], mutating=True)
+    @tool('write_file', 'Create or replace a UTF-8 file in the workspace.',
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'content': {'type': 'string'}}, ['path', 'content'], mutating=True)
+    @tool('append_file', 'Append UTF-8 text to a workspace file, creating it if needed.',
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'content': {'type': 'string'}}, ['path', 'content'], mutating=True)
+    def _tool_create_file(self, name, args, approve, call):
+        content = str(args["content"])
+        if len(content.encode("utf-8")) > self.MAX_WRITE_BYTES:
+            raise ValueError("file content exceeds Aura's 1 MB tool limit")
+        if name == "create_file":
+            target = self.sandbox.create_file(str(args["path"]), content)
+        elif name == "append_file":
+            path = str(args["path"])
+            existing = self.sandbox.read_file(path) if self.sandbox.path(path).exists() else ""
+            target = self.sandbox.write_file(path, existing + content)
+        else:
+            target = self.sandbox.write_file(str(args["path"]), content)
+        result = {"path": target.relative_to(self.sandbox.root).as_posix(),
+                  "bytes": len(content.encode("utf-8"))}
+        return result
+
+    @tool('write_files', 'Create or replace up to 20 related UTF-8 files in one batch. Every file remains recoverable.',
+          {'files': {'type': 'array', 'minItems': 1, 'maxItems': 20, 'items': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'content': {'type': 'string'}}, 'required': ['path', 'content'], 'additionalProperties': False}}}, ['files'], mutating=True)
+    def _tool_write_files(self, name, args, approve, call):
+        items = args.get("files")
+        if not isinstance(items, list) or not 1 <= len(items) <= 20:
+            raise ValueError("files must contain between 1 and 20 items")
+        prepared: list[tuple[str, str, int]] = []
+        total_bytes = 0
+        for item in items:
+            if not isinstance(item, dict) or "path" not in item or "content" not in item:
+                raise ValueError("each file requires path and content")
+            path, content = str(item["path"]), str(item["content"])
+            size = len(content.encode("utf-8"))
+            if size > self.MAX_WRITE_BYTES:
+                raise ValueError(f"{path} exceeds Aura's 1 MB per-file tool limit")
+            self.sandbox.path(path)
+            prepared.append((path, content, size))
+            total_bytes += size
+        if total_bytes > 4_000_000:
+            raise ValueError("combined batch write exceeds Aura's 4 MB limit")
+        written = []
+        for path, content, size in prepared:
+            target = self.sandbox.write_file(path, content)
+            written.append({"path": target.relative_to(self.sandbox.root).as_posix(),
+                            "bytes": size})
+        result = {"files": written, "count": len(written), "bytes": total_bytes}
+        return result
+
+    @tool('replace_in_file', 'Precisely replace exact text in an existing UTF-8 file. Fails if the match count is unexpected.',
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'old_text': {'type': 'string'}, 'new_text': {'type': 'string'}, 'expected_count': {'type': 'integer', 'minimum': 1, 'default': 1}}, ['path', 'old_text', 'new_text'], mutating=True)
+    def _tool_replace_in_file(self, name, args, approve, call):
+        path = str(args["path"])
+        old, new = str(args["old_text"]), str(args["new_text"])
+        if not old:
+            raise ValueError("old_text cannot be empty")
+        content = self.sandbox.read_file(path)
+        expected = int(args.get("expected_count", 1))
+        actual = content.count(old)
+        if actual != expected:
+            raise ValueError(f"expected {expected} exact matches but found {actual}")
+        updated = content.replace(old, new)
+        if len(updated.encode("utf-8")) > self.MAX_WRITE_BYTES:
+            raise ValueError("updated file exceeds Aura's 1 MB tool limit")
+        target = self.sandbox.write_file(path, updated)
+        result = {"path": target.relative_to(self.sandbox.root).as_posix(),
+                  "replacements": actual}
+        return result
+
+    @tool('apply_edits', 'Atomically apply several exact text replacements to one file with one recovery snapshot.',
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'edits': {'type': 'array', 'minItems': 1, 'maxItems': 50, 'items': {'type': 'object', 'properties': {'old_text': {'type': 'string'}, 'new_text': {'type': 'string'}, 'expected_count': {'type': 'integer', 'minimum': 1, 'default': 1}}, 'required': ['old_text', 'new_text'], 'additionalProperties': False}}}, ['path', 'edits'], mutating=True)
+    def _tool_apply_edits(self, name, args, approve, call):
+        path = str(args["path"])
+        edits = args["edits"]
+        if not isinstance(edits, list) or not 1 <= len(edits) <= 50:
+            raise ValueError("edits must contain between 1 and 50 replacements")
+        updated = self.sandbox.read_file(path)
+        applied = 0
+        for edit in edits:
+            old, new = str(edit["old_text"]), str(edit["new_text"])
+            if not old:
+                raise ValueError("old_text cannot be empty")
+            expected = int(edit.get("expected_count", 1))
+            actual = updated.count(old)
+            if actual != expected:
+                raise ValueError(f"expected {expected} matches but found {actual} for edit {applied + 1}")
+            updated = updated.replace(old, new)
+            applied += actual
+        if len(updated.encode("utf-8")) > self.MAX_WRITE_BYTES:
+            raise ValueError("updated file exceeds Aura's 1 MB tool limit")
+        target = self.sandbox.write_file(path, updated)
+        result = {"path": target.relative_to(self.sandbox.root).as_posix(),
+                  "edits": len(edits), "replacements": applied}
+        return result
+
+    @tool('search_files', 'Search file names and UTF-8 contents in the workspace.',
+          {'query': {'type': 'string'}, 'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..', 'default': '.'}}, ['query'])
+    def _tool_search_files(self, name, args, approve, call):
+        result = {"matches": self.sandbox.search_files(
+            str(args["query"]), str(args.get("path", ".")))[:500]}
+        return result
+
+    @tool('search_text', 'Return matching lines with file names and line numbers.',
+          {'query': {'type': 'string'}, 'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..', 'default': '.'}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 500, 'default': 100}}, ['query'])
+    def _tool_search_text(self, name, args, approve, call):
+        limit = max(1, min(int(args.get("limit", 100)), 500))
+        result = {"matches": self.sandbox.search_text(
+            str(args["query"]), str(args.get("path", ".")), limit)}
+        return result
+
+    @tool('list_granted_folders', 'List folders outside the workspace that the user has granted Aura permission to read. Aura cannot grant itself access; only the user can, from the Permissions panel.',
+          {}, [])
+    def _tool_list_granted_folders(self, name, args, approve, call):
+        result = {"folders": [
+            {"path": grant["root"], "mode": grant["mode"],
+             "project": grant.get("project")}
+            for grant in self.permissions.active()
+            if grant.get("capability") == "read_folder"]}
+        return result
+
+    @tool('list_external_folder', 'List files inside a folder the user has already granted. Fails if there is no active permission for that folder.',
+          {'path': {'type': 'string'}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 500, 'default': 200}}, ['path'])
+    def _tool_list_external_folder(self, name, args, approve, call):
+        result = {"path": str(args["path"]),
+                  "files": self.external.list_files(
+                      str(args["path"]), limit=int(args.get("limit", 200)))}
+        return result
+
+    @tool('read_external_file', "Read a UTF-8 text file inside a folder the user has already granted. Fails if there is no active permission for that file's folder.",
+          {'path': {'type': 'string'}}, ['path'])
+    def _tool_read_external_file(self, name, args, approve, call):
+        result = {"path": str(args["path"]),
+                  "content": self.external.read_file(str(args["path"]))}
+        return result
+
+    @tool('write_external_file', 'Write a UTF-8 text file inside a folder the user granted for writing. The previous version is saved first, so the change can be undone. A read grant is not enough; writing needs its own permission.',
+          {'path': {'type': 'string'}, 'content': {'type': 'string'}}, ['path', 'content'], mutating=True)
+    def _tool_write_external_file(self, name, args, approve, call):
+        result = self.external_writer.write_file(
+            str(args["path"]), str(args["content"]),
+            task_id=self.current_task_id)
+        return result
+
+    @tool('undo_external_change', "Undo Aura's most recent write outside the workspace, restoring the previous version or removing a file it created.",
+          {}, [])
+    def _tool_undo_external_change(self, name, args, approve, call):
+        result = self.external_writer.undo_last()
+        return result
+
+    @tool('check_accessibility', 'Report accessibility problems in workspace HTML: images without alt text, form controls without labels, empty links or buttons, a missing lang or title, and skipped heading levels. Structural checks only — it does not evaluate colour contrast.',
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..', 'default': '.'}}, [])
+    def _tool_check_accessibility(self, name, args, approve, call):
+        result = check_accessibility(self.sandbox, str(args.get("path", ".")))
+        return result
+
+    @tool('compare_images', 'Measure exactly how two workspace PNG images differ: percentage of changed pixels and the region that changed. Use it to check a render against a reference or to detect a layout regression between two screenshots. This is a real pixel measurement, not an impression.',
+          {'first': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'second': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'tolerance': {'type': 'integer', 'minimum': 0, 'maximum': 128, 'default': 8}}, ['first', 'second'])
+    def _tool_compare_images(self, name, args, approve, call):
+        result = compare_images(
+            self.sandbox.path(str(args["first"])),
+            self.sandbox.path(str(args["second"])),
+            tolerance=int(args.get("tolerance", 8)))
+        return result
+
+    @tool('capture_page', "Render a workspace HTML page in a local headless browser and save a PNG screenshot of it into the workspace. Use this to see how a page actually looks, then call look_at_image on the saved screenshot. Needs the user's approval because it launches a browser.",
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'width': {'type': 'integer', 'minimum': 320, 'maximum': 2560, 'default': 1200}, 'height': {'type': 'integer', 'minimum': 240, 'maximum': 2000, 'default': 800}}, ['path'])
+    def _tool_capture_page(self, name, args, approve, call):
+        result = self._capture_page(
+            str(args["path"]), approve,
+            int(args.get("width", 1200)), int(args.get("height", 800)))
+        # The wrapper reads "ok" straight from the result now.
+        result["ok"] = bool(result.get("approved"))
+        return result
+
+    @tool('look_at_image', 'Actually look at a workspace image (PNG/JPEG/GIF/WebP/BMP). The image is attached to the conversation so you can describe or compare what it shows. Call this whenever the user asks what an image contains or looks like — listing or reading the file cannot answer that, because its pixels are only visible through this tool.',
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['path'])
+    def _tool_look_at_image(self, name, args, approve, call):
+        if not self.vision_enabled():
+            raise ValueError(
+                "The loaded model does not accept images. Turn vision on in "
+                "Settings if you know it does.")
+        result = self._read_image_attachment(str(args["path"]))
+        return result
+
+    @tool('find_relevant_files', 'Rank workspace files by relevance to a described topic or question. Use this when you do not know the exact wording to search for; use search_files or search_text when you need an exact string. Matches words, not synonyms.',
+          {'query': {'type': 'string'}, 'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..', 'default': '.'}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 50, 'default': 10}}, ['query'])
+    def _tool_find_relevant_files(self, name, args, approve, call):
+        result = {"matches": self.index.search(
+            str(args["query"]), int(args.get("limit", 10)),
+            str(args.get("path", ".")))}
+        return result
+
+    @tool('copy_file', 'Copy a workspace file.',
+          {'source': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'destination': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['source', 'destination'], mutating=True)
+    def _tool_copy_file(self, name, args, approve, call):
+        target = self.sandbox.copy_file(str(args["source"]), str(args["destination"]))
+        result = {"path": target.relative_to(self.sandbox.root).as_posix()}
+        return result
+
+    @tool('move_file', 'Move or rename a workspace file.',
+          {'source': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'destination': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['source', 'destination'], mutating=True)
+    def _tool_move_file(self, name, args, approve, call):
+        target = self.sandbox.move_file(str(args["source"]), str(args["destination"]))
+        result = {"path": target.relative_to(self.sandbox.root).as_posix()}
+        return result
+
+    @tool('safe_delete_file', "Move a file into Aura's recoverable trash.",
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['path'], mutating=True)
+    def _tool_safe_delete_file(self, name, args, approve, call):
+        target = self.sandbox.safe_delete_file(str(args["path"]))
+        result = {"trashed_as": target.name, "recoverable": True}
+        return result
+
+    @tool('undo_last_change', "Undo Aura's most recent file mutation using its protected snapshot history.",
+          {}, [])
+    def _tool_undo_last_change(self, name, args, approve, call):
+        result = self.sandbox.undo_last_change()
+        return result
+
+    @tool('rollback_task', 'Undo every still-active file mutation belonging to a specific Aura task ID.',
+          {'task_id': {'type': 'string'}}, ['task_id'])
+    def _tool_rollback_task(self, name, args, approve, call):
+        result = self.sandbox.rollback_task(str(args["task_id"]))
+        return result
+
+    @tool('change_history', 'List recent recoverable workspace mutations and whether they were undone.',
+          {'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100, 'default': 20}}, [])
+    def _tool_change_history(self, name, args, approve, call):
+        result = {"changes": self.sandbox.change_history(int(args.get("limit", 20)))}
+        return result
+
+    @tool('workspace_summary', 'Summarize workspace file count, size, extensions, and largest files.',
+          {}, [])
+    def _tool_workspace_summary(self, name, args, approve, call):
+        files = self.sandbox.list_files()
+        sizes = []
+        extensions: dict[str, int] = {}
+        for relative in files:
+            target = self.sandbox.path(relative)
+            size = target.stat().st_size
+            sizes.append((relative, size))
+            extension = target.suffix.casefold() or "(none)"
+            extensions[extension] = extensions.get(extension, 0) + 1
+        result = {"file_count": len(files), "total_bytes": sum(size for _, size in sizes),
+                  "extensions": dict(sorted(extensions.items())),
+                  "largest_files": [{"path": path, "bytes": size}
+                                    for path, size in sorted(sizes, key=lambda item: item[1], reverse=True)[:10]]}
+        return result
+
+    @tool('inspect_code', 'Outline symbols, imports, and structure in a Python, JavaScript, or TypeScript file without executing it.',
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['path'])
+    def _tool_inspect_code(self, name, args, approve, call):
+        result = self._inspect_code(str(args["path"]))
+        return result
+
+    @tool('compare_files', 'Produce a bounded unified diff between two UTF-8 workspace files.',
+          {'left': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'right': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'context_lines': {'type': 'integer', 'minimum': 0, 'maximum': 20, 'default': 3}}, ['left', 'right'])
+    def _tool_compare_files(self, name, args, approve, call):
+        left, right = str(args["left"]), str(args["right"])
+        context = max(0, min(int(args.get("context_lines", 3)), 20))
+        result = self.sandbox.compare_files(left, right, context)
+        return result
+
+    @tool('calculate', 'Evaluate arithmetic and common math functions locally without running code.',
+          {'expression': {'type': 'string'}}, ['expression'])
+    def _tool_calculate(self, name, args, approve, call):
+        expression = str(args["expression"])
+        result = {"expression": expression, "result": self._calculate(expression)}
+        return result
+
+    @tool('system_info', 'Inspect non-sensitive local runtime facts such as OS, Python, CPU count, and workspace disk space.',
+          {}, [])
+    def _tool_system_info(self, name, args, approve, call):
+        disk = shutil.disk_usage(self.sandbox.root)
+        result = {"os": platform.platform(), "python": platform.python_version(),
+                  "architecture": platform.machine(), "cpu_count": os.cpu_count(),
+                  "workspace": str(self.sandbox.root),
+                  "workspace_disk": {"total": disk.total, "used": disk.used, "free": disk.free}}
+        return result
+
+    @tool('validate_project', 'Safely validate every project file, including Python, JSON, TOML, HTML, CSS, JavaScript/TypeScript, XML, and UTF-8 text, without executing project code.',
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..', 'default': '.'}}, [])
+    def _tool_validate_project(self, name, args, approve, call):
+        result = self._validate_project(str(args.get("path", ".")))
+        return result
+
+    @tool('run_command', 'Run an actual program, test, build, or project runtime inside the workspace. Commands use a direct argument array with no shell. Never use this for file/folder operations; create_file and write_file create parent folders. Use python for Python; unsafe commands require approval.',
+          {'command': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1}, 'timeout': {'type': 'number', 'minimum': 1, 'maximum': 60, 'default': 15}}, ['command'])
+    def _tool_run_command(self, name, args, approve, call):
+        command = args["command"]
+        if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
+            raise ValueError("command must be an array of strings")
+        timeout = max(1.0, min(float(args.get("timeout", 15)), 60.0))
+        run = self.commands.run(
+            command, approve=approve, timeout=timeout,
+            autonomy=str(self.config.data.get("autonomy_mode", "balanced")),
+        )
+        result = {"approved": run.approved, "returncode": run.returncode,
+                  "stdout": run.stdout[-20_000:], "stderr": run.stderr[-20_000:],
+                  "timed_out": run.timed_out, "blocked": run.blocked}
+        result["ok"] = run.succeeded
+        if not run.succeeded:
+            if run.blocked:
+                reason = run.stderr or "Command is blocked by Aura's workspace policy."
+            elif not run.approved:
+                reason = "Command was not approved."
+            elif run.timed_out:
+                reason = "Command timed out."
+            elif run.returncode is None:
+                reason = run.stderr or "Command could not be started."
+            else:
+                reason = run.stderr.strip() or f"Command exited with code {run.returncode}."
+            result["error"] = reason
+        return result
+
+    @tool('http_get', 'Fetch a bounded HTTP(S) text response. Localhost is direct; any other domain must already be granted by the user under Permissions, and cannot be requested from here.',
+          {'url': {'type': 'string'}, 'timeout': {'type': 'number', 'minimum': 1, 'maximum': 20, 'default': 10}}, ['url'])
+    def _tool_http_get(self, name, args, approve, call):
+        result = self._http_get(str(args["url"]),
+                                max(1.0, min(float(args.get("timeout", 10)), 20.0)))
+        return result
+
+    @tool('open_workspace_item', 'Open a workspace file or folder in its normal desktop application after approval.',
+          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['path'])
+    def _tool_open_workspace_item(self, name, args, approve, call):
+        path = str(args["path"])
+        target = self.sandbox.path(path)
+        if not target.exists():
+            raise FileNotFoundError(path)
+        if not approve or not approve(["OPEN", path]):
+            raise PermissionError("Opening a desktop application was not approved")
+        os.startfile(target)  # type: ignore[attr-defined]
+        result = {"path": path, "opened": True}
+        return result
+
+    @tool('create_archive', 'Create a recoverable ZIP archive from a workspace file or folder.',
+          {'source': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'destination': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['source', 'destination'], mutating=True)
+    def _tool_create_archive(self, name, args, approve, call):
+        target = self.sandbox.create_archive(str(args["source"]), str(args["destination"]))
+        result = {"path": target.relative_to(self.sandbox.root).as_posix(),
+                  "bytes": target.stat().st_size}
+        return result
+
+    @tool('extract_archive', 'Safely extract a workspace ZIP with traversal, link, file-count, and size protection.',
+          {'archive': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'destination': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['archive', 'destination'], mutating=True)
+    def _tool_extract_archive(self, name, args, approve, call):
+        extracted = self.sandbox.extract_archive(str(args["archive"]), str(args["destination"]))
+        result = {"files": [path.relative_to(self.sandbox.root).as_posix() for path in extracted],
+                  "count": len(extracted)}
+        return result
+
+    @tool('capability_summary', "List Aura's currently available tools and autonomy policy.",
+          {}, [])
+    def _tool_capability_summary(self, name, args, approve, call):
+        result = {"tools": [item["function"]["name"] for item in self.tool_definitions()],
+                  "tool_count": len(self.tool_definitions()),
+                  "reasoning_depth": self.config.data.get("reasoning_depth"),
+                  "autonomy_mode": self.config.data.get("autonomy_mode"),
+                  "workspace_only": True,
+                  "approval_policy": "Safe local tools are automatic; executable code, external HTTP, and desktop launches ask first."}
+        return result
+
+    @tool('remember_name', "Remember the user's preferred name.",
+          {'name': {'type': 'string'}}, ['name'])
+    def _tool_remember_name(self, name, args, approve, call):
+        self.memory.set_name(str(args["name"]))
+        result = {"remembered": True}
+        return result
+
+    @tool('remember_preference', 'Remember one durable user preference.',
+          {'key': {'type': 'string'}, 'value': {'type': 'string'}}, ['key', 'value'])
+    def _tool_remember_preference(self, name, args, approve, call):
+        self.memory.set_preference(str(args["key"]), str(args["value"]))
+        result = {"remembered": True}
+        return result
+
+    @tool('remember_personal_fact', 'Remember one clear, non-sensitive fact the user explicitly stated about their preferences, interests, goals, projects, tools, or working style.',
+          {'category': {'type': 'string', 'enum': ['goal', 'interest', 'personal', 'preference', 'project', 'tool', 'work_style']}, 'value': {'type': 'string'}}, ['category', 'value'])
+    def _tool_remember_personal_fact(self, name, args, approve, call):
+        item = self.memory.learn_fact(
+            str(args["category"]), str(args["value"]),
+            source="Explicitly remembered through Aura chat", confidence=1.0, explicit=True,
+        )
+        result = {"remembered": True, "memory": item}
+        return result
+
+    @tool('list_personal_memory', 'Review the editable personal facts Aura currently remembers about the user.',
+          {'query': {'type': 'string', 'default': ''}}, [])
+    def _tool_list_personal_memory(self, name, args, approve, call):
+        query = str(args.get("query", "")).strip()
+        memories = (self.memory.find_profile_memories(query) if query
+                    else self.memory.profile_memories())
+        result = {"memories": memories[:100], "count": len(memories)}
+        return result
+
+    @tool('forget_personal_fact', "Forget one personal memory matching the user's description. Ambiguous matches are returned without deleting anything.",
+          {'query': {'type': 'string'}}, ['query'])
+    def _tool_forget_personal_fact(self, name, args, approve, call):
+        query = str(args["query"])
+        matches = self.memory.find_profile_memories(query)
+        if not matches:
+            raise FileNotFoundError("No personal memory matches that description")
+        if len(matches) != 1:
+            choices = "; ".join(str(item.get("value", "")) for item in matches[:5])
+            raise ValueError(f"Memory description is ambiguous; matching facts: {choices}")
+        removed = self.memory.forget_profile_memory(str(matches[0]["id"]))
+        result = {"forgotten": True, "memory": removed}
+        return result
+
+    @tool('correct_personal_fact', 'Correct one unambiguous personal memory and mark the corrected value as user-confirmed.',
+          {'query': {'type': 'string'}, 'new_value': {'type': 'string'}, 'category': {'type': 'string', 'enum': ['goal', 'interest', 'personal', 'preference', 'project', 'tool', 'work_style']}}, ['query', 'new_value'])
+    def _tool_correct_personal_fact(self, name, args, approve, call):
+        query = str(args["query"])
+        matches = self.memory.find_profile_memories(query)
+        if not matches:
+            raise FileNotFoundError("No personal memory matches that description")
+        if len(matches) != 1:
+            choices = "; ".join(str(item.get("value", "")) for item in matches[:5])
+            raise ValueError(f"Memory description is ambiguous; matching facts: {choices}")
+        updated = self.memory.update_profile_memory(
+            str(matches[0]["id"]), value=str(args["new_value"]),
+            category=str(args.get("category") or matches[0].get("category", "personal")),
+        )
+        result = {"corrected": True, "memory": updated}
+        return result
+
+    @tool('recent_tasks', "Review Aura's recent persistent task outcomes and tools used.",
+          {'limit': {'type': 'integer', 'minimum': 1, 'maximum': 20, 'default': 5}}, [])
+    def _tool_recent_tasks(self, name, args, approve, call):
+        result = {"tasks": self.tasks.recent(max(1, min(int(args.get("limit", 5)), 20)))}
+        return result
+
 
     def _execute_tool(self, call: ToolCall, approve: Callable[[list[str]], bool] | None) -> dict:
+        """Run one tool, with the audit trail every tool shares.
+
+        Logging, task recording, and error handling stay here rather than in the
+        handlers, so a newly added tool cannot quietly skip them.
+        """
         name, args = call.name, call.arguments
-        tool_ok = True
         try:
             service = services.get(name)
+            spec = toolkit.get(name)
             if service is not None:
                 # The service is handed a fetch that already enforces the domain
                 # grant, so it cannot reach anywhere the user has not allowed.
                 result = service.handler(
                     lambda url, timeout=10.0: self._http_get(url, timeout), dict(args))
-                tool_ok = bool(result.get("ok", True))
-            elif name == "list_files":
-                result = {"files": self.sandbox.list_files(str(args.get("path", ".")))[:1000]}
-            elif name == "create_folder":
-                target = self.sandbox.create_folder(str(args["path"]))
-                result = {"path": target.relative_to(self.sandbox.root).as_posix()}
-            elif name == "read_file":
-                content = self.sandbox.read_file(str(args["path"]))
-                lines = content.splitlines(keepends=True)
-                start = max(1, int(args.get("start_line", 1)))
-                end = min(len(lines), int(args.get("end_line", start + 399)))
-                selected = "".join(lines[start - 1:end])
-                result = {"path": args["path"], "content": selected,
-                          "start_line": start, "end_line": end, "total_lines": len(lines),
-                          "truncated": end < len(lines)}
-            elif name == "read_many_files":
-                paths = args.get("paths")
-                if not isinstance(paths, list) or not 1 <= len(paths) <= 20:
-                    raise ValueError("paths must contain between 1 and 20 files")
-                max_lines = max(20, min(int(args.get("max_lines_each", 300)), 1000))
-                files = []
-                output_chars = 0
-                for raw_path in paths:
-                    path = str(raw_path)
-                    content = self.sandbox.read_file(path)
-                    lines = content.splitlines(keepends=True)
-                    selected = "".join(lines[:max_lines])
-                    output_chars += len(selected)
-                    if output_chars > 250_000:
-                        raise ValueError("combined read exceeds Aura's 250,000 character context limit")
-                    files.append({"path": path, "content": selected, "total_lines": len(lines),
-                                  "truncated": len(lines) > max_lines})
-                result = {"files": files, "count": len(files)}
-            elif name == "file_info":
-                target = self.sandbox.path(str(args["path"]))
-                if not target.is_file():
-                    raise FileNotFoundError(str(args["path"]))
-                stat = target.stat()
-                try:
-                    line_count = len(target.read_text(encoding="utf-8").splitlines())
-                except UnicodeDecodeError:
-                    line_count = None
-                result = {"path": args["path"], "bytes": stat.st_size,
-                          "lines": line_count, "modified": stat.st_mtime}
-            elif name in {"create_file", "write_file", "append_file"}:
-                content = str(args["content"])
-                if len(content.encode("utf-8")) > self.MAX_WRITE_BYTES:
-                    raise ValueError("file content exceeds Aura's 1 MB tool limit")
-                if name == "create_file":
-                    target = self.sandbox.create_file(str(args["path"]), content)
-                elif name == "append_file":
-                    path = str(args["path"])
-                    existing = self.sandbox.read_file(path) if self.sandbox.path(path).exists() else ""
-                    target = self.sandbox.write_file(path, existing + content)
-                else:
-                    target = self.sandbox.write_file(str(args["path"]), content)
-                result = {"path": target.relative_to(self.sandbox.root).as_posix(),
-                          "bytes": len(content.encode("utf-8"))}
-            elif name == "write_files":
-                items = args.get("files")
-                if not isinstance(items, list) or not 1 <= len(items) <= 20:
-                    raise ValueError("files must contain between 1 and 20 items")
-                prepared: list[tuple[str, str, int]] = []
-                total_bytes = 0
-                for item in items:
-                    if not isinstance(item, dict) or "path" not in item or "content" not in item:
-                        raise ValueError("each file requires path and content")
-                    path, content = str(item["path"]), str(item["content"])
-                    size = len(content.encode("utf-8"))
-                    if size > self.MAX_WRITE_BYTES:
-                        raise ValueError(f"{path} exceeds Aura's 1 MB per-file tool limit")
-                    self.sandbox.path(path)
-                    prepared.append((path, content, size))
-                    total_bytes += size
-                if total_bytes > 4_000_000:
-                    raise ValueError("combined batch write exceeds Aura's 4 MB limit")
-                written = []
-                for path, content, size in prepared:
-                    target = self.sandbox.write_file(path, content)
-                    written.append({"path": target.relative_to(self.sandbox.root).as_posix(),
-                                    "bytes": size})
-                result = {"files": written, "count": len(written), "bytes": total_bytes}
-            elif name == "replace_in_file":
-                path = str(args["path"])
-                old, new = str(args["old_text"]), str(args["new_text"])
-                if not old:
-                    raise ValueError("old_text cannot be empty")
-                content = self.sandbox.read_file(path)
-                expected = int(args.get("expected_count", 1))
-                actual = content.count(old)
-                if actual != expected:
-                    raise ValueError(f"expected {expected} exact matches but found {actual}")
-                updated = content.replace(old, new)
-                if len(updated.encode("utf-8")) > self.MAX_WRITE_BYTES:
-                    raise ValueError("updated file exceeds Aura's 1 MB tool limit")
-                target = self.sandbox.write_file(path, updated)
-                result = {"path": target.relative_to(self.sandbox.root).as_posix(),
-                          "replacements": actual}
-            elif name == "apply_edits":
-                path = str(args["path"])
-                edits = args["edits"]
-                if not isinstance(edits, list) or not 1 <= len(edits) <= 50:
-                    raise ValueError("edits must contain between 1 and 50 replacements")
-                updated = self.sandbox.read_file(path)
-                applied = 0
-                for edit in edits:
-                    old, new = str(edit["old_text"]), str(edit["new_text"])
-                    if not old:
-                        raise ValueError("old_text cannot be empty")
-                    expected = int(edit.get("expected_count", 1))
-                    actual = updated.count(old)
-                    if actual != expected:
-                        raise ValueError(f"expected {expected} matches but found {actual} for edit {applied + 1}")
-                    updated = updated.replace(old, new)
-                    applied += actual
-                if len(updated.encode("utf-8")) > self.MAX_WRITE_BYTES:
-                    raise ValueError("updated file exceeds Aura's 1 MB tool limit")
-                target = self.sandbox.write_file(path, updated)
-                result = {"path": target.relative_to(self.sandbox.root).as_posix(),
-                          "edits": len(edits), "replacements": applied}
-            elif name == "search_files":
-                result = {"matches": self.sandbox.search_files(
-                    str(args["query"]), str(args.get("path", ".")))[:500]}
-            elif name == "search_text":
-                limit = max(1, min(int(args.get("limit", 100)), 500))
-                result = {"matches": self.sandbox.search_text(
-                    str(args["query"]), str(args.get("path", ".")), limit)}
-            elif name == "list_granted_folders":
-                result = {"folders": [
-                    {"path": grant["root"], "mode": grant["mode"],
-                     "project": grant.get("project")}
-                    for grant in self.permissions.active()
-                    if grant.get("capability") == "read_folder"]}
-            elif name == "list_external_folder":
-                result = {"path": str(args["path"]),
-                          "files": self.external.list_files(
-                              str(args["path"]), limit=int(args.get("limit", 200)))}
-            elif name == "read_external_file":
-                result = {"path": str(args["path"]),
-                          "content": self.external.read_file(str(args["path"]))}
-            elif name == "write_external_file":
-                result = self.external_writer.write_file(
-                    str(args["path"]), str(args["content"]),
-                    task_id=self.current_task_id)
-            elif name == "undo_external_change":
-                result = self.external_writer.undo_last()
-            elif name == "check_accessibility":
-                result = check_accessibility(self.sandbox, str(args.get("path", ".")))
-            elif name == "compare_images":
-                result = compare_images(
-                    self.sandbox.path(str(args["first"])),
-                    self.sandbox.path(str(args["second"])),
-                    tolerance=int(args.get("tolerance", 8)))
-            elif name == "capture_page":
-                result = self._capture_page(
-                    str(args["path"]), approve,
-                    int(args.get("width", 1200)), int(args.get("height", 800)))
-                tool_ok = bool(result.get("approved"))
-            elif name == "look_at_image":
-                if not self.vision_enabled():
-                    raise ValueError(
-                        "The loaded model does not accept images. Turn vision on in "
-                        "Settings if you know it does.")
-                result = self._read_image_attachment(str(args["path"]))
-            elif name == "find_relevant_files":
-                result = {"matches": self.index.search(
-                    str(args["query"]), int(args.get("limit", 10)),
-                    str(args.get("path", ".")))}
-            elif name == "copy_file":
-                target = self.sandbox.copy_file(str(args["source"]), str(args["destination"]))
-                result = {"path": target.relative_to(self.sandbox.root).as_posix()}
-            elif name == "move_file":
-                target = self.sandbox.move_file(str(args["source"]), str(args["destination"]))
-                result = {"path": target.relative_to(self.sandbox.root).as_posix()}
-            elif name == "safe_delete_file":
-                target = self.sandbox.safe_delete_file(str(args["path"]))
-                result = {"trashed_as": target.name, "recoverable": True}
-            elif name == "undo_last_change":
-                result = self.sandbox.undo_last_change()
-            elif name == "rollback_task":
-                result = self.sandbox.rollback_task(str(args["task_id"]))
-            elif name == "change_history":
-                result = {"changes": self.sandbox.change_history(int(args.get("limit", 20)))}
-            elif name == "workspace_summary":
-                files = self.sandbox.list_files()
-                sizes = []
-                extensions: dict[str, int] = {}
-                for relative in files:
-                    target = self.sandbox.path(relative)
-                    size = target.stat().st_size
-                    sizes.append((relative, size))
-                    extension = target.suffix.casefold() or "(none)"
-                    extensions[extension] = extensions.get(extension, 0) + 1
-                result = {"file_count": len(files), "total_bytes": sum(size for _, size in sizes),
-                          "extensions": dict(sorted(extensions.items())),
-                          "largest_files": [{"path": path, "bytes": size}
-                                            for path, size in sorted(sizes, key=lambda item: item[1], reverse=True)[:10]]}
-            elif name == "inspect_code":
-                result = self._inspect_code(str(args["path"]))
-            elif name == "compare_files":
-                left, right = str(args["left"]), str(args["right"])
-                context = max(0, min(int(args.get("context_lines", 3)), 20))
-                result = self.sandbox.compare_files(left, right, context)
-            elif name == "calculate":
-                expression = str(args["expression"])
-                result = {"expression": expression, "result": self._calculate(expression)}
-            elif name == "system_info":
-                disk = shutil.disk_usage(self.sandbox.root)
-                result = {"os": platform.platform(), "python": platform.python_version(),
-                          "architecture": platform.machine(), "cpu_count": os.cpu_count(),
-                          "workspace": str(self.sandbox.root),
-                          "workspace_disk": {"total": disk.total, "used": disk.used, "free": disk.free}}
-            elif name == "validate_project":
-                result = self._validate_project(str(args.get("path", ".")))
-            elif name == "run_command":
-                command = args["command"]
-                if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
-                    raise ValueError("command must be an array of strings")
-                timeout = max(1.0, min(float(args.get("timeout", 15)), 60.0))
-                run = self.commands.run(
-                    command, approve=approve, timeout=timeout,
-                    autonomy=str(self.config.data.get("autonomy_mode", "balanced")),
-                )
-                result = {"approved": run.approved, "returncode": run.returncode,
-                          "stdout": run.stdout[-20_000:], "stderr": run.stderr[-20_000:],
-                          "timed_out": run.timed_out, "blocked": run.blocked}
-                tool_ok = run.succeeded
-                if not tool_ok:
-                    if run.blocked:
-                        reason = run.stderr or "Command is blocked by Aura's workspace policy."
-                    elif not run.approved:
-                        reason = "Command was not approved."
-                    elif run.timed_out:
-                        reason = "Command timed out."
-                    elif run.returncode is None:
-                        reason = run.stderr or "Command could not be started."
-                    else:
-                        reason = run.stderr.strip() or f"Command exited with code {run.returncode}."
-                    result["error"] = reason
-            elif name == "http_get":
-                result = self._http_get(str(args["url"]),
-                                        max(1.0, min(float(args.get("timeout", 10)), 20.0)))
-            elif name == "open_workspace_item":
-                path = str(args["path"])
-                target = self.sandbox.path(path)
-                if not target.exists():
-                    raise FileNotFoundError(path)
-                if not approve or not approve(["OPEN", path]):
-                    raise PermissionError("Opening a desktop application was not approved")
-                os.startfile(target)  # type: ignore[attr-defined]
-                result = {"path": path, "opened": True}
-            elif name == "create_archive":
-                target = self.sandbox.create_archive(str(args["source"]), str(args["destination"]))
-                result = {"path": target.relative_to(self.sandbox.root).as_posix(),
-                          "bytes": target.stat().st_size}
-            elif name == "extract_archive":
-                extracted = self.sandbox.extract_archive(str(args["archive"]), str(args["destination"]))
-                result = {"files": [path.relative_to(self.sandbox.root).as_posix() for path in extracted],
-                          "count": len(extracted)}
-            elif name == "capability_summary":
-                result = {"tools": [item["function"]["name"] for item in self.tool_definitions()],
-                          "tool_count": len(self.tool_definitions()),
-                          "reasoning_depth": self.config.data.get("reasoning_depth"),
-                          "autonomy_mode": self.config.data.get("autonomy_mode"),
-                          "workspace_only": True,
-                          "approval_policy": "Safe local tools are automatic; executable code, external HTTP, and desktop launches ask first."}
-            elif name == "remember_name":
-                self.memory.set_name(str(args["name"]))
-                result = {"remembered": True}
-            elif name == "remember_preference":
-                self.memory.set_preference(str(args["key"]), str(args["value"]))
-                result = {"remembered": True}
-            elif name == "remember_personal_fact":
-                item = self.memory.learn_fact(
-                    str(args["category"]), str(args["value"]),
-                    source="Explicitly remembered through Aura chat", confidence=1.0, explicit=True,
-                )
-                result = {"remembered": True, "memory": item}
-            elif name == "list_personal_memory":
-                query = str(args.get("query", "")).strip()
-                memories = (self.memory.find_profile_memories(query) if query
-                            else self.memory.profile_memories())
-                result = {"memories": memories[:100], "count": len(memories)}
-            elif name == "forget_personal_fact":
-                query = str(args["query"])
-                matches = self.memory.find_profile_memories(query)
-                if not matches:
-                    raise FileNotFoundError("No personal memory matches that description")
-                if len(matches) != 1:
-                    choices = "; ".join(str(item.get("value", "")) for item in matches[:5])
-                    raise ValueError(f"Memory description is ambiguous; matching facts: {choices}")
-                removed = self.memory.forget_profile_memory(str(matches[0]["id"]))
-                result = {"forgotten": True, "memory": removed}
-            elif name == "correct_personal_fact":
-                query = str(args["query"])
-                matches = self.memory.find_profile_memories(query)
-                if not matches:
-                    raise FileNotFoundError("No personal memory matches that description")
-                if len(matches) != 1:
-                    choices = "; ".join(str(item.get("value", "")) for item in matches[:5])
-                    raise ValueError(f"Memory description is ambiguous; matching facts: {choices}")
-                updated = self.memory.update_profile_memory(
-                    str(matches[0]["id"]), value=str(args["new_value"]),
-                    category=str(args.get("category") or matches[0].get("category", "personal")),
-                )
-                result = {"corrected": True, "memory": updated}
-            elif name == "recent_tasks":
-                result = {"tasks": self.tasks.recent(max(1, min(int(args.get("limit", 5)), 20)))}
+            elif spec is not None:
+                result = spec.handler(self, name, args, approve, call)
             else:
                 raise ValueError(f"unknown tool: {name}")
             redacted = {k: v for k, v in args.items()
                         if k not in {"content", "old_text", "new_text", "edits"}}
             if name != "run_command":
                 self.log.record(name, tool_call=call.id, arguments=redacted)
-            payload = {"ok": tool_ok, **result}
+            payload = {"ok": True, **result}
             if self.current_task_id:
                 self.tasks.record_tool(self.current_task_id, name, redacted, payload)
             return payload
@@ -1680,6 +1776,7 @@ class AuraAgent:
                              if k not in {"content", "old_text", "new_text", "edits"}}
                 self.tasks.record_tool(self.current_task_id, name, safe_args, payload)
             return payload
+
 
     def _inspect_code(self, relative: str) -> dict:
         target = self.sandbox.path(relative)
@@ -1859,3 +1956,9 @@ class AuraAgent:
         output = run.stdout.strip()
         return ("Built and validated `hello-world` successfully.\n"
                 f"Run output: {output}\nFiles: PLAN.md, README.md, hello.py.")
+
+
+# One source of truth for what counts as a workspace mutation: the tools that
+# declare themselves mutating, plus `import_file`, which the user performs
+# through the UI rather than the model through a tool.
+AuraAgent.MUTATING_TOOL_NAMES = toolkit.mutating_names() | {"import_file"}

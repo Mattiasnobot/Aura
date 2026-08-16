@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import struct
 import subprocess
 import tempfile
@@ -24,8 +25,12 @@ import package
 import aura_app
 from aura import __version__ as aura_version
 from aura import services
+from aura import toolkit
+from aura.turn import PASS, TurnState
 from aura.action_log import ActionLog
-from aura.agent import AuraAgent
+from aura.agent import AuraAgent, TaskCancelled
+from aura.errors import AuraError
+from aura.memory import MemoryStore
 from aura.config import ConfigStore
 from aura.commands import CommandResult
 from aura.http_app import create_server, existing_aura_url
@@ -3461,6 +3466,267 @@ class HTMLServerTests(unittest.TestCase):
         self.assertTrue(any(event.get("type") == "reply" for event in events))
         graph = self.call("get_mind_graph")
         self.assertTrue(graph["ok"])
+
+
+class OnePreferenceStoreTests(unittest.TestCase):
+    """A preference lived in a flat dict *and* as a profile memory, written by
+    two different tools. That is what made Aura Mind draw one fact twice."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / "memory.json"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_both_routes_now_write_the_same_single_memory(self):
+        memory = MemoryStore(self.path)
+        memory.set_preference("tone", "terse")
+        memory.learn_fact("preference", "tone = terse", source="chat", explicit=True)
+        preferences = [item for item in memory.profile_memories()
+                       if item["category"] == "preference"]
+        self.assertEqual(len(preferences), 1)
+        self.assertEqual(memory.data["preferences"], {"tone": "terse"})
+
+    def test_a_preference_can_now_be_forgotten_like_any_other_memory(self):
+        """The old dict had no way to edit, confirm, revert, or export it."""
+        memory = MemoryStore(self.path)
+        memory.set_preference("theme", "dark")
+        memory.forget_profile_memory(memory.profile_memories()[0]["id"])
+        self.assertEqual(memory.data["preferences"], {})
+
+    def test_an_existing_flat_preference_list_is_adopted_once(self):
+        self.path.write_text(json.dumps({
+            "name": "Maya",
+            "preferences": {"tone": "terse", "theme": "dark"},
+            "profile_memories": [],
+        }), encoding="utf-8")
+        memory = MemoryStore(self.path)
+        adopted = {item["value"] for item in memory.profile_memories()
+                   if item["category"] == "preference"}
+        self.assertEqual(adopted, {"tone = terse", "theme = dark"})
+        self.assertEqual(memory.data["preferences"], {"tone": "terse", "theme": "dark"})
+        # Reopening must not duplicate what it already adopted.
+        again = MemoryStore(self.path)
+        self.assertEqual(len([item for item in again.profile_memories()
+                              if item["category"] == "preference"]), 2)
+        self.assertEqual(again.data["name"], "Maya")
+
+    def test_a_preference_already_held_as_a_memory_is_not_adopted_twice(self):
+        self.path.write_text(json.dumps({
+            "preferences": {"tone": "terse"},
+            "profile_memories": [{"id": "m1", "key": "preference:x", "category": "preference",
+                                  "value": "tone = terse", "confidence": 1.0,
+                                  "confirmed": True, "pinned": False, "source": "chat",
+                                  "created": "2026-01-01", "updated": "2026-01-01"}],
+        }), encoding="utf-8")
+        memory = MemoryStore(self.path)
+        self.assertEqual(len([item for item in memory.profile_memories()
+                              if item["category"] == "preference"]), 1)
+
+    def test_the_graph_no_longer_has_two_places_to_disagree(self):
+        memory = MemoryStore(self.path)
+        memory.set_preference("tone", "terse")
+        nodes, edges = build_mind_graph(memory.data, [], [])
+        labels = [node.label for node in nodes]
+        self.assertEqual(sum("terse" in label for label in labels), 1)
+        pairs = {(edge.source, edge.target) for edge in edges}
+        node_id = next(node.node_id for node in nodes if "terse" in node.label)
+        self.assertIn(("personal_memory", node_id), pairs)
+        self.assertIn(("preferences", node_id), pairs)
+
+
+class ErrorHierarchyTests(unittest.TestCase):
+    def test_everything_aura_refuses_shares_one_root(self):
+        for cls in (SandboxViolation, PermissionDenied, PermissionRefused,
+                    ProviderError, UnsupportedImage, TaskCancelled):
+            self.assertTrue(issubclass(cls, AuraError), cls.__name__)
+
+    def test_the_builtin_bases_are_kept_so_existing_handlers_still_work(self):
+        """The root was added beside the builtin bases, not instead of them —
+        every `except ValueError` already written keeps catching what it did."""
+        self.assertTrue(issubclass(SandboxViolation, ValueError))
+        self.assertTrue(issubclass(PermissionRefused, ValueError))
+        self.assertTrue(issubclass(PermissionDenied, PermissionError))
+        self.assertTrue(issubclass(ProviderError, RuntimeError))
+        with self.assertRaises(ValueError):
+            raise SandboxViolation("still a ValueError")
+
+    def test_an_unrelated_builtin_is_not_swept_up(self):
+        self.assertFalse(issubclass(FileNotFoundError, AuraError))
+
+
+class SchemaVersionTests(unittest.TestCase):
+    def test_a_fresh_database_records_the_current_version(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Database(Path(temporary) / "aura.db")
+            self.assertEqual(database.schema_version(), len(Database.MIGRATIONS))
+
+    def test_an_older_database_is_migrated_once_and_then_left_alone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "aura.db"
+            Database(path)
+            # Pretend this database predates versioning, as the user's real one
+            # does. Closed explicitly: sqlite3's context manager commits but
+            # leaves the connection open, which on Windows holds the file.
+            raw = sqlite3.connect(path)
+            try:
+                raw.execute("PRAGMA user_version = 0")
+                raw.commit()
+            finally:
+                raw.close()
+            applied = []
+            original = Database._migrate
+
+            def counting(self, connection):
+                applied.append(True)
+                return original(self, connection)
+
+            with patch.object(Database, "_migrate", counting):
+                Database(path)
+                self.assertEqual(Database(path).schema_version(), len(Database.MIGRATIONS))
+            self.assertEqual(len(applied), 2)   # called both times, applied only once
+
+    def test_migrations_are_append_only(self):
+        """A shipped migration must never be edited or renumbered, so the list
+        may only grow; entry 1 is the baseline that existing databases match."""
+        self.assertEqual(Database.MIGRATIONS[0], ())
+
+
+class CompletionGateTests(unittest.TestCase):
+    """Each gate can now be asked its verdict on its own, which the single
+    344-line function made impossible."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _turn(self, **values):
+        return TurnState(retries_left=AuraAgent.MAX_COMPLETION_RETRIES, **values)
+
+    def test_the_gates_run_in_the_order_the_reply_depends_on(self):
+        self.assertEqual([gate.__name__ for gate in AuraAgent.COMPLETION_GATES],
+                         ["_gate_empty_response", "_gate_artifacts", "_gate_validation",
+                          "_gate_action", "_gate_verification"])
+
+    def test_an_empty_answer_asks_again_and_stops_the_later_gates(self):
+        turn = self._turn(expected_paths=["missing.txt"])
+        verdict = self.agent._gate_empty_response(turn, ProviderReply("", []))
+        self.assertTrue(verdict.wants_retry)
+        self.assertIn("completely empty", verdict.instruction)
+        # Later gates keep quiet rather than judging a turn that said nothing.
+        self.assertEqual(self.agent._gate_artifacts(turn, ProviderReply("", [])), PASS)
+        self.assertEqual(self.agent._gate_action(turn, ProviderReply("", [])), PASS)
+
+    def test_a_missing_deliverable_asks_for_it_by_tool_name(self):
+        turn = self._turn(expected_paths=["notes.txt"])
+        verdict = self.agent._gate_artifacts(turn, ProviderReply("All done!", []))
+        self.assertTrue(verdict.wants_retry)
+        self.assertIn("create_file", verdict.instruction)
+        self.assertIn("notes.txt", verdict.instruction)
+
+    def test_a_spent_budget_turns_a_retry_into_an_honest_note(self):
+        turn = self._turn(expected_paths=["notes.txt"])
+        turn.retries_left = 0
+        verdict = self.agent._gate_artifacts(turn, ProviderReply("All done!", []))
+        self.assertFalse(verdict.wants_retry)
+        self.assertIn("requested but not found", verdict.note)
+
+    def test_work_in_a_granted_folder_owes_no_workspace_file(self):
+        turn = self._turn(expected_paths=["report.txt"], external_activity=True)
+        self.assertEqual(self.agent._gate_artifacts(turn, ProviderReply("Done.", [])), PASS)
+
+    def test_one_budget_is_shared_by_every_gate(self):
+        turn = self._turn()
+        self.assertTrue(turn.spend_retry())
+        self.assertTrue(turn.spend_retry())
+        self.assertTrue(turn.spend_retry())
+        self.assertFalse(turn.spend_retry())
+        self.assertEqual(turn.retries_left, 0)
+
+    def test_a_note_is_never_recorded_twice(self):
+        turn = self._turn()
+        turn.record_unconfirmed("same thing")
+        turn.record_unconfirmed("same thing")
+        self.assertEqual(turn.unconfirmed, ["same thing"])
+
+
+class SingleCommandPathTests(unittest.TestCase):
+    """One capability, one implementation — the phrasing must not pick which."""
+
+    def test_a_real_model_sees_phrase_commands_as_ordinary_requests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            replies = iter([
+                ProviderReply("", [ToolCall("1", "list_files", {"path": "."})]),
+                ProviderReply("The workspace is empty.", []),
+            ])
+            provider.complete = unittest.mock.Mock(side_effect=lambda *a, **k: next(replies))
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            answer = agent.handle("list files")
+            # It went through the tool loop rather than the old shortcut, which
+            # answered with a bullet list and never consulted the model.
+            self.assertTrue(provider.complete.called)
+            self.assertIn("workspace is empty", answer)
+            self.assertNotIn("Workspace files:", answer)
+
+    def test_remembering_a_name_goes_through_the_memory_tool(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            replies = iter([
+                ProviderReply("", [ToolCall("1", "remember_name", {"name": "Maya"})]),
+                ProviderReply("I will remember that.", []),
+            ])
+            provider.complete = unittest.mock.Mock(side_effect=lambda *a, **k: next(replies))
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            agent.handle("remember my name is Maya")
+            self.assertEqual(agent.memory.data["name"], "Maya")
+
+    def test_a_provider_without_tools_still_answers_deterministically(self):
+        """MockProvider cannot call tools, so the phrase matches remain its only
+        route — that is why they moved here instead of being deleted."""
+        with tempfile.TemporaryDirectory() as temporary:
+            agent = AuraAgent(Path(temporary) / "workspace", provider=MockProvider())
+            agent.sandbox.write_file("note.txt", "hi")
+            self.assertIn("note.txt", agent.handle("list files"))
+            agent.handle("remember my name is Maya")
+            self.assertEqual(agent.memory.data["name"], "Maya")
+
+
+class ToolRegistryTests(unittest.TestCase):
+    """Declaration and dispatch used to be two lists that could drift apart."""
+
+    def test_every_offered_tool_can_actually_be_dispatched(self):
+        for definition in AuraAgent.tool_definitions():
+            name = definition["function"]["name"]
+            self.assertTrue(toolkit.get(name) or services.get(name),
+                            f"{name} is offered to the model but nothing runs it")
+
+    def test_every_registered_tool_is_offered(self):
+        offered = {item["function"]["name"] for item in AuraAgent.tool_definitions()}
+        self.assertEqual(set(toolkit.REGISTRY) - offered, set())
+
+    def test_a_tool_cannot_be_declared_twice(self):
+        with self.assertRaises(ValueError):
+            toolkit.tool("list_files", "duplicate")(lambda *args: {})
+
+    def test_mutating_tools_come_from_the_tools_themselves(self):
+        self.assertEqual(AuraAgent.MUTATING_TOOL_NAMES,
+                         toolkit.mutating_names() | {"import_file"})
+        for name in ("write_file", "apply_edits", "safe_delete_file"):
+            self.assertTrue(toolkit.get(name).mutating, name)
+        for name in ("read_file", "list_files", "validate_project"):
+            self.assertFalse(toolkit.get(name).mutating, name)
+
+    def test_an_unknown_tool_is_still_an_ordinary_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            agent = AuraAgent(Path(temporary) / "workspace", provider=MockProvider())
+            result = agent._execute_tool(ToolCall("1", "no_such_tool", {}), None)
+        self.assertFalse(result["ok"])
+        self.assertIn("unknown tool", result["error"])
 
 
 class NetworkPermissionTests(unittest.TestCase):

@@ -64,9 +64,15 @@ class MemoryStore:
             if not isinstance(self.data.get("profile_memories"), list):
                 self.data["profile_memories"] = []
             self.data["profile_memory_version"] = self.PROFILE_VERSION
+            self._adopt_legacy_preferences()
 
     def save(self) -> None:
         with self._lock:
+            # Derived here rather than at each of the five places a memory can
+            # change: a view that is rebuilt on every write cannot go stale,
+            # and forgetting one call site is exactly the failure this phase is
+            # about.
+            self._refresh_preference_view()
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_suffix(".tmp")
             temporary.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -85,9 +91,62 @@ class MemoryStore:
             self.data["name"] = name.strip()
             self.save()
 
+    #: How a preference reads once it is a memory like every other fact.
+    PREFERENCE_SHAPE = "{key} = {value}"
+    _PREFERENCE_PATTERN = re.compile(r"^\s*([^=:]{1,60}?)\s*[=:]\s*(.+?)\s*$")
+
     def set_preference(self, key: str, value: str) -> None:
+        """Remember a preference as an ordinary personal memory.
+
+        A preference used to live in a flat `preferences` dict while the same
+        kind of fact learned in conversation became a `profile_memory` — two
+        stores for one thing, which is why Aura Mind drew one preference as two
+        unrelated nodes. Only the memory store can be edited, confirmed,
+        reverted, or exported, so that is the one that survived.
+        """
+        key, value = str(key).strip(), str(value).strip()
+        if not key or not value:
+            return
         with self._lock:
-            self.data["preferences"][key.strip()] = value.strip()
+            self.learn_fact("preference", self.PREFERENCE_SHAPE.format(key=key, value=value),
+                            source="Explicitly remembered as a preference",
+                            confidence=1.0, explicit=True)
+            self._refresh_preference_view()
+            self.save()
+
+    def _refresh_preference_view(self) -> None:
+        """Rebuild `data["preferences"]` from the memories that now own it.
+
+        Kept as a derived dict rather than deleted, because the provider
+        context, Aura Mind, and the memory panel all read that shape; they
+        should not each learn a new one for a change they cannot observe.
+        """
+        view: dict[str, str] = {}
+        for item in self.data.get("profile_memories", []):
+            if str(item.get("category")) != "preference":
+                continue
+            match = self._PREFERENCE_PATTERN.match(str(item.get("value", "")))
+            if match:
+                view.setdefault(match.group(1).strip(), match.group(2).strip())
+        self.data["preferences"] = view
+
+    def _adopt_legacy_preferences(self) -> None:
+        """Move anything left in the old dict into the memory store, once."""
+        stored = self.data.get("preferences") or {}
+        known = {self._comparable_fact(str(item.get("value", "")))
+                 for item in self.data.get("profile_memories", [])
+                 if str(item.get("category")) == "preference"}
+        adopted = 0
+        for key, value in list(stored.items()):
+            phrase = self.PREFERENCE_SHAPE.format(key=str(key).strip(), value=str(value).strip())
+            if self._comparable_fact(phrase) in known:
+                continue
+            if self.learn_fact("preference", phrase,
+                               source="Migrated from Aura's earlier preference list",
+                               confidence=1.0, explicit=True):
+                adopted += 1
+        self._refresh_preference_view()
+        if adopted:
             self.save()
 
     @staticmethod

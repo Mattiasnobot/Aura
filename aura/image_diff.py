@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .errors import AuraError
+
 import struct
 import zlib
 from pathlib import Path
@@ -10,7 +12,7 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 CHANNELS = {0: 1, 2: 3, 4: 2, 6: 4}
 
 
-class UnsupportedImage(ValueError):
+class UnsupportedImage(AuraError, ValueError):
     """Raised for PNG variants this dependency-free decoder cannot read."""
 
 

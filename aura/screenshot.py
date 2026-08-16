@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .errors import AuraError
+
 import os
 import subprocess
 import tempfile
@@ -21,7 +23,7 @@ POSIX_BROWSERS = (
 MIN_SCREENSHOT_BYTES = 1_000
 
 
-class ScreenshotUnavailable(RuntimeError):
+class ScreenshotUnavailable(AuraError, RuntimeError):
     """Raised when no Chromium-based browser is installed to capture with."""
 
 

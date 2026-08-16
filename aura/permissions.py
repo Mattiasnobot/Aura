@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from .errors import AuraError
 from .store import Database
 
 
@@ -22,11 +23,11 @@ HOST_CAPABILITIES = {"reach_domain"}
 MODES = {"once", "session", "project", "persistent"}
 
 
-class PermissionDenied(PermissionError):
+class PermissionDenied(AuraError, PermissionError):
     """Raised when a capability was used without an active grant."""
 
 
-class PermissionRefused(ValueError):
+class PermissionRefused(AuraError, ValueError):
     """Raised when a grant may not be created at all, whatever the user says."""
 
 
