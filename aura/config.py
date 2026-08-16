@@ -46,7 +46,7 @@ DEFAULTS = {
     "avatar_quality": "auto",
     "web_sidebar_width": 250,
     "web_log_height": 170,
-    "web_log_visible": True,
+    "web_log_visible": False,
 }
 
 

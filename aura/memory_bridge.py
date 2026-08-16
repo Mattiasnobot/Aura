@@ -120,6 +120,9 @@ class MemoryBridge:
             self.agent.autonomy.pause("paused from the interface")
         else:
             self.agent.autonomy.resume()
+            # Emergency stop halts the loop, so resuming has to start it again.
+            # Without this the guard would say yes while nothing was listening.
+            self.scheduler.start()
         status = self.autonomy_status()
         self._push("autonomy", **status["autonomy"])
         return status
@@ -131,6 +134,9 @@ class MemoryBridge:
         anybody means when they reach for a stop control.
         """
         self.agent.autonomy.pause("emergency stop")
+        # The guard already refuses, but stopping the loop means nothing is
+        # mid-flight when the user next looks.
+        self.scheduler.stop()
         self.agent.cancel_current()
         self._deny_pending_approvals()
         self.speech.stop()

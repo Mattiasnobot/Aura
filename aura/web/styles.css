@@ -141,6 +141,7 @@ button { color: inherit; }
 }
 
 .sidebar {
+  position: relative;
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -546,3 +547,38 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* The "More" menu.
+ *
+ * Six occasional actions used to sit in the sidebar competing with the three
+ * that are used constantly, which is why 27 controls were visible at rest with
+ * no hierarchy. They live here now; the sidebar keeps only what is reached for
+ * often.
+ */
+.side-menu {
+  /* Floating, not flowing: a menu that pushes the layout squeezes Aura's face
+     and moves everything under it while you are reading it. */
+  position: absolute; z-index: 30; left: var(--s4); right: var(--s4);
+  display: flex; flex-direction: column; gap: 2px;
+  padding: var(--s2);
+  border: 1px solid var(--border-strong); border-radius: var(--r-md);
+  background: var(--surface-1);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, .5);
+}
+.menu-item {
+  display: flex; align-items: center; gap: var(--s4);
+  width: 100%; padding: var(--s2) var(--s3);
+  border: 1px solid transparent; border-radius: var(--r-sm);
+  background: transparent; color: var(--text-soft);
+  text-align: left; cursor: pointer; font-size: var(--t-label);
+}
+.menu-item:hover { color: var(--text); background: var(--surface-3); }
+.menu-item.danger { color: var(--danger-soft); }
+.menu-item.danger:hover { background: var(--danger-surface); border-color: var(--danger-border); }
+.menu-separator { height: 1px; margin: var(--s2) var(--s2); background: var(--border); }
+.menu-status { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); padding: var(--s1) var(--s3); }
+
+/* One status line under the face instead of four stacked labels. */
+.status-line { margin-top: var(--s2); color: var(--text-muted); font-size: var(--t-caption); text-align: center; }
+.status-line .dot { display: inline-block; width: 6px; height: 6px; margin-right: 5px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.ghost-button.subtle { color: var(--text-dim); }

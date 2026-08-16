@@ -15,6 +15,7 @@ from . import __version__
 from .agent import AuraAgent
 from .graph_model import build_mind_graph
 from .preview_server import PreviewServer
+from .scheduler import Scheduler
 from .speech import SpeechOutput
 from .voice import VoiceInput
 from .memory_bridge import MemoryBridge
@@ -75,6 +76,16 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         self._task_approved_exact: dict[str, set[str]] = {}
         self._approval_lock = threading.Lock()
         self.preview_server = PreviewServer(self.agent.sandbox, self.agent.log)
+        # Nothing is registered yet, so the loop has nothing to run: the
+        # kinds of background work arrive in 48.3 and 48.4.
+        self.scheduler = Scheduler(self.agent.db, self.agent.autonomy,
+                                   self.agent.log, busy=self._is_busy)
+        self.scheduler.start()
+
+    def _is_busy(self) -> bool:
+        """Is a user request in flight? Background work waits for it."""
+        with self._state_lock:
+            return self._busy or self._voice_active
 
     def _push(self, event_type: str, **payload: Any) -> None:
         if not self._closing:
@@ -580,6 +591,7 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
 
     def shutdown(self) -> None:
         self._closing = True
+        self.scheduler.stop()
         self.agent.cancel_current()
         self.speech.stop()
         self.voice.stop()

@@ -6,6 +6,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 
 SCHEMA = """
@@ -74,6 +75,22 @@ CREATE TABLE IF NOT EXISTS sessions (
     archived INTEGER NOT NULL DEFAULT 0
 );
 
+-- Work Aura may do without being asked. `next_run` is UTC ISO; a row with
+-- `every_minutes = 0` runs once and disables itself.
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    request TEXT NOT NULL,
+    every_minutes INTEGER NOT NULL DEFAULT 0,
+    next_run TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created TEXT NOT NULL,
+    last_run TEXT,
+    last_outcome TEXT,
+    runs INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS scheduled_due ON scheduled_tasks (enabled, next_run);
+
 CREATE TABLE IF NOT EXISTS external_changes (
     id TEXT PRIMARY KEY,
     path TEXT NOT NULL,
@@ -128,6 +145,14 @@ class Database:
     MIGRATIONS: tuple[tuple[str, ...], ...] = (
         # 1 — baseline. Everything up to this point was created by SCHEMA, so
         # this records the version without changing anything.
+        (),
+        # 2 — `scheduled_tasks` arrived. Worth being straight about what this
+        # does: SCHEMA runs `CREATE TABLE IF NOT EXISTS` on every open, so a new
+        # table reaches old databases without any migration at all. The entry
+        # earns its keep by making the version number mean something — anything
+        # that needs to know whether this database has schedules can ask, rather
+        # than probing for a table. The mechanism becomes load-bearing the first
+        # time a *column* changes, which no `IF NOT EXISTS` can do for us.
         (),
     )
 
@@ -399,6 +424,53 @@ class Database:
         start = max(0, found - width // 3)
         end = min(len(flat), start + width)
         return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
+
+    # ------------------------------------------------------------- schedules
+
+    def add_scheduled(self, kind: str, request: str, *, every_minutes: int = 0,
+                      next_run: str | None = None) -> dict:
+        identifier = uuid4().hex[:12]
+        self._execute(
+            "INSERT INTO scheduled_tasks (id, kind, request, every_minutes, next_run, "
+            "enabled, created) VALUES (?, ?, ?, ?, ?, 1, ?)",
+            (identifier, str(kind), str(request), max(0, int(every_minutes)),
+             str(next_run or _now()), _now()))
+        return self.scheduled_task(identifier)
+
+    def scheduled_task(self, identifier: str) -> dict | None:
+        rows = self._query("SELECT * FROM scheduled_tasks WHERE id = ?", (str(identifier),))
+        return dict(rows[0]) if rows else None
+
+    def scheduled_tasks(self, include_disabled: bool = True) -> list[dict]:
+        rows = self._query(
+            "SELECT * FROM scheduled_tasks WHERE (? OR enabled = 1) ORDER BY next_run",
+            (1 if include_disabled else 0,))
+        return [dict(row) for row in rows]
+
+    def due_scheduled_tasks(self, moment: str | None = None, limit: int = 5) -> list[dict]:
+        rows = self._query(
+            "SELECT * FROM scheduled_tasks WHERE enabled = 1 AND next_run <= ? "
+            "ORDER BY next_run LIMIT ?", (str(moment or _now()), int(limit)))
+        return [dict(row) for row in rows]
+
+    def record_scheduled_run(self, identifier: str, outcome: str,
+                             next_run: str | None) -> None:
+        """Write the outcome and when it should happen again.
+
+        `next_run = None` disables the row, which is how a one-off retires
+        itself rather than staying permanently due.
+        """
+        self._execute(
+            "UPDATE scheduled_tasks SET last_run = ?, last_outcome = ?, runs = runs + 1, "
+            "next_run = COALESCE(?, next_run), enabled = ? WHERE id = ?",
+            (_now(), str(outcome)[:400], next_run, 1 if next_run else 0, str(identifier)))
+
+    def enable_scheduled_task(self, identifier: str, enabled: bool = True) -> None:
+        self._execute("UPDATE scheduled_tasks SET enabled = ? WHERE id = ?",
+                      (1 if enabled else 0, str(identifier)))
+
+    def delete_scheduled_task(self, identifier: str) -> None:
+        self._execute("DELETE FROM scheduled_tasks WHERE id = ?", (str(identifier),))
 
     def archive_session(self, session_id: str, archived: bool = True) -> None:
         self._execute("UPDATE sessions SET archived = ? WHERE id = ?",

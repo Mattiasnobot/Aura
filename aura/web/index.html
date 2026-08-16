@@ -28,14 +28,11 @@
         <div id="stateLabel" class="state-label">IDLE</div>
       </div>
 
-      <div class="privacy-line"><span></span> Local • private • calm</div>
-      <div id="networkLabel" class="network-label">Offline • local only</div>
-      <div class="autonomy-row">
-        <button id="pauseAutonomy" class="autonomy-toggle" aria-pressed="false" title="Pause anything Aura would do on her own">Background: on</button>
-        <button id="emergencyStop" class="autonomy-stop" title="Stop everything now: pause background work and cancel what is running">Stop all</button>
-      </div>
+      <!-- One quiet status block instead of four competing lines. What Aura is
+           doing belongs next to her face; what she is allowed to do belongs in
+           the menu with the rest of the settings. -->
+      <div id="statusLine" class="status-line" role="status">Local • private • calm</div>
       <div id="providerLabel" class="provider-label">LM Studio • checking…</div>
-      <div id="powerLabel" class="power-label">Deep mind • powerful tools</div>
 
       <nav class="side-actions" aria-label="Aura controls">
         <button id="voiceButton" class="side-button" aria-pressed="false" aria-describedby="voiceHint" title="Click to talk, or hold while speaking"><span class="button-icon">◉</span> <span id="voiceButtonLabel">Voice</span> <span class="voice-wave" aria-hidden="true"><i></i><i></i><i></i></span></button>
@@ -46,14 +43,26 @@
           <div class="voice-tray-actions"><button id="voiceRetry" type="button" class="hidden">Retry</button><span id="voiceHint">Local • click or hold to talk</span></div>
         </div>
         <button id="mindButton" class="side-button accent"><span class="button-icon">✦</span> Aura Mind <kbd>Ctrl M</kbd></button>
-        <button id="memoryButton" class="side-button"><span class="button-icon">◇</span> What Aura knows</button>
-        <button id="permissionsButton" class="side-button"><span class="button-icon">⚿</span> Permissions</button>
-        <button id="settingsButton" class="side-button"><span class="button-icon">⚙</span> Settings</button>
-        <button id="workspaceButton" class="side-button"><span class="button-icon">↗</span> Open workspace</button>
-        <button id="tasksButton" class="side-button"><span class="button-icon">✓</span> Recent tasks</button>
         <button id="filesButton" class="side-button"><span class="button-icon">≡</span> Workspace</button>
-        <button id="quitButton" class="side-button quit-button"><span class="button-icon">○</span> Quit Aura</button>
+        <button id="menuButton" class="side-button" aria-haspopup="true" aria-expanded="false"><span class="button-icon">⋯</span> More</button>
       </nav>
+
+      <!-- Everything that is used occasionally rather than constantly. -->
+      <div id="sideMenu" class="side-menu hidden" role="menu" aria-labelledby="menuButton">
+        <button id="memoryButton" class="menu-item" role="menuitem"><span class="button-icon">◇</span> What Aura knows</button>
+        <button id="tasksButton" class="menu-item" role="menuitem"><span class="button-icon">✓</span> Recent tasks</button>
+        <button id="permissionsButton" class="menu-item" role="menuitem"><span class="button-icon">⚿</span> Permissions</button>
+        <button id="settingsButton" class="menu-item" role="menuitem"><span class="button-icon">⚙</span> Settings</button>
+        <button id="workspaceButton" class="menu-item" role="menuitem"><span class="button-icon">↗</span> Open workspace folder</button>
+        <button id="toggleLogButton" class="menu-item" role="menuitem"><span class="button-icon">▤</span> <span id="toggleLogLabel">Show action log</span></button>
+        <div class="menu-separator" role="separator"></div>
+        <div class="menu-status">
+          <span id="networkLabel" class="network-label">Offline • local only</span>
+          <button id="pauseAutonomy" class="autonomy-toggle" aria-pressed="false" title="Pause anything Aura would do on her own">Background: on</button>
+        </div>
+        <button id="emergencyStop" class="menu-item danger" role="menuitem" title="Stop everything now: pause background work and cancel what is running"><span class="button-icon">■</span> Stop everything</button>
+        <button id="quitButton" class="menu-item danger" role="menuitem"><span class="button-icon">○</span> Quit Aura</button>
+      </div>
 
       <div class="sidebar-footer">
         <span id="workspacePath">aura-workspace</span>
@@ -70,10 +79,9 @@
           <p id="activityText" role="status" aria-live="polite">Aura is ready.</p>
         </div>
         <div class="top-actions">
-          <button id="toggleLogButton" class="ghost-button">Action log</button>
-          <button id="sessionsButton" class="ghost-button">Conversations</button>
-          <button id="newSessionButton" class="ghost-button">New</button>
-          <button id="clearButton" class="ghost-button">Clear</button>
+          <button id="newSessionButton" class="ghost-button" title="Start a new conversation. The current one is kept.">New</button>
+          <button id="sessionsButton" class="ghost-button" title="Open, search, export or archive earlier conversations">Conversations</button>
+          <button id="clearButton" class="ghost-button subtle" title="Clear the view only. Nothing is deleted.">Clear</button>
         </div>
       </header>
 

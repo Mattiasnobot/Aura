@@ -51,10 +51,13 @@ function catmullOpen(pts,seg){
 }
 
 /* ================= FEMININE HEAD ================= */
+/* The silhouette carries most of the read. Width is held high — at the temples
+ * and cheekbones — and taken away below them, so the face tapers to a softer
+ * chin instead of running straight down to a square jaw. */
 const R_LAND=[
-  [0,-1.30],[0.40,-1.26],[0.72,-1.08],[0.89,-0.78],[0.96,-0.42],
-  [0.98,-0.02],[0.94,0.34],[0.83,0.66],[0.64,0.90],[0.40,1.06],
-  [0.18,1.13],[0,1.16]
+  [0,-1.30],[0.41,-1.26],[0.73,-1.08],[0.90,-0.78],[0.97,-0.42],
+  [0.99,-0.02],[0.93,0.34],[0.78,0.66],[0.57,0.92],[0.33,1.07],
+  [0.14,1.14],[0,1.17]
 ];
 const loop=[...R_LAND];
 for(let i=R_LAND.length-2;i>0;i--)loop.push([-R_LAND[i][0],R_LAND[i][1]]);
@@ -153,8 +156,10 @@ const NOST=[{x:0.075,y:0.345,r:-0.5},{x:-0.075,y:0.345,r:0.5}];
     let prevT=-1,prevB=-1;
     for(let i=0;i<=14;i++){const t=i/14;
       const x=side*lerp(0.16,0.76,t);
-      const yT=-0.36-0.13*Math.sin(t*Math.PI*0.9)+0.06*t*t;
-      const yB=yT+0.05-0.028*t;
+      /* Sat higher on the socket and arched more, and thinner with it: a low
+       * straight brow is the single strongest masculine cue on this mesh. */
+      const yT=-0.40-0.17*Math.sin(t*Math.PI*0.85)+0.07*t*t;
+      const yB=yT+0.038-0.022*t;
       const pT=sPoint(x,yT,faceDepth(x,yT)+0.02,0.9);
       const pB=sPoint(x,yB,faceDepth(x,yB)+0.02,0.85);
       store.push(pT);
@@ -413,11 +418,12 @@ function drawMouth(){
   const upT=[],seU=[],seL=[],loB=[],loC=[];
   for(let i=0;i<=16;i++){
     const t=i/16*2-1,shp=Math.max(0,1-t*t),at=Math.abs(t);
-    const bow=-0.016*Math.exp(-(((at-0.35)/0.18)**2))+0.011*Math.exp(-((t/0.12)**2));
+    /* A deeper cupid's bow and a fuller upper lip. */
+    const bow=-0.021*Math.exp(-(((at-0.33)/0.17)**2))+0.015*Math.exp(-((t/0.11)**2));
     const x=t*hw,z=faceDepth(x,my)+0.03;
     const expression=-state.smile*0.036*Math.pow(Math.abs(t),1.6);
-    upT.push(project(x,my-0.050*shp+bow*shp+0.003+expression,z));
-    const yU=my+0.006*shp-0.026*t*t-0.020*m*shp+expression;
+    upT.push(project(x,my-0.062*shp+bow*shp+0.003+expression,z));
+    const yU=my+0.010*shp-0.026*t*t-0.020*m*shp+expression;
     seU.push(project(x,yU,z));
     const open=m*0.17*Math.pow(shp,0.85);
     seL.push(project(x,yU+open,z));

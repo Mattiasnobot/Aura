@@ -4,7 +4,9 @@ const $ = (selector) => document.querySelector(selector);
 const elements = {
   app: $("#app"), sidebar: $("#sidebar"), sidebarResizer: $("#sidebarResizer"),
   main: $(".main-panel"), face: $("#faceWrap"), state: $("#stateLabel"),
-  activity: $("#activityText"), provider: $("#providerLabel"), power: $("#powerLabel"),
+  activity: $("#activityText"), provider: $("#providerLabel"),
+  statusLine: $("#statusLine"), sideMenu: $("#sideMenu"), menuButton: $("#menuButton"),
+  toggleLogLabel: $("#toggleLogLabel"),
   networkLabel: $("#networkLabel"), pauseAutonomy: $("#pauseAutonomy"), conversation: $("#conversation"),
   composer: $("#composer"), send: $("#sendButton"), stop: $("#stopButton"),
   actionPanel: $("#actionPanel"), actionLog: $("#actionLog"), logResizer: $("#logResizer"),
@@ -376,12 +378,33 @@ function setProvider(payload) {
   if (payload.error) elements.provider.title = payload.error;
 }
 
+function toggleSideMenu(open) {
+  const show = open === undefined ? elements.sideMenu.classList.contains("hidden") : open;
+  elements.sideMenu.classList.toggle("hidden", !show);
+  if (show) {
+    // Anchored under the button that opened it.
+    const anchor = elements.menuButton.getBoundingClientRect();
+    const sidebar = elements.sidebar.getBoundingClientRect();
+    elements.sideMenu.style.top = `${anchor.bottom - sidebar.top + 6}px`;
+  }
+  elements.menuButton.setAttribute("aria-expanded", String(show));
+  if (show) elements.sideMenu.querySelector(".menu-item")?.focus();
+}
+
 function updatePowerStatus(values = {}) {
   capabilityState = { ...capabilityState, ...values };
+  // One line under the face, not four stacked labels. The detail that used to
+  // be shouted — tool counts, autonomy mode, memory count — is true but rarely
+  // what someone is looking for, so it moved into the tooltip.
   const depth = String(capabilityState.reasoning_depth || "balanced");
-  const label = `${depth[0].toUpperCase()}${depth.slice(1)} mind • ${capabilityState.tools || "many"} tools • ${capabilityState.autonomy_mode || "balanced"}`;
   const memories = Number(capabilityState.personal_memories) || 0;
-  elements.power.textContent = `${label} • ${memories} ${memories === 1 ? "memory" : "memories"}`;
+  elements.statusLine.innerHTML = "";
+  const dot = document.createElement("span");
+  dot.className = "dot";
+  elements.statusLine.append(dot, document.createTextNode("Local • private • calm"));
+  elements.statusLine.title =
+    `${depth[0].toUpperCase()}${depth.slice(1)} thinking • ${capabilityState.tools || "many"} tools • `
+    + `${capabilityState.autonomy_mode || "balanced"} • ${memories} ${memories === 1 ? "memory" : "memories"}`;
 }
 
 const FRIENDLY_ACTIONS = Object.freeze({
@@ -2100,7 +2123,8 @@ function applyLayout() {
   document.documentElement.style.setProperty("--sidebar-width", `${renderedSidebar}px`);
   document.documentElement.style.setProperty("--log-height", `${renderedLog}px`);
   elements.main.classList.toggle("log-hidden", !logVisible);
-  elements.toggleLog.textContent = logVisible ? "Hide log" : "Show log";
+  // It is a menu item now, so replacing its text would eat the icon with it.
+  elements.toggleLogLabel.textContent = logVisible ? "Hide action log" : "Show action log";
 }
 
 function installResizers() {
@@ -2649,6 +2673,16 @@ function bindControls() {
   $("#newSessionButton").addEventListener("click", startNewSession);
   $("#permissionGrant").addEventListener("submit", grantFolderAccess);
   $("#domainGrant").addEventListener("submit", grantDomainAccess);
+  elements.menuButton.addEventListener("click", () => toggleSideMenu());
+  document.addEventListener("click", event => {
+    // Clicking anywhere else closes it, which is what a menu is expected to do.
+    if (elements.sideMenu.classList.contains("hidden")) return;
+    if (elements.sideMenu.contains(event.target) || elements.menuButton.contains(event.target)) return;
+    toggleSideMenu(false);
+  });
+  for (const item of elements.sideMenu.querySelectorAll(".menu-item")) {
+    item.addEventListener("click", () => toggleSideMenu(false));
+  }
   elements.pauseAutonomy.addEventListener("click", async () => {
     const paused = elements.pauseAutonomy.classList.contains("paused");
     const result = await callApi("pause_autonomy", !paused);

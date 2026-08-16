@@ -29,6 +29,7 @@ from aura import toolkit
 from aura.turn import PASS, TurnState
 from aura.action_log import ActionLog
 from aura.autonomy import AutonomyGuard
+from aura.scheduler import Scheduler
 from aura.agent import AuraAgent, TaskCancelled
 from aura.errors import AuraError
 from aura.memory import MemoryStore
@@ -3687,6 +3688,106 @@ class AutonomyGuardTests(unittest.TestCase):
         self.assertIsNone(self.guard.next_opening(self.at(12)))
 
 
+class SchedulerTests(unittest.TestCase):
+    """The loop only decides *when*; these are the rules it exists to keep."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.database = Database(root / "aura.db")
+        self.config = ConfigStore(root / "config.json")
+        # Open window, so only the rule under test can refuse.
+        self.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00")
+        self.log = ActionLog(self.database)
+        self.guard = AutonomyGuard(self.config, self.log)
+        self.busy = False
+        self.scheduler = Scheduler(self.database, self.guard, self.log,
+                                   busy=lambda: self.busy, tick_seconds=0.01)
+        self.ran = []
+        self.scheduler.register("test", lambda task: self.ran.append(task["request"]) or "done")
+
+    def tearDown(self):
+        self.scheduler.stop()
+        self.temp.cleanup()
+
+    def due(self, request="check something", every_minutes=0):
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        return self.database.add_scheduled("test", request, every_minutes=every_minutes,
+                                           next_run=past)
+
+    def test_due_work_runs_and_records_its_outcome(self):
+        task = self.due()
+        self.assertEqual(self.scheduler.tick(), [task["id"]])
+        self.assertEqual(self.ran, ["check something"])
+        stored = self.database.scheduled_task(task["id"])
+        self.assertEqual(stored["runs"], 1)
+        self.assertEqual(stored["last_outcome"], "done")
+
+    def test_nothing_runs_while_the_user_is_waiting(self):
+        self.due()
+        self.busy = True
+        self.assertEqual(self.scheduler.tick(), [])
+        self.assertEqual(self.ran, [])
+
+    def test_a_refusal_leaves_the_work_due_instead_of_burning_it(self):
+        """Quiet hours must postpone, not silently skip."""
+        task = self.due()
+        self.config.update(autonomy_paused=True)
+        self.assertEqual(self.scheduler.tick(), [])
+        self.assertEqual(self.database.scheduled_task(task["id"])["runs"], 0)
+        self.config.update(autonomy_paused=False)
+        self.assertEqual(self.scheduler.tick(), [task["id"]])
+
+    def test_a_repeating_task_is_rescheduled_and_a_one_off_retires(self):
+        once = self.due("once only")
+        repeating = self.due("every hour", every_minutes=60)
+        self.scheduler.tick()
+        self.assertEqual(self.database.scheduled_task(once["id"])["enabled"], 0)
+        again = self.database.scheduled_task(repeating["id"])
+        self.assertEqual(again["enabled"], 1)
+        self.assertGreater(again["next_run"], datetime.now(timezone.utc).isoformat())
+
+    def test_a_failing_task_is_recorded_and_the_loop_survives(self):
+        self.scheduler.register("boom", lambda task: (_ for _ in ()).throw(RuntimeError("nope")))
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        broken = self.database.add_scheduled("boom", "explode", next_run=past)
+        good = self.due("still runs")
+        self.scheduler.tick()
+        self.assertIn("nope", self.database.scheduled_task(broken["id"])["last_outcome"])
+        self.assertEqual(self.ran, ["still runs"])
+
+    def test_an_unknown_kind_is_disabled_rather_than_retried_forever(self):
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        orphan = self.database.add_scheduled("from-a-newer-build", "?", next_run=past)
+        self.scheduler.tick()
+        stored = self.database.scheduled_task(orphan["id"])
+        self.assertEqual(stored["enabled"], 0)
+        self.assertIn("no handler", stored["last_outcome"])
+
+    def test_every_run_spends_the_daily_allowance(self):
+        self.config.update(autonomy_daily_runs=1)
+        self.due("first")
+        self.due("second")
+        self.scheduler.tick()
+        self.assertEqual(self.ran, ["first"])
+        self.assertEqual(self.guard.runs_today(), 1)
+        self.assertFalse(self.guard.may_run())
+
+    def test_work_that_is_not_due_yet_is_left_alone(self):
+        later = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        self.database.add_scheduled("test", "later", next_run=later)
+        self.assertEqual(self.scheduler.tick(), [])
+
+    def test_the_thread_starts_and_stops_cleanly(self):
+        self.due("threaded")
+        self.scheduler.start()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not self.ran:
+            time.sleep(0.02)
+        self.scheduler.stop()
+        self.assertEqual(self.ran, ["threaded"])
+
+
 class AutonomyControlTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -3719,6 +3820,20 @@ class AutonomyControlTests(unittest.TestCase):
         self.assertTrue(self.bridge.agent.cancel_event.is_set())
         self.assertTrue(any(event.get("action") == "emergency_stop"
                             for event in self.bridge.agent.log.recent(20)))
+
+    def test_resuming_after_an_emergency_stop_revives_the_loop(self):
+        """The stop halts the thread, so resuming has to start it again —
+        otherwise the guard says yes while nothing is listening."""
+        self.bridge.emergency_stop()
+        self.assertFalse(self.bridge.scheduler._thread.is_alive())
+        self.bridge.pause_autonomy(False)
+        self.assertTrue(self.bridge.scheduler._thread.is_alive())
+        self.assertTrue(self.bridge.autonomy_status()["autonomy"]["allowed"]
+                        or self.bridge.agent.autonomy.in_quiet_hours())
+
+    def test_the_scheduler_runs_nothing_it_has_not_been_taught(self):
+        """48.2 delivers the loop; the kinds of work arrive in 48.3 and 48.4."""
+        self.assertEqual(self.bridge.scheduler.handlers, {})
 
     def test_the_bootstrap_carries_the_envelope(self):
         autonomy = self.bridge.get_bootstrap()["autonomy"]
