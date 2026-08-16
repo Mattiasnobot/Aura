@@ -1675,7 +1675,50 @@ class LMStudioProviderTests(unittest.TestCase):
             self.assertIn("Validation passed for `aura_craft`", answer)
             self.assertIn("`aura_craft/index.html`", answer)
             self.assertEqual(agent.tasks.recent(1)[0]["status"], "completed")
-            self.assertEqual(provider.complete.call_count, 3)
+            # Two rounds, not three: Aura asks the model once, then validates
+            # deterministically itself rather than spending more of the user's
+            # time asking for something the backend is about to do anyway.
+            self.assertEqual(provider.complete.call_count, 2)
+
+    def test_unconfirmed_work_keeps_the_answer_and_says_what_is_unproven(self):
+        # A failed gate used to raise, so the user lost the model's whole answer
+        # to "I couldn't complete that safely". The answer now survives with an
+        # explicit note, so nothing is presented as verified that was not.
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            provider.complete = unittest.mock.Mock(return_value=ProviderReply(
+                "I created report.txt for you.", []))
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            answer = agent.handle("Create report.txt in the workspace")
+
+            self.assertIn("I created report.txt for you.", answer)
+            self.assertIn("Not confirmed", answer)
+            self.assertIn("report.txt", answer)
+            self.assertNotIn("Confirmed evidence", answer)
+
+    def test_every_gate_shares_one_bounded_retry_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            provider.complete = unittest.mock.Mock(return_value=ProviderReply(
+                "All done, I promise.", []))
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            agent.handle("Create report.txt in the workspace")
+            # One first answer plus at most MAX_COMPLETION_RETRIES more, however
+            # many gates were unhappy — four separate counters used to allow nine.
+            self.assertLessEqual(provider.complete.call_count,
+                                 agent.MAX_COMPLETION_RETRIES + 1)
+
+    def test_a_question_mentioning_a_project_does_not_demand_validation(self):
+        # "project" in a read-only question used to switch validation on and
+        # burn retries proving something the user never asked about.
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            provider.complete = unittest.mock.Mock(return_value=ProviderReply(
+                "Your project looks tidy and well organised.", []))
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            answer = agent.handle("How does my project look these days?")
+            self.assertIn("tidy", answer)
+            self.assertEqual(provider.complete.call_count, 1)
 
     def test_backend_verifies_final_mutation_when_model_does_not(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1683,6 +1726,7 @@ class LMStudioProviderTests(unittest.TestCase):
             provider.complete = unittest.mock.Mock(side_effect=[
                 ProviderReply("", [ToolCall("1", "create_file",
                                              {"path": "note.txt", "content": "verified"})]),
+                ProviderReply("Created note.txt.", []),
                 ProviderReply("Created note.txt.", []),
                 ProviderReply("Created note.txt.", []),
                 ProviderReply("Created note.txt.", []),

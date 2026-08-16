@@ -53,6 +53,8 @@ class AuraAgent:
     # Recovery stays available for 30 days or 500 changes, whichever ends first.
     RETENTION_DAYS = 30
     RETENTION_CHANGES = 500
+    # Total extra model rounds allowed to satisfy the completion gates.
+    MAX_COMPLETION_RETRIES = 3
 
     def __init__(self, workspace: str | Path = "aura-workspace", provider: Provider | None = None,
                  on_log: Callable[[dict], None] | None = None) -> None:
@@ -342,10 +344,11 @@ class AuraAgent:
                 "completion: " + json.dumps(expected_paths) +
                 (f". Validate the project at path {expected_base!r}." if expected_base else ".")})
         verification_needed = False
-        verification_nudges = 0
-        action_nudges = 0
-        artifact_nudges = 0
-        validation_nudges = 0
+        # One budget for every completion gate. Four independent counters
+        # allowed up to nine extra rounds, each re-answering from scratch.
+        retries_left = self.MAX_COMPLETION_RETRIES
+        validation_attempted = False
+        unconfirmed: list[str] = []
         successful_tools = 0
         external_written: set[str] = set()
         external_activity = False
@@ -357,8 +360,12 @@ class AuraAgent:
         verified_final_paths: set[str] = set()
         pending_verifications: dict[str, str] = {}
         requires_mutation = self._requires_mutation(routing_request)
-        validation_required = any(word in routing_request.casefold() for word in
-                                  ("build", "project", "app", "website", "validate"))
+        # Asking to validate is a request in itself and stands on its own.
+        # Merely mentioning a build word does not: "how does my project look?"
+        # contains "project" but asks for nothing to be checked.
+        validation_asked = "validate" in routing_request.casefold()
+        build_words = any(word in routing_request.casefold() for word in
+                          ("build", "project", "app", "website"))
         mutation_tools = {"create_folder", "create_file", "write_file", "write_files", "append_file",
                           "replace_in_file", "apply_edits", "copy_file", "move_file", "safe_delete_file",
                           "create_archive", "extract_archive", "undo_last_change", "rollback_task"}
@@ -373,7 +380,18 @@ class AuraAgent:
             r"\bbased on what you remember\b",
             routing_request.casefold(),
         ))
-        action_expected = bool(selected_tools) and not (auto_learning_only or memory_read_question)
+        # The router offers tools for almost any wording, so "tools were offered"
+        # is far too weak a reason to insist one must have run. Only demand action
+        # when the request actually asked for work — otherwise an ordinary
+        # question like "how does my project look?" spends the whole retry budget
+        # proving something the user never asked about.
+        asks_for_work = requires_mutation or any(
+            verb in routing_request.casefold() for verb in
+            ("list", "read", "show", "find", "search", "open", "inspect", "check",
+             "validate", "compare", "look at", "screenshot", "capture", "undo",
+             "run ", "test"))
+        action_expected = (bool(selected_tools) and asks_for_work
+                           and not (auto_learning_only or memory_read_question))
         verification_tools = {"read_file", "read_many_files", "file_info", "inspect_code"}
         def emit(piece: str) -> None:
             self._check_cancelled()
@@ -401,19 +419,14 @@ class AuraAgent:
                     raise RuntimeError("the model returned neither text nor a tool request")
                 missing_action = action_expected and successful_tools == 0
                 missing_mutation = requires_mutation and not mutation_performed
-                # A file written into a granted folder outside the workspace
-                # satisfies the request even though it can never appear inside
-                # the sandbox; without this the contract nags forever.
-                # Work done in a granted folder can never satisfy a workspace
-                # artifact contract, so demanding one here nags forever and the
-                # user sees the same answer repeated. Drop it once the task has
-                # genuinely operated outside the workspace.
+                # Work in a granted folder can never satisfy a workspace
+                # artifact contract, so requiring one there nags forever.
                 missing_artifacts = [] if external_activity else [
                     path for path in expected_paths
                     if not self.sandbox.path(path).is_file()
                     and posixpath.basename(self._normalize_path(path)) not in external_written]
-                if missing_artifacts and artifact_nudges < 3:
-                    artifact_nudges += 1
+                if missing_artifacts and retries_left > 0:
+                    retries_left -= 1
                     if token:
                         token("Aura is checking the requested deliverables and continuing…\n\n")
                     messages.append({"role": "system", "content":
@@ -421,14 +434,26 @@ class AuraAgent:
                         json.dumps(missing_artifacts) + ". Then validate and inspect them before reporting completion."})
                     continue
                 if missing_artifacts:
-                    raise RuntimeError("required artifacts are still missing: " + ", ".join(missing_artifacts))
+                    # Report rather than raise: the model's work is still worth
+                    # showing, but Aura must not imply it was verified.
+                    unconfirmed.append(
+                        "these files were requested but not found: "
+                        + ", ".join(f"`{path}`" for path in missing_artifacts[:8]))
                 validation_path = expected_base or self._validation_root(pending_verifications)
-                # Validating the workspace proves nothing about a file written
-                # into a granted folder, so do not nag for it there.
+                # A build word alone only demands validation once the workspace
+                # actually changed; an explicit "validate" always does.
+                validation_required = validation_asked or (build_words and workspace_mutation)
+                # ...except for work done entirely in a granted folder, where
+                # validating the workspace would prove nothing about it.
                 if external_activity and not workspace_mutation:
                     validation_required = False
-                if validation_required and not validation_succeeded and validation_nudges < 2:
-                    validation_nudges += 1
+                # Only one model attempt here: Aura can validate deterministically
+                # itself, so further rounds would spend the user's time asking the
+                # model for something the backend is about to do anyway.
+                if (validation_required and not validation_succeeded
+                        and not validation_attempted and retries_left > 0):
+                    validation_attempted = True
+                    retries_left -= 1
                     if token:
                         token("Aura is validating the completed project…\n\n")
                     messages.append({"role": "system", "content":
@@ -440,9 +465,10 @@ class AuraAgent:
                     self._record_automatic_validation(validation_path, automatic)
                     if not automatic["valid"]:
                         first = automatic["issues"][0] if automatic["issues"] else {"error": "unknown issue"}
-                        raise RuntimeError(
-                            "final validation failed: " + str(first.get("error", "unknown issue")))
-                    validation_succeeded = True
+                        unconfirmed.append(
+                            "validation of `" + str(validation_path) + "` failed: "
+                            + str(first.get("error", "unknown issue")))
+                    validation_succeeded = automatic["valid"]
                     validation_evidence = dict(automatic)
                     validation_scope = validation_path
                     self._clear_verified_scope(pending_verifications, validation_path)
@@ -457,8 +483,8 @@ class AuraAgent:
                             validation_path, automatic,
                             self.sandbox.list_files(validation_path),
                         )
-                if (missing_action or missing_mutation) and action_nudges < 2:
-                    action_nudges += 1
+                if (missing_action or missing_mutation) and retries_left > 0:
+                    retries_left -= 1
                     if token:
                         token("Aura noticed the requested action was not completed and is correcting it…\n\n")
                     requirement = "perform the requested workspace mutation" if missing_mutation else "use the relevant tool"
@@ -467,11 +493,14 @@ class AuraAgent:
                         f"Do not claim completion or inability: {requirement} now, inspect the result, and report only confirmed facts."})
                     continue
                 if missing_action or missing_mutation:
-                    if missing_action and not missing_mutation:
+                    if missing_action and not missing_mutation and not requires_mutation:
                         selected_names = {
                             item["function"]["name"] for item in selected_tools
                         }
                         if "list_files" in selected_names:
+                            # Add the facts to the reply instead of replacing it.
+                            # Returning the listing threw away a perfectly good
+                            # answer whenever the model chose not to call a tool.
                             list_path = expected_base or "."
                             files = self.sandbox.list_files(list_path)
                             self.log.record("list_files", "ok", path=list_path, automatic=True)
@@ -481,10 +510,16 @@ class AuraAgent:
                                     {"path": list_path, "automatic": True},
                                     {"ok": True, "files": files},
                                 )
-                            return self._format_file_report(list_path, files)
-                    raise RuntimeError("the model did not perform the requested workspace action")
-                if verification_needed and verification_nudges < 2:
-                    verification_nudges += 1
+                            successful_tools += 1
+                            missing_action = False
+                            if not response.content:
+                                response.content = self._format_file_report(list_path, files)
+                    if missing_action or missing_mutation:
+                        unconfirmed.append(
+                            "no tool actually performed the requested change, so this "
+                            "answer describes intent rather than confirmed work")
+                if verification_needed and retries_left > 0:
+                    retries_left -= 1
                     if token:
                         token("Aura is verifying the files it just changed…\n\n")
                     messages.append({"role": "system", "content":
@@ -495,7 +530,9 @@ class AuraAgent:
                 if verification_needed:
                     verification_errors = self._verify_pending(pending_verifications)
                     if verification_errors:
-                        raise RuntimeError("final-state verification failed: " + "; ".join(verification_errors[:3]))
+                        unconfirmed.append(
+                            "the final state could not be verified: "
+                            + "; ".join(verification_errors[:3]))
                     paths = sorted(pending_verifications)
                     verified_final_paths.update(paths)
                     self.log.record("verify_final_state", paths=paths, automatic=True)
@@ -506,9 +543,11 @@ class AuraAgent:
                         )
                     pending_verifications.clear()
                     verification_needed = False
+                missing = set(missing_artifacts)
+                present = [path for path in expected_paths if path not in missing]
                 return self._format_completion_evidence(
                     response.content, validation_scope, validation_evidence,
-                    sorted(verified_final_paths), expected_paths,
+                    sorted(verified_final_paths), present, unconfirmed,
                 )
             if response.content and token:
                 token("\n\n")
@@ -759,7 +798,9 @@ class AuraAgent:
             if match:
                 candidate = match.group(1).strip("./")
                 if candidate.casefold() not in {
-                        "a", "an", "the", "this", "that", "entire", "current", "whole"}:
+                        "a", "an", "the", "this", "that", "entire", "current", "whole",
+                        # Possessives and pronouns: "my project" names no folder.
+                        "my", "your", "our", "his", "her", "their", "its", "some", "any"}:
                     target = candidate
                     break
         paths = [f"{target}/{name}" if target and "/" not in name and "\\" not in name else name
@@ -898,7 +939,8 @@ class AuraAgent:
     @staticmethod
     def _format_completion_evidence(content: str, validation_scope: str | None,
                                     validation: dict | None, verified_paths: list[str],
-                                    expected_paths: list[str]) -> str:
+                                    expected_paths: list[str],
+                                    unconfirmed: list[str] | None = None) -> str:
         evidence: list[str] = []
         if validation and validation.get("valid"):
             scope = validation_scope or "."
@@ -907,7 +949,10 @@ class AuraAgent:
                 f"Validation passed for `{scope}` ({files_seen} file"
                 f"{'s' if files_seen != 1 else ''} checked, 0 issues)."
             )
-        required = [path for path in expected_paths if path]
+        # `expected_paths` here is the list the caller already confirmed exists.
+        # It used to be the *requested* paths, echoed unconditionally, which was
+        # only harmless because a missing file raised before reaching this line.
+        required = [path for path in (expected_paths or []) if path]
         if required:
             display = ", ".join(f"`{path}`" for path in required[:8])
             suffix = f" and {len(required) - 8} more" if len(required) > 8 else ""
@@ -917,11 +962,13 @@ class AuraAgent:
             display = ", ".join(f"`{path}`" for path in verified[:8])
             suffix = f" and {len(verified) - 8} more" if len(verified) > 8 else ""
             evidence.append(f"Final file state inspected: {display}{suffix}.")
-        if not evidence:
-            return content
-        return content.rstrip() + "\n\nConfirmed evidence:\n" + "\n".join(
-            f"- {item}" for item in evidence
-        )
+        report = content.rstrip()
+        if evidence:
+            report += "\n\nConfirmed evidence:\n" + "\n".join(f"- {item}" for item in evidence)
+        if unconfirmed:
+            # Stated plainly, so an answer is never mistaken for verified work.
+            report += "\n\nNot confirmed:\n" + "\n".join(f"- {item}" for item in unconfirmed)
+        return report
 
     @staticmethod
     def tool_definitions() -> list[dict]:

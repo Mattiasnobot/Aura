@@ -102,6 +102,8 @@ Aura deliberately refuses to learn credentials and filters health, exact contact
 - Actionable requests cannot be marked complete until at least one relevant tool succeeds.
 - File mutations trigger a verification requirement: Aura must read back the final state or run a successful validation command.
 - If a local model repeatedly skips the final read-back, Aura performs a separate deterministic filesystem verification instead of adding an ambiguous warning.
+- When Aura cannot prove the work was done, it still shows the reply and adds a **Not confirmed** section naming exactly what is unproven, rather than discarding the answer.
+- All completion gates share one retry budget of three extra rounds, so a stubborn request cannot spin.
 - Successful mutations and builds end with deterministic **Confirmed evidence** covering final files and fresh validation results instead of relying only on the model's wording.
 - If LM Studio returns a partial streamed tool call or invalid atomic JSON, Aura retries through a bounded non-streaming repair turn and records the recovery in Diagnostics.
 - If the model falsely says an available action is impossible, Aura detects the missing work, corrects the model, and retries within the bounded tool loop.

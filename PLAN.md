@@ -594,3 +594,45 @@ the interface.
 
 **Also fixed:** the 250-memory cap evicted the oldest entry even when the user had pinned or
 confirmed it. It now only drops memories the user never vouched for.
+
+## Completion gates unified — 2026-08-15
+
+Every confusing failure in a full day of real use traced back to one place: the four
+completion gates (artifacts, validation, action/mutation, verification). They were four
+ad-hoc implementations of one question — *did the model actually do what was asked, and
+can Aura prove it?* — with four counters, four message styles, and inconsistent escalation.
+
+**What changed**
+
+- **A failed gate no longer destroys the answer.** It used to `raise`, so the user saw
+  "I couldn't complete that safely: required artifacts are still missing" and lost the
+  model's entire reply — twice today when the work had in fact been done, just looked for
+  in the wrong place. The reply is now kept and a **Not confirmed** section names precisely
+  what could not be proven. The rule that matters is unchanged: Aura never presents
+  unverified work as verified.
+- **One retry budget of three**, shared by every gate, replacing four counters that
+  together allowed nine extra rounds — each of which re-answered from scratch.
+- **Validation only when there is something to validate.** "build", "project", "app",
+  "website" now require an actual workspace mutation; an explicit "validate" still stands
+  alone. "How does my project look?" used to demand validation because it contains
+  "project".
+- **The validation gate asks the model once**, then validates deterministically itself
+  instead of spending more of the user's time on something the backend is about to do —
+  one round fewer than before, not more.
+- **`action_expected` narrowed.** "The router offered tools" was far too weak a reason to
+  insist one must have run, since the router offers tools for almost any wording.
+
+**Three real bugs surfaced while writing the tests for it**
+
+1. **Aura claimed deliverables were present without checking.** The evidence line echoed
+   the *requested* paths unconditionally; that was only ever harmless because a missing
+   file raised before reaching it. Turning the raise into a report would have turned this
+   into an outright false claim.
+2. **"my project" was parsed as a folder named `my`.** The artifact contract's exclusion
+   list covered "the" and "this" but no possessives, so Aura went looking for `my/`.
+3. **The list_files fallback replaced the reply** instead of adding to it, so a good
+   conversational answer was thrown away and returned as a bare file listing whenever the
+   model chose not to call a tool. It now augments the answer.
+
+Verified live: "How does my project look these days?" now completes in one round with a
+real answer, where before it burned the retry budget and returned a file listing.
