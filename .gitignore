@@ -17,3 +17,6 @@ aura-startup-error.log
 
 # Local machine-specific settings
 .claude/settings.local.json
+
+# Built distribution packages
+dist/

@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from . import __version__
 from .web_bridge import AuraWebBridge
 
 
@@ -124,7 +125,10 @@ class AuraRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path == "/health":
-            self._send_json({"app": "Aura", "interface": "html", "ready": True})
+            # The version is here so an update can be confirmed from the
+            # browser, without opening a file or trusting a cached page.
+            self._send_json({"app": "Aura", "interface": "html", "ready": True,
+                             "version": __version__})
             return
         if path == "/favicon.ico":
             self._send_bytes(b"", "image/x-icon", HTTPStatus.NO_CONTENT)

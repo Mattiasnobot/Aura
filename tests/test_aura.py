@@ -19,6 +19,9 @@ from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import package
+import aura_app
+from aura import __version__ as aura_version
 from aura.action_log import ActionLog
 from aura.agent import AuraAgent
 from aura.config import ConfigStore
@@ -3240,6 +3243,78 @@ class HTMLServerTests(unittest.TestCase):
         self.assertTrue(any(event.get("type") == "reply" for event in events))
         graph = self.call("get_mind_graph")
         self.assertTrue(graph["ok"])
+
+
+class PackagingTests(unittest.TestCase):
+    """A package must contain a runnable Aura and none of anyone's data."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "checkout"
+        (self.root / "aura" / "web").mkdir(parents=True)
+        (self.root / "aura" / "__init__.py").write_text('__version__ = "9.9.9"\n',
+                                                        encoding="utf-8")
+        for name in ("agent.py", "store.py"):
+            (self.root / "aura" / name).write_text("# module\n", encoding="utf-8")
+        for name in ("index.html", "app.js", "styles.css", "avatar-face.js"):
+            (self.root / "aura" / "web" / name).write_text("asset", encoding="utf-8")
+        (self.root / "aura_app.py").write_text("# launcher\n", encoding="utf-8")
+        (self.root / "README.md").write_text("# Aura\n", encoding="utf-8")
+
+        # The things that must never be shipped, in the places they really live.
+        workspace = self.root / "aura-workspace" / ".aura"
+        workspace.mkdir(parents=True)
+        (workspace / "memory.json").write_text('{"name": "Maya"}', encoding="utf-8")
+        (workspace / "aura.db").write_bytes(b"SQLite format 3\x00")
+        (self.root / "aura-workspace" / "secret-plan.txt").write_text("mine",
+                                                                     encoding="utf-8")
+        (self.root / "aura-runtime.log").write_text("startup", encoding="utf-8")
+        (self.root / "aura" / "__pycache__").mkdir()
+        (self.root / "aura" / "__pycache__" / "agent.cpython-313.pyc").write_bytes(b"\x00")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_a_package_carries_the_app_and_nothing_private(self):
+        target = Path(self.temp.name) / "aura-test.zip"
+        package.build(self.root, target)
+        with zipfile.ZipFile(target) as archive:
+            names = archive.namelist()
+        shipped = {Path(name).name for name in names}
+        self.assertIn("aura_app.py", shipped)
+        self.assertIn("index.html", shipped)
+        self.assertIn("agent.py", shipped)
+        for private in ("memory.json", "aura.db", "secret-plan.txt",
+                        "aura-runtime.log", "agent.cpython-313.pyc"):
+            self.assertNotIn(private, shipped)
+        self.assertFalse(any("aura-workspace" in name for name in names))
+
+    def test_packaging_stops_rather_than_ship_an_incomplete_interface(self):
+        (self.root / "aura" / "web" / "app.js").unlink()
+        with self.assertRaises(RuntimeError):
+            package.build(self.root, Path(self.temp.name) / "broken.zip")
+
+    def test_the_running_version_is_reported_where_it_can_be_checked(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        agent = AuraAgent(Path(temp.name) / "workspace", provider=MockProvider())
+        bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+        self.addCleanup(bridge.shutdown)
+        self.assertEqual(bridge.get_bootstrap()["version"], aura_version)
+        written = bridge.export_diagnostics()
+        self.assertIn(f"- Aura: {aura_version}",
+                      (agent.sandbox.root / written["path"]).read_text(encoding="utf-8"))
+
+
+class LauncherTests(unittest.TestCase):
+    def test_an_old_python_is_explained_instead_of_crashing(self):
+        """`pyw -3` can start an older interpreter than Aura was installed with."""
+        with patch.object(aura_app.sys, "version_info", (3, 9, 7)):
+            problem = aura_app.check_python()
+        self.assertIsNotNone(problem)
+        self.assertIn("3.10", problem)
+        self.assertIn("3.9.7", problem)
+        self.assertIsNone(aura_app.check_python())
 
 
 if __name__ == "__main__":

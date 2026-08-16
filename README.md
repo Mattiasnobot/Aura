@@ -157,6 +157,14 @@ This checks Python, the local HTML service and assets, the LM Studio server, and
 - The local interface answers on `127.0.0.1` and `localhost` only, and every API call additionally needs the session cookie and Aura's own client header.
 - Recovery is kept for 30 days or 500 changes, whichever ends first. Expiring a change removes its backups in the same transaction, and Aura never deletes a backup another record still needs.
 
+## Packaging
+
+```bash
+python package.py
+```
+
+Writes `dist/aura-<version>.zip` containing the launcher, the `aura` package, and the documentation — and nothing else. The workspace, conversations, personal memory, permissions, undo history, and logs are excluded by name and by suffix, and the finished archive is re-opened and checked before it is handed over, so a package can be shared without leaking anything local. The running version is reported at `/health` and in the diagnostics report, so an update can be confirmed without opening a file.
+
 ## Tests
 
 ```powershell

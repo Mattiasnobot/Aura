@@ -18,6 +18,7 @@ from typing import Any
 from urllib.parse import quote
 from uuid import uuid4
 
+from . import __version__
 from .agent import AuraAgent
 from .graph_model import build_mind_graph
 from .permissions import PermissionRefused
@@ -116,6 +117,7 @@ class AuraWebBridge:
             event_cursor = self._event_sequence
         return {
             "app": "Aura",
+            "version": __version__,
             "onboarded": bool(config["onboarded"]),
             "session_id": self.agent.session_id,
             "workspace": str(self.agent.sandbox.root),
@@ -1142,6 +1144,7 @@ class AuraWebBridge:
             lines = ["# Aura diagnostics", "",
                      f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} · local only",
                      "", "## This machine", "",
+                     f"- Aura: {__version__}",
                      f"- Platform: {platform.platform()}",
                      f"- Python: {platform.python_version()}",
                      f"- SQLite: {sqlite3.sqlite_version}",

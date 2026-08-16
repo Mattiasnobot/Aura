@@ -1,4 +1,5 @@
 import os
+import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -7,6 +8,24 @@ from pathlib import Path
 PROJECT = Path(__file__).resolve().parent
 RUNTIME_LOG = PROJECT / "aura-runtime.log"
 ERROR_LOG = PROJECT / "aura-startup-error.log"
+MINIMUM_PYTHON = (3, 10)
+
+
+def check_python() -> str | None:
+    """Return a plain explanation when this Python cannot run Aura.
+
+    Launchers can pick an older interpreter than the one Aura was installed
+    with (`pyw -3` finds whatever is first), and the failure that follows is a
+    syntax error deep inside a module — which explains nothing to anyone.
+    """
+    if sys.version_info >= MINIMUM_PYTHON:
+        return None
+    running = ".".join(str(part) for part in sys.version_info[:3])
+    wanted = ".".join(str(part) for part in MINIMUM_PYTHON)
+    return (f"Aura needs Python {wanted} or newer, but this launcher started "
+            f"Python {running} from:\n{sys.executable}\n\n"
+            "Install a newer Python from python.org, or start Aura with the "
+            "newer interpreter directly.")
 
 
 def runtime_log(message: str, details: str = "") -> None:
@@ -26,6 +45,16 @@ def runtime_log(message: str, details: str = "") -> None:
 
 def main() -> None:
     os.chdir(PROJECT)
+    problem = check_python()
+    if problem:
+        runtime_log("Refused to start on an unsupported Python.", problem)
+        try:
+            ERROR_LOG.write_text(problem + "\n", encoding="utf-8")
+            if os.name == "nt":
+                os.startfile(ERROR_LOG)  # type: ignore[attr-defined]
+        except OSError:
+            print(problem)
+        raise SystemExit(1)
     runtime_log("Starting HTML-only localhost interface.")
     from aura.http_app import run
     run()
