@@ -549,6 +549,7 @@ async function handleEvent(event) {
       attachTaskCard(completedMessage?.article, event.task);
       attachRecallNote(completedMessage?.article, event.recalled);
       updateSuggestions(event.text, event.task);
+      announce(event.text);
       break;
     case "state": setState(event.value); break;
     case "busy": setBusy(event.value); break;
@@ -1145,15 +1146,45 @@ function autoSizeComposer() {
   elements.composer.style.height = `${Math.min(elements.composer.scrollHeight, 160)}px`;
 }
 
+// Keyboard and screen-reader focus must stay inside the open dialog. Rather
+// than cycling Tab by hand, the rest of the page is made inert: it removes it
+// from the tab order *and* from the accessibility tree, so a screen reader
+// cannot wander into content the dialog is covering.
+const modalStack = [];
+const modalOpeners = new WeakMap();
+
+function applyModalFocusContainment() {
+  const top = modalStack[modalStack.length - 1] || null;
+  elements.app.inert = Boolean(top);
+  for (const modal of document.querySelectorAll(".modal-backdrop")) {
+    modal.inert = Boolean(top) && modal !== top;
+  }
+}
+
 function openModal(modal) {
+  const opener = document.activeElement;
+  if (opener && opener !== document.body && !opener.closest(".modal-backdrop")) {
+    modalOpeners.set(modal, opener);
+  }
   modal.classList.remove("hidden");
-  const focusable = modal.querySelector("input, select, button");
-  focusable?.focus();
+  const index = modalStack.indexOf(modal);
+  if (index >= 0) modalStack.splice(index, 1);
+  modalStack.push(modal);
+  applyModalFocusContainment();
+  modal.querySelector("input, select, textarea, button")?.focus();
 }
 
 function closeModal(modal) {
   if (modal === elements.approvalModal && currentApproval) return;
   modal.classList.add("hidden");
+  const index = modalStack.indexOf(modal);
+  if (index >= 0) modalStack.splice(index, 1);
+  applyModalFocusContainment();
+  // Back to the control that opened it, so the keyboard does not restart
+  // from the top of the page after every dialog.
+  const opener = modalOpeners.get(modal);
+  modalOpeners.delete(modal);
+  if (opener && opener.isConnected && !opener.closest(".hidden")) opener.focus();
 }
 
 let promptSubmitHandler = null;
@@ -1216,6 +1247,13 @@ function renderConversation(messages) {
   for (const item of messages || []) {
     if (item && item.role && item.text) addMessage(item.role, item.text);
   }
+}
+
+function announce(text) {
+  const region = $("#announcer");
+  // Re-setting identical text does not re-announce, so clear it first.
+  region.textContent = "";
+  window.setTimeout(() => { region.textContent = String(text || "").trim(); }, 40);
 }
 
 const WELCOME_STEPS = 3;
@@ -2440,8 +2478,12 @@ function bindControls() {
   });
   $("#collapseSidebar").addEventListener("click", () => {
     const collapsed = elements.sidebar.classList.toggle("collapsed");
-    if (collapsed) { expandedSidebarWidth = sidebarWidth; sidebarWidth = 72; $("#collapseSidebar").textContent = "›"; }
-    else { sidebarWidth = expandedSidebarWidth; $("#collapseSidebar").textContent = "‹"; }
+    const toggle = $("#collapseSidebar");
+    if (collapsed) { expandedSidebarWidth = sidebarWidth; sidebarWidth = 72; toggle.textContent = "›"; }
+    else { sidebarWidth = expandedSidebarWidth; toggle.textContent = "‹"; }
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.setAttribute("aria-label", collapsed ? "Expand sidebar" : "Collapse sidebar");
+    toggle.title = collapsed ? "Expand sidebar" : "Collapse sidebar";
     applyLayout();
   });
   $("#refreshModels").addEventListener("click", refreshModels);
@@ -2514,7 +2556,8 @@ function bindControls() {
   elements.filePicker.addEventListener("change", () => importFiles(elements.filePicker.files));
   document.querySelectorAll("[data-close]").forEach(button => button.addEventListener("click", () => closeModal($(`#${button.dataset.close}`))));
   [elements.settingsModal, elements.tasksModal, elements.memoryModal, elements.promptModal,
-   elements.historyModal, elements.previewServerModal]
+   elements.historyModal, elements.previewServerModal, elements.permissionsModal,
+   elements.sessionsModal]
     .forEach(modal => modal.addEventListener("click", event => {
       if (event.target === modal) closeModal(modal);
     }));
@@ -2524,16 +2567,15 @@ function bindControls() {
     if (event.ctrlKey && event.key.toLowerCase() === "o") { event.preventDefault(); openWorkspaceExplorer(); return; }
     if (event.ctrlKey && event.key === ",") { event.preventDefault(); openSettings(); return; }
     if (event.key === "Escape") {
+      // Whatever was opened last is what Escape closes, so every dialog
+      // behaves the same — including ones added later.
+      const top = modalStack[modalStack.length - 1];
       if (currentApproval) resolveApproval(false);
       else if (diffPickActive) cancelDiffPick();
-      else if (!elements.promptModal.classList.contains("hidden")) closeModal(elements.promptModal);
-      else if (!elements.historyModal.classList.contains("hidden")) closeModal(elements.historyModal);
-      else if (!elements.previewServerModal.classList.contains("hidden")) closeModal(elements.previewServerModal);
+      else if (top === elements.welcomeModal) finishOnboarding(true);
+      else if (top) closeModal(top);
       else if (!elements.workspaceView.classList.contains("hidden")) closeWorkspaceExplorer();
       else if (!elements.mindView.classList.contains("hidden")) closeMind();
-      else if (!elements.memoryModal.classList.contains("hidden")) closeModal(elements.memoryModal);
-      else if (!elements.settingsModal.classList.contains("hidden")) closeModal(elements.settingsModal);
-      else if (!elements.tasksModal.classList.contains("hidden")) closeModal(elements.tasksModal);
       else if (busy) callApi("stop");
     }
   });

@@ -68,6 +68,8 @@ With Piper, mouth opening follows the amplitude envelope measured directly from 
 
 On the first launch a short guide explains what Aura is, helps connect LM Studio and pick a model, and points out where permissions, undo, and the diagnostics report live. It can be skipped without changing any setting, and reopened later from **Settings → Show first-run guide**.
 
+Aura is usable from the keyboard alone. An open dialog keeps focus inside itself and returns it to the control that opened it, **Escape** closes whichever dialog is on top, and finished replies are announced once to a screen reader rather than repeated on every streamed word. Small helper text meets the 4.5:1 contrast ratio, and the avatar honours the system's reduced-motion setting.
+
 - **Enter** sends a message; **Shift+Enter** inserts a new line.
 - **Escape** stops the current task.
 - **Ctrl+L** clears the visible conversation.

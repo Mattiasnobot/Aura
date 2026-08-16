@@ -35,7 +35,7 @@
       <nav class="side-actions" aria-label="Aura controls">
         <button id="voiceButton" class="side-button" aria-pressed="false" aria-describedby="voiceHint" title="Click to talk, or hold while speaking"><span class="button-icon">◉</span> <span id="voiceButtonLabel">Voice</span> <span class="voice-wave" aria-hidden="true"><i></i><i></i><i></i></span></button>
         <div id="voiceTray" class="voice-tray hidden" aria-live="polite">
-          <div class="voice-tray-head"><strong id="voiceStatus">Ready to listen</strong><button id="voiceCancel" type="button" title="Cancel voice input">×</button></div>
+          <div class="voice-tray-head"><strong id="voiceStatus">Ready to listen</strong><button id="voiceCancel" type="button" title="Cancel voice input" aria-label="Cancel voice input">×</button></div>
           <div class="voice-meter" role="meter" aria-label="Microphone level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="voiceMeterFill"></i></div>
           <p id="voicePartial">Click once for automatic listening, or hold the Voice button while speaking.</p>
           <div class="voice-tray-actions"><button id="voiceRetry" type="button" class="hidden">Retry</button><span id="voiceHint">Local • click or hold to talk</span></div>
@@ -52,7 +52,7 @@
 
       <div class="sidebar-footer">
         <span id="workspacePath">aura-workspace</span>
-        <button id="collapseSidebar" title="Collapse sidebar">‹</button>
+        <button id="collapseSidebar" title="Collapse sidebar" aria-label="Collapse sidebar" aria-expanded="true">‹</button>
       </div>
     </aside>
 
@@ -62,7 +62,7 @@
       <header class="topbar">
         <div>
           <h1>Conversation</h1>
-          <p id="activityText">Aura is ready.</p>
+          <p id="activityText" role="status" aria-live="polite">Aura is ready.</p>
         </div>
         <div class="top-actions">
           <button id="toggleLogButton" class="ghost-button">Action log</button>
@@ -72,7 +72,11 @@
         </div>
       </header>
 
-      <section id="conversation" class="conversation" aria-live="polite"></section>
+      <!-- Deliberately not a live region: streaming rewrites this element on
+           every token, which a screen reader would read out over and over.
+           Finished replies are announced once through #announcer instead. -->
+      <section id="conversation" class="conversation"></section>
+      <div id="announcer" class="sr-only" role="status" aria-live="polite"></div>
 
       <div id="logResizer" class="horizontal-resizer" role="separator" aria-orientation="horizontal" aria-label="Resize action log" title="Drag to resize action log"></div>
       <section id="actionPanel" class="action-panel">
@@ -158,7 +162,7 @@
 
   <div id="memoryModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="memoryTitle">
     <div class="modal-card memory-card">
-      <header><div><h2 id="memoryTitle">What Aura knows about you</h2><p id="memoryPrivacy">Local, transparent, and always under your control.</p></div><button class="modal-x" data-close="memoryModal">×</button></header>
+      <header><div><h2 id="memoryTitle">What Aura knows about you</h2><p id="memoryPrivacy">Local, transparent, and always under your control.</p></div><button class="modal-x" aria-label="Close" data-close="memoryModal">×</button></header>
       <div class="memory-overview">
         <div><span>Name</span><strong id="memoryName">Not set</strong></div>
         <div><span>Personal memories</span><strong id="memoryCount">0</strong></div>
@@ -216,7 +220,7 @@
 
   <div id="sessionsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="sessionsTitle">
     <div class="modal-card memory-card">
-      <header><div><h2 id="sessionsTitle">Conversations</h2><p>Every conversation is kept locally. Open one to continue it.</p></div><button class="modal-x" data-close="sessionsModal">×</button></header>
+      <header><div><h2 id="sessionsTitle">Conversations</h2><p>Every conversation is kept locally. Open one to continue it.</p></div><button class="modal-x" aria-label="Close" data-close="sessionsModal">×</button></header>
       <div class="session-search"><input type="search" id="sessionSearch" placeholder="Search everything said in every conversation…" aria-label="Search conversations"></div>
       <div id="sessionList" class="memory-list"></div>
       <footer><label class="inline-check"><input type="checkbox" id="showArchivedSessions"> Show archived</label><span>Starting a new conversation never deletes an old one.</span><button class="primary-button" data-close="sessionsModal">Done</button></footer>
@@ -225,7 +229,7 @@
 
   <div id="permissionsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="permissionsTitle">
     <div class="modal-card memory-card">
-      <header><div><h2 id="permissionsTitle">Permissions</h2><p id="permissionsNote">Folders outside the workspace that Aura may read.</p></div><button class="modal-x" data-close="permissionsModal">×</button></header>
+      <header><div><h2 id="permissionsTitle">Permissions</h2><p id="permissionsNote">Folders outside the workspace that Aura may read.</p></div><button class="modal-x" aria-label="Close" data-close="permissionsModal">×</button></header>
       <form id="permissionGrant" class="memory-teach">
         <select id="permissionAccess" aria-label="Access level">
           <option value="read">Read only</option>
@@ -246,7 +250,7 @@
 
   <div id="settingsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
     <div class="modal-card settings-card">
-      <header><div><h2 id="settingsTitle">Aura settings</h2><p>Stored locally on this computer.</p></div><button class="modal-x" data-close="settingsModal">×</button></header>
+      <header><div><h2 id="settingsTitle">Aura settings</h2><p>Stored locally on this computer.</p></div><button class="modal-x" aria-label="Close" data-close="settingsModal">×</button></header>
       <div class="settings-grid">
         <label class="wide">LM Studio URL<input id="settingUrl" type="url"></label>
         <label class="wide model-field">Model<select id="settingModel"></select><button id="refreshModels" type="button">Refresh models</button></label>
@@ -286,7 +290,7 @@
 
   <div id="tasksModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="tasksTitle">
     <div class="modal-card tasks-card">
-      <header><div><h2 id="tasksTitle">Recent tasks</h2><p>Outcomes and recoverable workspace changes.</p></div><button class="modal-x" data-close="tasksModal">×</button></header>
+      <header><div><h2 id="tasksTitle">Recent tasks</h2><p>Outcomes and recoverable workspace changes.</p></div><button class="modal-x" aria-label="Close" data-close="tasksModal">×</button></header>
       <div id="taskList" class="task-list"></div>
       <footer><button class="primary-button" data-close="tasksModal">Done</button></footer>
     </div>
@@ -305,7 +309,7 @@
 
   <div id="promptModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="promptTitle">
     <div class="modal-card prompt-card">
-      <header><div><h2 id="promptTitle">Name it</h2><p id="promptHint">Workspace-relative path</p></div><button class="modal-x" data-close="promptModal">×</button></header>
+      <header><div><h2 id="promptTitle">Name it</h2><p id="promptHint">Workspace-relative path</p></div><button class="modal-x" aria-label="Close" data-close="promptModal">×</button></header>
       <form id="promptForm">
         <input id="promptInput" type="text" maxlength="255" required autocomplete="off">
         <div id="promptStatus" class="modal-status"></div>
@@ -316,7 +320,7 @@
 
   <div id="historyModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="historyTitle">
     <div class="modal-card history-card">
-      <header><div><h2 id="historyTitle">Workspace history</h2><p>Only the most recent change can be undone directly.</p></div><button class="modal-x" data-close="historyModal">×</button></header>
+      <header><div><h2 id="historyTitle">Workspace history</h2><p>Only the most recent change can be undone directly.</p></div><button class="modal-x" aria-label="Close" data-close="historyModal">×</button></header>
       <div id="historyList" class="task-list"></div>
       <footer><button class="primary-button" data-close="historyModal">Done</button></footer>
     </div>
@@ -324,7 +328,7 @@
 
   <div id="previewServerModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="previewServerTitle">
     <div class="modal-card">
-      <header><div><h2 id="previewServerTitle">Live preview server</h2><p>Serves a workspace folder with real HTML/CSS/JS execution, separate from Aura's protected app. Starts only when you ask.</p></div><button class="modal-x" data-close="previewServerModal">×</button></header>
+      <header><div><h2 id="previewServerTitle">Live preview server</h2><p>Serves a workspace folder with real HTML/CSS/JS execution, separate from Aura's protected app. Starts only when you ask.</p></div><button class="modal-x" aria-label="Close" data-close="previewServerModal">×</button></header>
       <form id="previewServerForm" class="prompt-card-form">
         <input id="previewServerFolder" type="text" maxlength="255" placeholder="Workspace-relative folder to serve (blank = whole workspace)" autocomplete="off">
         <button type="submit" class="primary-button" id="previewServerStart">Start preview</button>

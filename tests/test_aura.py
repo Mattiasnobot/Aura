@@ -3015,6 +3015,25 @@ class HTMLServerTests(unittest.TestCase):
         self.assertEqual(health["interface"], "html")
         self.assertEqual(existing_aura_url(self.server.server_address[1]), self.base)
 
+    def test_the_interface_keeps_keyboard_and_screen_reader_users_oriented(self):
+        with urlopen(self.base + "/app.js", timeout=3) as response:
+            script = response.read().decode("utf-8")
+        with urlopen(self.base + "/styles.css", timeout=3) as response:
+            styles = response.read().decode("utf-8")
+        # A dialog contains focus by making everything else inert, and hands
+        # focus back to whatever opened it.
+        self.assertIn("elements.app.inert = Boolean(top)", script)
+        self.assertIn("opener.focus()", script)
+        # Escape closes whichever dialog is on top, so newer dialogs are covered
+        # without anyone remembering to extend a list.
+        self.assertIn("closeModal(top)", script)
+        # Streaming must not be announced token by token.
+        self.assertNotIn('id="conversation" class="conversation" aria-live', self.index)
+        self.assertIn('id="announcer"', self.index)
+        self.assertIn('role="status"', self.index)
+        self.assertIn(".sr-only", styles)
+        self.assertIn('class="modal-x" aria-label="Close"', self.index)
+
     def test_serves_holographic_avatar_motion_without_external_assets(self):
         with urlopen(self.base + "/app.js", timeout=3) as response:
             script = response.read().decode("utf-8")
