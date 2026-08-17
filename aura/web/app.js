@@ -12,11 +12,11 @@ const elements = {
   actionPanel: $("#actionPanel"), actionLog: $("#actionLog"), logResizer: $("#logResizer"),
   logCount: $("#logCount"), toggleLog: $("#toggleLogButton"), workspacePath: $("#workspacePath"),
   activityLogTab: $("#activityLogTab"), diagnosticsLogTab: $("#diagnosticsLogTab"),
-  suggestionBar: $("#suggestionBar"), voiceButton: $("#voiceButton"), gazeLayer: $("#gazeLayer"),
+  suggestionBar: $("#suggestionBar"), voiceButton: $("#voiceButton"),
   voiceButtonLabel: $("#voiceButtonLabel"), voiceTray: $("#voiceTray"),
   voiceStatus: $("#voiceStatus"), voicePartial: $("#voicePartial"),
   voiceMeterFill: $("#voiceMeterFill"), voiceRetry: $("#voiceRetry"), voiceCancel: $("#voiceCancel"),
-  avatarCanvas: $("#avatarCanvas"), avatarMouth: $("#avatarMouth"),
+  avatarCanvas: $("#avatarCanvas"),
   attachButton: $("#attachButton"), filePicker: $("#filePicker"), dropOverlay: $("#dropOverlay"),
   mindView: $("#mindView"), mindCanvas: $("#mindCanvas"), mindSearch: $("#mindSearch"),
   mindSummary: $("#mindSummary"), mindDetail: $("#mindDetail"), mindActions: $("#mindActions"),
@@ -2503,12 +2503,10 @@ function installFaceInteraction() {
       const y = (event.clientY - centerY) / distance * strength;
       const normalizedX = Math.max(-1, Math.min(1, (event.clientX - centerX) / Math.max(rect.width * .65, 1)));
       const normalizedY = Math.max(-1, Math.min(1, (event.clientY - centerY) / Math.max(rect.height * .65, 1)));
-      elements.gazeLayer?.setAttribute("transform", `translate(${(x * .72).toFixed(2)} ${(y * .72).toFixed(2)})`);
       avatarMotion?.setGaze(normalizedX, normalizedY);
     });
   });
   document.addEventListener("pointerleave", () => {
-    elements.gazeLayer?.setAttribute("transform", "translate(0 0)");
     avatarMotion?.setGaze(0, 0);
   });
   const react = () => {
