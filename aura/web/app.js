@@ -28,6 +28,7 @@ const elements = {
   settingsModal: $("#settingsModal"), tasksModal: $("#tasksModal"), memoryModal: $("#memoryModal"),
   permissionsModal: $("#permissionsModal"), sessionsModal: $("#sessionsModal"),
   welcomeModal: $("#welcomeModal"), watchModal: $("#watchModal"),
+  planStrip: $("#planStrip"),
   memoryList: $("#memoryList"),
   promptModal: $("#promptModal"), promptForm: $("#promptForm"), promptTitle: $("#promptTitle"),
   promptHint: $("#promptHint"), promptInput: $("#promptInput"), promptStatus: $("#promptStatus"),
@@ -73,6 +74,7 @@ let diffPickActive = false;
 let diffFirstFile = null;
 let previewServerState = { running: false };
 let selectedMindNode = null;
+let planSteps = [];
 let dragDepth = 0;
 let personalMemories = [];
 let memoryCategories = [];
@@ -678,6 +680,17 @@ async function handleEvent(event) {
       if (!event.covered) {
         toast("No Estonian voice is installed — that reply was read by the English voice. Settings → Speech.", true);
       }
+      break;
+    case "wrong_language":
+      toast(`Aura answered in ${event.looked_like} instead of ${event.expected}. `
+            + "The local model does this; it is logged in Diagnostics.", true);
+      break;
+    case "plan_started": planSteps = event.steps || []; renderPlan(planSteps); break;
+    case "plan_progress": planSteps = event.steps || []; renderPlan(planSteps); break;
+    case "plan_finished":
+      // Left on screen rather than cleared, because what got built is worth
+      // reading after the fact.
+      renderPlan(planSteps, true);
       break;
     case "search_service":
       renderSearchServiceStatus();
@@ -1526,6 +1539,33 @@ async function openSessions(focus = true) {
     }
   } catch (error) {
     list.textContent = String(error);
+  }
+}
+
+function renderPlan(steps, finished = false) {
+  const strip = elements.planStrip;
+  if (!steps || !steps.length) { strip.classList.add("hidden"); return; }
+  const done = steps.filter(step => step.done).length;
+  strip.classList.remove("hidden");
+  $("#planCount").textContent = finished
+    // Said plainly rather than hidden: a plan that ends part-done is exactly
+    // what the user needs to see, and rounding it up to "finished" is the
+    // dishonesty this project keeps having to remove.
+    ? (done === steps.length ? `all ${steps.length} written`
+                             : `${done} of ${steps.length} written`)
+    : `${done} of ${steps.length}`;
+  const list = $("#planSteps");
+  list.replaceChildren();
+  for (const step of steps) {
+    const row = document.createElement("li");
+    row.className = step.done ? "done" : "";
+    const mark = document.createElement("i");
+    mark.textContent = step.done ? "✓" : "•";
+    mark.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.textContent = step.text;
+    row.append(mark, label);
+    list.append(row);
   }
 }
 
@@ -2416,6 +2456,25 @@ function updateMindActions(node) {
   elements.mindActions.classList.toggle("hidden", !node);
   $("#mindOpen").classList.toggle("hidden", !node?.target);
   $("#mindOpen").textContent = node?.kind === "folder" ? "Browse" : "Open";
+  // Every other edge on this map is derived from the data and cannot be
+  // edited without lying about it. A memory's project is the exception: it
+  // comes from a guess made when the fact was learned.
+  const editable = !!node?.memory_id;
+  $("#mindProjectField").classList.toggle("hidden", !editable);
+  $("#mindProjectSave").classList.toggle("hidden", !editable);
+  if (editable) $("#mindProject").value = node.project || "";
+}
+
+async function saveMindProject() {
+  const node = selectedMindNode;
+  if (!node?.memory_id) return;
+  const wanted = $("#mindProject").value.trim();
+  // An empty box detaches rather than being refused: a wrong link is worse
+  // than no link, so removing one has to be as easy as adding one.
+  const result = await callApi("update_personal_memory", node.memory_id, { project: wanted });
+  if (!result.ok) return toast(result.error, true);
+  toast(wanted ? `Linked to ${wanted}.` : "Detached from its project.");
+  await openMind();
 }
 
 function askAboutMindNode() {
@@ -2920,6 +2979,10 @@ function bindControls() {
   $("#mindFit").addEventListener("click", () => mindGraph.fit());
   $("#mindReset").addEventListener("click", () => mindGraph.reset());
   $("#mindRefresh").addEventListener("click", openMind);
+  $("#mindProjectSave").addEventListener("click", saveMindProject);
+  $("#mindProject").addEventListener("keydown", event => {
+    if (event.key === "Enter") { event.preventDefault(); saveMindProject(); }
+  });
   $("#mindAsk").addEventListener("click", askAboutMindNode);
   $("#mindOpen").addEventListener("click", openMindTarget);
   elements.mindSearch.addEventListener("input", () => { mindGraph.search = elements.mindSearch.value; mindGraph.draw(); });

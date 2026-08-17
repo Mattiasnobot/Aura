@@ -77,6 +77,9 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         self._busy = False
         self._voice_active = False
         self._approvals: dict[str, queue.Queue[str]] = {}
+        #: The approved file plan for the running turn, ticked off as the
+        #: files are actually written rather than as they are intended.
+        self._plan_steps: list[dict] = []
         self._task_approved_exact: dict[str, set[str]] = {}
         self._approval_lock = threading.Lock()
         self.preview_server = PreviewServer(self.agent.sandbox, self.agent.log)
@@ -492,18 +495,36 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
             self._push("stream_token", text=piece)
 
         try:
-            response = self.agent.handle(
-                text,
-                approve=self._approve_command,
-                state=self._on_agent_state,
-                token=on_token,
-            )
+            self._plan_steps = []
+            self.agent.on_tool = self._on_tool
+            try:
+                response = self.agent.handle(
+                    text,
+                    approve=self._approve_command,
+                    state=self._on_agent_state,
+                    token=on_token,
+                )
+            finally:
+                self.agent.on_tool = None
+                if self._plan_steps:
+                    self._push("plan_finished",
+                               done=sum(1 for step in self._plan_steps if step["done"]),
+                               total=len(self._plan_steps))
+                self._plan_steps = []
             recent = self.agent.tasks.recent(1)
             recalled = [{"value": item.get("value"), "category": item.get("category"),
                          "recall_reason": item.get("recall_reason")}
                         for item in self.agent.last_recalled if item.get("recall_reason")]
             self._push("reply", text=response, streamed=bool(streamed),
                        task=recent[0] if recent else None, recalled=recalled)
+            if language.looks_finnish(response) and language.detect(text) == "et":
+                # The model drifts to Finnish when it is asked in Estonian, and a
+                # reply in the wrong language reads as Aura being confused rather
+                # than as the model slipping. Recorded so the pattern is visible
+                # in diagnostics, and said once so it is not just endured.
+                self.agent.log.record("wrong_language", "error", expected="et",
+                                      looked_like="fi")
+                self._push("wrong_language", expected="Estonian", looked_like="Finnish")
             if self.agent.last_learned:
                 self._push("memory_learned", memories=self.agent.last_learned)
             selected = getattr(self.agent.provider, "model", None)
@@ -554,7 +575,61 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         self._push("state", value="working")
         return {"ok": True}
 
+    #: Tools whose success means a planned file now exists. Anything else can
+    #: mention a path without producing it, and a plan that ticks on intention
+    #: rather than on result is worse than no plan at all.
+    PLAN_TOOLS = frozenset({"create_file", "write_file", "write_files", "append_file"})
+
+    def _start_plan(self, plan: str) -> None:
+        """Remember an approved plan so the interface can follow it.
+
+        The plan used to be shown once, in the dialog that asked for it, and
+        then vanish — leaving a spinner and a log to answer "how far along is
+        this?".
+        """
+        steps = []
+        for line in str(plan or "").splitlines():
+            text = line.strip(" -*\t")
+            if not text:
+                continue
+            path = text.split(" - ")[0].strip()
+            steps.append({"path": path, "text": text, "done": False})
+        self._plan_steps = steps[:20]
+        if self._plan_steps:
+            self._push("plan_started", steps=self._plan_steps)
+
+    def _on_tool(self, name: str, arguments: dict, succeeded: bool) -> None:
+        if not succeeded or not getattr(self, "_plan_steps", None):
+            return
+        if name not in self.PLAN_TOOLS:
+            return
+        written = []
+        if isinstance(arguments.get("files"), list):
+            written = [str(item.get("path", "")) for item in arguments["files"]
+                       if isinstance(item, dict)]
+        elif arguments.get("path"):
+            written = [str(arguments["path"])]
+        changed = False
+        for step in self._plan_steps:
+            if step["done"]:
+                continue
+            if any(path and (path == step["path"] or path.endswith(step["path"])
+                             or step["path"].endswith(path)) for path in written):
+                step["done"] = True
+                changed = True
+        if changed:
+            self._push("plan_progress", steps=self._plan_steps,
+                       done=sum(1 for step in self._plan_steps if step["done"]),
+                       total=len(self._plan_steps))
+
     def _approve_command(self, command: list[str]) -> bool:
+        """Ask, and if a plan was approved, start following it."""
+        approved = self._ask_approval(command)
+        if approved and len(command) > 1 and command[0] == "PLAN":
+            self._start_plan(command[1])
+        return approved
+
+    def _ask_approval(self, command: list[str]) -> bool:
         task_id = self.agent.current_task_id or "active"
         exact_key = json.dumps(command, ensure_ascii=False, separators=(",", ":"))
         with self._approval_lock:
@@ -773,9 +848,11 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
                 value=str(values["value"]) if "value" in values else None,
                 category=str(values["category"]) if "category" in values else None,
                 pinned=bool(values["pinned"]) if "pinned" in values else None,
+                project=str(values["project"]) if "project" in values else None,
             )
             self.agent.log.record("update_personal_fact", "ok", memory_id=item["id"],
-                                  category=item["category"], value=item["value"])
+                                  category=item["category"], value=item["value"],
+                                  project=item.get("project"))
             self._push("memory_changed", action="updated", memory=item)
             return {"ok": True, "memory": item}
         except (KeyError, TypeError, ValueError) as exc:

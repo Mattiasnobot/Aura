@@ -559,7 +559,7 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
    - **Notifications stay inside the app** (also decided with the user): the conversation, the activity log, and a badge on the window. No OS toast, so none of the phase 46 notification work is pulled in and no new permission is asked of Windows.
    - **Gate:** a scheduled check runs on time inside its budget and quiet hours, reports what it found, and — when it wants to change something — produces a proposal that does nothing until approved; pause and emergency stop are provable while a run is in flight.
 
-49. **UX consolidation and release readiness — In progress (P3)**
+49. **UX consolidation and release readiness — Complete (P3)**
    - **Done — conversation sessions.** Every message is kept in `aura.db` against a session id, while `memory.data["conversation"]` stays the current session's view so the provider context, bootstrap, and Aura Mind read it unchanged. **New** starts a fresh conversation without destroying the old one; **Conversations** lists them, titled by their first message; opening one restores it as the live context. A session row is written on the first message, so launching Aura and saying nothing leaves no empty conversation behind. **Archive** hides a conversation and **Show archived** brings it back; the live conversation is refused, since archiving what is still collecting messages would hide it mid-use. Conversations are user content and are not touched by the 30-day recovery sweep.
    - **Done — search and export.** The search box matches every typed word against the same message across all conversations and returns the matching lines; `%`, `_`, and `\` are escaped, so a wildcard cannot silently match everything. Export writes one conversation into the workspace as Markdown, next to the existing memory export.
    - **Done — diagnostics export.** **Export report** in the log panel writes one Markdown file describing the machine, settings, storage counts and size, retention sweeps, granted folders, recent tasks, and recent failures. It reports counts and failures only — conversation text, memory content, and file contents are excluded by construction, with a test asserting they stay out — so the file can be handed to someone else. The retention sweep now also clears session rows with no messages, left behind by builds that wrote one per launch.
@@ -568,7 +568,11 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
    - **Done — packaging.** `python package.py` builds `dist/aura-<version>.zip` from an explicit include list, excludes personal data by name and suffix, and then re-opens the finished archive and refuses to hand over anything private that slipped through. The launcher now explains an unsupported Python instead of failing with a syntax error deep inside a module, since `pyw -3` can pick an older interpreter than Aura was installed with. The version is reported at `/health`, in the bootstrap, and in the diagnostics report.
    - Still open here: Aura Mind refinement.
    - **Done — Aura Mind.** The legend and the filters are one control: each layer (Identity, Memory, Preferences, Conversation, Tasks, Tools, Workspace) is a labelled colour key that switches its branch off, and the header reports how much is hidden. Layers are derived from the graph rather than a hand-kept table, with direct children of a category claimed first — tools hang off both `capabilities` and the tasks that used them, and without that, hiding Tasks took the entire Tools layer with it. Three misleading things were fixed: a fact held both as a preference and as a learned memory was drawn as two unrelated nodes and is now one node under both headings; a task with an empty request rendered as a nameless circle, because the key existed and the dict default never applied; and a task is now linked to the message that asked for it instead of repeating the same words in two branches.
-   - Still open here: relationship editing and a live task plan.
+   - **Done — relationship editing.** Every edge on this map is derived from the data, with one exception: the `project` a memory belongs to, which comes from a guess made when the fact was learned. It was **stored and never drawn**, so a fact tied to a piece of work hung under Memory like any other and the map showed less than Aura actually knew. It is now drawn as its own node, and a selected memory offers a project field — the only node kind that does, because offering to edit a derived edge would be a lie about what happens next. An empty box detaches rather than being refused: a wrong link is worse than no link, so removing one has to be as easy as adding one. An ordinary edit to the memory's text leaves the project alone.
+   - **Done — live task plan.** The approved plan used to be shown once, in the dialog that asked for it, and then vanish — leaving a spinner and an action log to answer "how far along is this?". It now stays on screen and ticks off. The tick comes from `create_file`/`write_file`/`write_files`/`append_file` **succeeding**, never from the model saying it would: a plan that advanced on intention would be worse than no plan, since it would show finished work that does not exist. Reading a planned file, or failing to write it, moves nothing. The strip stays visible when the turn ends and says *"2 of 3 written"* when that is what happened, rather than rounding up.
+     - The agent gained an `on_tool` callback beside the existing `approve`/`state`/`token` seams — there was no way for the interface to learn that a tool had finished. A failure inside that callback can never break the tool that triggered it, which has its own test.
+     - Verified live end to end: a three-file build showed **0 of 3** on approval, went to **1 of 3** at the moment `faas49/index.html` appeared on disk, and reached **3 of 3**. Contrast measured in the running page: 4.91–15.35:1.
+     - Relationship editing verified on the real graph: linking a memory to `aura_craft` created the project node and its edge, the field appeared for the memory node and **not** for a derived one, and detaching removed both. The test memory was put back as it was found.
    - Add sticky modal actions, keyboard focus handling, screen-reader summaries, contrast/reduced-motion checks, diagnostics export, first-run onboarding, and dependable packaging/updating.
    - **Gate:** a new user can install, connect LM Studio, choose voice and permissions, complete a first project, understand failures, and recover without opening source files.
 
@@ -1050,3 +1054,107 @@ was wrong. Only Hazel and Zira are available on this machine.
 
 That leaves exactly two routes to Estonian speech, both weighed and both declined for now:
 XTTS-v2-est at roughly 5 GB with unmeasured CPU latency, or espeak-ng at 10 MB and robotic.
+
+
+## The rest of the English-only checks — 2026-08-17
+
+Routing and mutation detection were fixed earlier the same day. A grep for raw `casefold()`
+comparisons found six more, and they were the ones that matter most: they decide **what Aura
+promised to produce** and **whether the turn counts as finished**.
+
+Measured the same way, ten Estonian requests against their English translations:
+**thirteen field mismatches**. In order of how quietly they fail:
+
+- **`asks_for_work` was false for six of ten Estonian read requests.** That sets
+  `action_expected` false, which switches off the gate insisting a tool actually ran. Aura
+  could answer *"loe see fail ette"* without opening the file and nothing would object — the
+  same family as the phase 42 and 48.5 bugs, where a finished job and an unstarted one became
+  indistinguishable in the report.
+- **The staged-delivery instruction never fired** on an Estonian build request, so multi-file
+  work skipped the plan/implement/validate/repair discipline entirely.
+- **`validation_asked` never fired**, so "valideeri projekt" was not treated as asking for
+  validation.
+- **`_targets_external_location` missed "väljaspool tööruumi"**, which means a request aimed at
+  a granted folder was held to a workspace contract it could never satisfy.
+- **No folder was ever extracted**, so validation was never scoped to the right project.
+
+Five of these are vocabulary and go through the same annotation as everything else — one
+annotated copy of the routing request, computed once and read by every keyword test below it.
+
+**The sixth is grammar, and annotation cannot fix it.** English marks the relation with a
+preposition ("in the promo folder"); Estonian marks it with a case ending, and the folder name
+sits on either side depending which ending is used — *kausta promo*, *promo kaustas*,
+*aura_craft projektis*. Two patterns, one per direction. The first attempt used one word list
+for both and reported the folder of "projektis uus leht" as **"uus"** — the word that merely
+came next. A test now pins all three shapes.
+
+Also added: `mida`, `kuidas`, `milline`. The memory-question regex asks for
+*what/which/how … know about me*, and the Estonian half of that sentence had no interrogative
+it recognised.
+
+After: **zero mismatches** across the same ten pairs, with a test that compares the whole
+contract for each pair rather than individual fields — so a future English-only check shows up
+as a failing test instead of as Estonian quietly getting a weaker promise.
+
+**Verified live**: *"Loe fail test.ts ette ja ütle, mis seal sees on"* called `read_file` and
+came back with *"Confirmed evidence: Final file state inspected: test.ts"* — that line is the
+verification gate, and it is exactly what `action_expected` had been switching off.
+
+
+## Aura answered in Finnish — 2026-08-17
+
+Spotted on screen, not in a test: *"Valmis! Kaikki kolme tiedostoa luotiin onnistuneesti"*,
+and a file plan whose descriptions read *"pääsivu HTML-dokumentaatio"*, *"perus CSS-tyylit
+sivuille"*. That is Finnish.
+
+**The cause was an absence.** The system prompt said nothing whatsoever about which language to
+answer in — so a 9B model asked in Estonian drifted to the neighbouring language that has far
+more training data behind it. `LANGUAGE_RULE` is inserted in `start_messages`, which every path
+into the model goes through, including the file plan whose descriptions had drifted too. It
+names Finnish explicitly, because naming the specific attractor helps a small model more than a
+general instruction does.
+
+**A correction to my own earlier work.** The bilingual speech test asserted that every dotted
+letter proved Estonian. It does not: `ä`, `ö` and `ü` are shared with Finnish, so that test was
+confirming the mistake rather than catching it. Only `õ`, `š` and `ž` are Estonian's alone.
+
+`looks_finnish()` is deliberately its own question rather than a third answer from `detect()`.
+Folding Finnish into "et" is exactly how a wrong-language reply becomes invisible; instead the
+bridge records `wrong_language` in the log and says so once, so the pattern is visible in
+diagnostics rather than merely endured.
+
+**Verified live**: *"Loetle, mis failid tööruumis on, ja ütle iga kohta üks lause"* came back as
+clean Estonian throughout — *"peamine esitlusleht HTML-failina"*, *"Kodulehe CSS-stiilid ja
+disainielemendid"* — where the same shape of request had produced Finnish an hour earlier.
+
+## Reliability: the empty response, measured — 2026-08-17
+
+The recurring failure is *"I couldn't complete that safely: the model kept returning an empty
+response"*, seen three times across two days.
+
+**It is now measured rather than only reported.** `ProviderReply` carries `finish_reason` and
+the token counts, and the empty-response gate records them. `finish_reason` is the question that
+was never asked: a model that ran out of budget mid-answer and a model that chose to say nothing
+produce the same empty string and need opposite fixes.
+
+**What the probing ruled in and out**, eight requests through the real provider against the real
+model:
+
+- Fresh context, five ordinary Estonian requests: **5/5 answered**, every one with a tool call,
+  1231–2321 prompt tokens.
+- With twelve and twenty-four turns of the real conversation replayed: answered both times.
+- `max_tokens` is 32768 and nothing came back with `finish_reason: length`.
+
+So **it did not reproduce in eight attempts**, and no hypothesis is confirmed. The honest state
+is that the next occurrence will be recorded with its reason instead of being unexplained.
+
+**One thing worth noting that did show up.** With the longest history the model answered a
+"list the files" request from context, with `finish_reason: stop` and **no tool call** — it
+talked about files instead of looking at them. That is the failure `action_expected` exists to
+catch, and it is caught now that the gate finally fires for Estonian requests.
+
+**A false alarm, recorded because it nearly became a report.** My first probe sent the messages
+straight to LM Studio and got HTTP 400 on every single request — the model's template refuses
+more than one system message. That looked like a serious bug in Aura until checking showed
+`merge_system_messages` is applied on the real path and folds them into one. The defect was in
+the probe, not the product.

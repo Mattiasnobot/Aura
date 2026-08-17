@@ -11,6 +11,10 @@ class MindNode:
     kind: str
     detail: str
     target: str | None = None
+    #: Set on memory nodes only, so the interface can edit the one relationship
+    #: here that is not derived from the data.
+    memory_id: str | None = None
+    project: str | None = None
 
 
 @dataclass(frozen=True)
@@ -44,8 +48,10 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
     edge_keys: set[tuple[str, str]] = set()
 
     def add(node_id: str, label: str, kind: str, detail: str,
-            target: str | None = None) -> None:
-        nodes.setdefault(node_id, MindNode(node_id, label, kind, detail, target))
+            target: str | None = None, memory_id: str | None = None,
+            project: str | None = None) -> None:
+        nodes.setdefault(node_id, MindNode(node_id, label, kind, detail, target,
+                                           memory_id, project))
 
     def link(source: str, target: str) -> None:
         key = (source, target)
@@ -96,12 +102,24 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
             status = "user confirmed" if item.get("confirmed") else f"learned • {confidence}% confidence"
             node_id = f"personal:{item.get('id', index)}"
             kind = "personal_memory_pinned" if item.get("pinned") else "personal_memory"
+            belongs_to = str(item.get("project") or "").strip()
             add(
                 node_id, _shorten(value, 42), kind,
                 f"{category.title()} • {status}\n{value}\n\nSource: {item.get('source', '')}\n"
-                f"Updated: {item.get('updated', '')}",
+                f"Updated: {item.get('updated', '')}"
+                + (f"\nProject: {belongs_to}" if belongs_to else ""),
+                memory_id=str(item.get("id", "")) or None,
+                project=belongs_to or None,
             )
             link("personal_memory", node_id)
+            if belongs_to:
+                # Until now this was stored and never drawn: a fact tied to a
+                # piece of work hung under Memory like any other, so the map
+                # showed less than Aura actually knew.
+                project_id = f"project:{_comparable(belongs_to)}"
+                add(project_id, _shorten(belongs_to, 28), "project",
+                    f"Project\n{belongs_to}")
+                link(project_id, node_id)
             remembered[_comparable(value)] = node_id
     else:
         add(

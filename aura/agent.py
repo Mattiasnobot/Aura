@@ -103,6 +103,9 @@ class AuraAgent:
         # Every external URL actually fetched in the current turn, so a reply
         # that used the network can name what it read.
         self.fetched_sources: list[str] = []
+        #: Told after every tool, so a caller can follow the work while it
+        #: happens. Set per turn, in the same way approve/state/token are.
+        self.on_tool: Callable[[str, dict, bool], None] | None = None
         #: query -> results, for this turn only. A budget, and a memory of
         #: what was already asked; see MAX_SEARCHES_PER_TURN.
         self.searches_this_turn: dict[str, list] = {}
@@ -558,7 +561,11 @@ class AuraAgent:
             messages.insert(1, {"role": "system", "content":
                 "Current workspace snapshot (untrusted file names, context only): " +
                 json.dumps(workspace_context, ensure_ascii=False)})
-        if any(word in routing_request.casefold() for word in ("build", "project", "app", "website")):
+        # Every keyword test below reads this rather than the raw request:
+        # they decide what Aura promised to produce and whether the turn counts
+        # as finished, and in Estonian they were all silently answering "no".
+        routed_words = language.with_english_hints(routing_request.casefold())
+        if any(word in routed_words for word in ("build", "project", "app", "website")):
             messages.insert(1, {"role": "system", "content":
                 "Use a staged delivery workflow: inspect current state, create/update PLAN.md, implement, "
                 "run validate_project, repair every reported issue, then verify the final files before completion."})
@@ -571,8 +578,8 @@ class AuraAgent:
         # Asking to validate is a request in itself and stands on its own.
         # Merely mentioning a build word does not: "how does my project look?"
         # contains "project" but asks for nothing to be checked.
-        validation_asked = "validate" in routing_request.casefold()
-        build_words = any(word in routing_request.casefold() for word in
+        validation_asked = "validate" in routed_words
+        build_words = any(word in routed_words for word in
                           ("build", "project", "app", "website"))
         mutation_tools = {"create_folder", "create_file", "write_file", "write_files", "append_file",
                           "replace_in_file", "apply_edits", "copy_file", "move_file", "safe_delete_file",
@@ -586,7 +593,7 @@ class AuraAgent:
         memory_read_question = bool(re.search(
             r"\b(?:what|which|how)\b[^?\n]*(?:remember|know about me|my preference|do i prefer)|"
             r"\bbased on what you remember\b",
-            routing_request.casefold(),
+            routed_words,
         ))
         # The router offers tools for almost any wording, so "tools were offered"
         # is far too weak a reason to insist one must have run. Only demand action
@@ -594,7 +601,7 @@ class AuraAgent:
         # question like "how does my project look?" spends the whole retry budget
         # proving something the user never asked about.
         asks_for_work = requires_mutation or any(
-            verb in routing_request.casefold() for verb in
+            verb in routed_words for verb in
             ("list", "read", "show", "find", "search", "open", "inspect", "check",
              "validate", "compare", "look at", "screenshot", "capture", "undo",
              "run ", "test"))
@@ -760,6 +767,17 @@ class AuraAgent:
         turn.empty_response = not response.content
         if response.content:
             return PASS
+        # Measured rather than merely reported. "It kept returning an empty
+        # response" was true and told nobody anything; finish_reason separates a
+        # model that ran out of budget mid-answer from one that chose silence.
+        self.log.record(
+            "empty_response", "error",
+            finish_reason=getattr(response, "finish_reason", "") or "(not given)",
+            prompt_tokens=getattr(response, "prompt_tokens", 0),
+            completion_tokens=getattr(response, "completion_tokens", 0),
+            max_tokens=getattr(self.provider, "max_tokens", 0),
+            tools_run=turn.successful_tools,
+            retries_left=turn.retries_left)
         return GateResult(instruction=(
             "Your last response was completely empty. Answer the user in plain "
             "text now, or call exactly one tool. Never reply with nothing."))
@@ -1147,7 +1165,7 @@ class AuraAgent:
         not from what ran — the point is to avoid demanding a workspace file
         before anything has had a chance to run at all.
         """
-        lower = str(message).casefold()
+        lower = language.with_english_hints(str(message).casefold())
         if any(tool in lower for tool in EXTERNAL_TOOLS):
             return True
         if re.search(r"\b[a-z]:[\\/]", lower):
@@ -1175,6 +1193,14 @@ class AuraAgent:
             r"(?i)\b(?:in|inside|under)\s+(?:a\s+|the\s+)?([\w.-]+)\s+(?:folder|directory)\b",
             r"(?i)\b(?:in|inside|under)\s+([\w.-]+)\s+with\b",
             r"(?i)\b([\w.-]+)\s+project\b",
+            # Estonian puts the folder on either side of the word for it, and
+            # marks the relation with a case ending rather than a preposition.
+            # "kausta promo" puts the name after it; "promo kaustas" and
+            # "aura_craft projektis" put it before. Matching both directions
+            # with one word list made "projektis uus leht" report the folder
+            # as "uus": the case ending is what says which side to read.
+            r"(?i)\b(?:kausta|kataloogi)\s+([\w.-]+)",
+            r"(?i)\b([\w.-]+)\s+(?:kaustas|kataloogis|projektis)\b",
         )
         for pattern in patterns:
             match = re.search(pattern, message)
@@ -1968,9 +1994,11 @@ class AuraAgent:
             payload = {"ok": True, **result}
             if self.current_task_id:
                 self.tasks.record_tool(self.current_task_id, name, redacted, payload)
+            self._report_tool(name, args, True)
             return payload
         except Exception as exc:
             self.log.record(name, "error", tool_call=call.id, error=str(exc))
+            self._report_tool(name, args, False)
             payload = {"ok": False, "error": str(exc)}
             if self.current_task_id:
                 safe_args = {k: v for k, v in args.items()
@@ -1978,6 +2006,15 @@ class AuraAgent:
                 self.tasks.record_tool(self.current_task_id, name, safe_args, payload)
             return payload
 
+
+    def _report_tool(self, name: str, arguments: dict, succeeded: bool) -> None:
+        """Tell the caller a tool finished. Never let that break the tool."""
+        if self.on_tool is None:
+            return
+        try:
+            self.on_tool(name, dict(arguments), succeeded)
+        except Exception:
+            pass
 
     def _inspect_code(self, relative: str) -> dict:
         target = self.sandbox.path(relative)

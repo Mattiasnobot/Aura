@@ -3985,6 +3985,142 @@ class RecurringCheckTests(unittest.TestCase):
         self.assertEqual(self.bridge.list_scheduled()["scheduled"], [])
 
 
+class MindRelationshipTests(unittest.TestCase):
+    """The one edge on the map the user owns.
+
+    Every other relationship in Aura Mind is derived from the data and cannot
+    honestly be edited. A memory's project is different: it comes from a guess
+    made when the fact was learned, it was never drawn, and it could not be
+    corrected.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.memory = MemoryStore(Path(self.temp.name) / "memory.json")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_a_project_can_be_set_corrected_and_detached(self):
+        fact = self.memory.learn_fact("goal", "ship the promo site", source="test")
+        self.assertIsNone(fact.get("project"))
+        self.assertEqual(
+            self.memory.update_profile_memory(fact["id"], project="promo")["project"], "promo")
+        self.assertEqual(
+            self.memory.update_profile_memory(fact["id"], project="shop")["project"], "shop")
+        # Detaching has to be as easy as linking: a wrong link is worse than none.
+        self.assertIsNone(self.memory.update_profile_memory(fact["id"], project="")["project"])
+
+    def test_an_ordinary_edit_leaves_the_project_alone(self):
+        fact = self.memory.learn_fact("goal", "ship the promo site", source="test")
+        self.memory.update_profile_memory(fact["id"], project="promo")
+        edited = self.memory.update_profile_memory(fact["id"], value="ship the promo site today")
+        self.assertEqual(edited["project"], "promo")
+
+    def test_the_project_is_actually_drawn(self):
+        """It was stored and never shown, so the map knew less than Aura did."""
+        memory = {"profile_memories": [
+            {"id": "m1", "category": "goal", "value": "ship the promo site",
+             "confirmed": True, "project": "promo"},
+            {"id": "m2", "category": "preference", "value": "dark backgrounds",
+             "confirmed": True},
+        ]}
+        nodes, edges = build_mind_graph(memory, [], [])
+        by_id = {node.node_id: node for node in nodes}
+        self.assertIn("project:promo", by_id)
+        self.assertIn(("project:promo", "personal:m1"), [(e.source, e.target) for e in edges])
+        self.assertEqual(by_id["personal:m1"].memory_id, "m1")
+        self.assertEqual(by_id["personal:m1"].project, "promo")
+        # A memory with no project gains no edge and no phantom node.
+        self.assertIsNone(by_id["personal:m2"].project)
+
+    def test_only_memory_nodes_offer_editing(self):
+        """Offering to edit a derived edge would be a lie about what happens."""
+        memory = {"profile_memories": [
+            {"id": "m1", "category": "goal", "value": "ship it", "confirmed": True,
+             "project": "promo"}]}
+        nodes, _edges = build_mind_graph(memory, [], ["promo/index.html"])
+        for node in nodes:
+            if node.kind not in {"personal_memory", "personal_memory_pinned"}:
+                self.assertIsNone(node.memory_id, node.node_id)
+
+
+class LivePlanTests(unittest.TestCase):
+    """An approved plan used to be shown once and then vanish.
+
+    While the build ran there was a spinner and a log, and no answer to "how far
+    along is this?".
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        agent.config.update(default_checks_seeded=True)
+        self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+        self.bridge.scheduler.stop()
+        self.events = []
+        self.bridge._push = lambda kind, **payload: self.events.append({"type": kind, **payload})
+
+    def tearDown(self):
+        self.bridge.shutdown()
+        self.temp.cleanup()
+
+    def kinds(self, name):
+        return [event for event in self.events if event["type"] == name]
+
+    def test_approving_a_plan_puts_it_on_screen(self):
+        self.bridge._start_plan("- promo/index.html - the landing page\n"
+                                "- promo/style.css - the styles")
+        started = self.kinds("plan_started")
+        self.assertEqual(len(started), 1)
+        self.assertEqual([step["path"] for step in started[0]["steps"]],
+                         ["promo/index.html", "promo/style.css"])
+        self.assertTrue(all(not step["done"] for step in started[0]["steps"]))
+
+    def test_a_step_ticks_only_when_the_file_was_really_written(self):
+        """Ticking on intention rather than on result is worse than no plan."""
+        self.bridge._start_plan("- promo/index.html - the landing page\n"
+                                "- promo/style.css - the styles")
+        # Reading it proves nothing.
+        self.bridge._on_tool("read_file", {"path": "promo/index.html"}, True)
+        self.assertEqual(self.kinds("plan_progress"), [])
+        # A failed write proves nothing either.
+        self.bridge._on_tool("create_file", {"path": "promo/index.html"}, False)
+        self.assertEqual(self.kinds("plan_progress"), [])
+
+        self.bridge._on_tool("create_file", {"path": "promo/index.html"}, True)
+        progress = self.kinds("plan_progress")
+        self.assertEqual(len(progress), 1)
+        self.assertEqual(progress[-1]["done"], 1)
+        self.assertEqual(progress[-1]["total"], 2)
+
+    def test_a_batch_write_ticks_every_file_it_wrote(self):
+        self.bridge._start_plan("- a.html - one\n- b.css - two")
+        self.bridge._on_tool("write_files", {"files": [{"path": "a.html"}, {"path": "b.css"}]}, True)
+        self.assertEqual(self.kinds("plan_progress")[-1]["done"], 2)
+
+    def test_the_same_file_twice_does_not_tick_twice(self):
+        self.bridge._start_plan("- a.html - one\n- b.css - two")
+        self.bridge._on_tool("create_file", {"path": "a.html"}, True)
+        self.bridge._on_tool("write_file", {"path": "a.html"}, True)
+        self.assertEqual(len(self.kinds("plan_progress")), 1)
+
+    def test_tool_activity_without_a_plan_is_ignored(self):
+        self.bridge._on_tool("create_file", {"path": "a.html"}, True)
+        self.assertEqual(self.kinds("plan_progress"), [])
+
+    def test_a_reporting_failure_never_breaks_the_tool(self):
+        """The callback is a convenience; a tool must not fail because of it."""
+        agent = self.bridge.agent
+        agent.on_tool = lambda *_args: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            result = agent._execute_tool(
+                ToolCall("1", "list_files", {"path": "."}), None)
+            self.assertTrue(result["ok"])
+        finally:
+            agent.on_tool = None
+
+
 class BilingualSpeechTests(unittest.TestCase):
     """Aura answers in two languages and had one voice for both.
 
@@ -4030,9 +4166,46 @@ class BilingualSpeechTests(unittest.TestCase):
         self.assertEqual(language.detect("The workspace has 10 files", default="et"), "en")
         self.assertEqual(language.detect("Kõik on tehtud", default="en"), "et")
 
-    def test_an_estonian_letter_settles_it_on_its_own(self):
-        for letter in "õäöüšž":
+    def test_only_the_letters_estonian_owns_settle_it(self):
+        """The first version of this test asserted the wrong thing.
+
+        It treated every dotted letter as proof of Estonian, but `ä`, `ö` and
+        `ü` are shared with Finnish — which is exactly where the model drifts
+        when it is asked in Estonian, so those letters were confirming the
+        mistake rather than catching it.
+        """
+        for letter in "õšž":
             self.assertEqual(language.detect(f"x{letter}x", default="en"), "et", letter)
+        for shared in "äöü":
+            self.assertEqual(language.detect(f"x{shared}x", default="en"), "en", shared)
+
+    def test_a_finnish_reply_is_named_rather_than_relabelled(self):
+        """Finnish is neither answer `detect` gives, so it gets its own question.
+
+        Folding it into "et" is how a wrong-language reply becomes invisible.
+        """
+        self.assertTrue(language.looks_finnish(
+            "Valmis! Kaikki kolme tiedostoa luotiin onnistuneesti"))
+        self.assertTrue(language.looks_finnish("perus CSS-tyylit sivuille, joka on tehty"))
+        # One borrowed word proves nothing: "voi" and "niin" occur in Estonian.
+        self.assertFalse(language.looks_finnish("Ma ei saa voi seda teha"))
+        self.assertFalse(language.looks_finnish("Tööruumis on 10 faili"))
+        self.assertFalse(language.looks_finnish("The workspace has 10 files"))
+
+    def test_the_reply_language_is_stated_in_the_prompt(self):
+        """Nothing had ever said which language to answer in."""
+        provider = LMStudioProvider("http://127.0.0.1:1234/v1")
+        context = ProviderContext(name="", preferences={}, recent_messages=[])
+        def rule_for(message):
+            return next((item["content"] for item in provider.start_messages(message, context)
+                         if item["role"] == "system" and "writing in" in item["content"]), "")
+        estonian = rule_for("Tee mulle veebileht")
+        self.assertIn("Estonian", estonian)
+        # Naming the specific drift is the point: a small model asked in
+        # Estonian answers in Finnish, and saying so helps it more than a
+        # general instruction does.
+        self.assertIn("Finnish", estonian)
+        self.assertIn("English", rule_for("Make me a web page"))
 
     # ------------------------------------------------------- picking a voice
 
@@ -4149,6 +4322,72 @@ class EstonianRoutingTests(unittest.TestCase):
                 if word.startswith(stem.strip()) and word not in language.ENGLISH_LOOKALIKES:
                     collisions.append((stem, hint, word))
         self.assertEqual(collisions, [], f"Estonian stems firing on English: {collisions}")
+
+    # ------------------------------------------- what the turn is held to
+
+    #: These decide what Aura promised to produce and whether the turn counts as
+    #: finished. Measured before the fix: ten ordinary requests differed from
+    #: their English translations in thirteen of these fields.
+    CONTRACT_PAIRS = (
+        ("Ehita mulle veebileht kausta promo", "Build me a website in the promo folder"),
+        ("Tee aura_craft projektis uus leht", "Make a new page in the aura_craft project"),
+        ("Valideeri projekt ja paranda vead", "Validate the project and fix the issues"),
+        ("Loe fail notes.txt ette", "Read the file notes.txt"),
+        ("Näita, mis failid tööruumis on", "Show me what files are in the workspace"),
+        ("Otsi failidest sõna TODO", "Search the files for the word TODO"),
+        ("Võrdle neid kahte faili", "Compare those two files"),
+        ("Kontrolli, kas kõik lingid töötavad", "Check whether all links work"),
+        ("Loe fail väljaspool tööruumi", "Read a file outside the workspace"),
+    )
+
+    WORK_VERBS = ("list", "read", "show", "find", "search", "open", "inspect", "check",
+                  "validate", "compare", "look at", "screenshot", "capture", "undo",
+                  "run ", "test")
+
+    def contract(self, message):
+        annotated = language.with_english_hints(message.casefold())
+        base, _paths = AuraAgent._extract_artifact_contract(message)
+        return {
+            "staged": any(w in annotated for w in ("build", "project", "app", "website")),
+            "validation_asked": "validate" in annotated,
+            "asks_for_work": (AuraAgent._requires_mutation(message)
+                              or any(v in annotated for v in self.WORK_VERBS)),
+            "external": AuraAgent._targets_external_location(message),
+            "base": base,
+        }
+
+    def test_estonian_is_held_to_the_same_contract_as_english(self):
+        for estonian, english in self.CONTRACT_PAIRS:
+            with self.subTest(request=estonian):
+                self.assertEqual(self.contract(estonian), self.contract(english))
+
+    def test_an_estonian_read_request_still_has_to_actually_read(self):
+        """The worst of the thirteen, and the quietest.
+
+        `asks_for_work` false means `action_expected` false, so the gate that
+        insists a tool actually ran never fires: Aura could answer "loe see
+        fail" without opening it and nothing would object.
+        """
+        for request in ("Loe fail notes.txt ette", "Näita, mis failid tööruumis on",
+                        "Otsi failidest sõna TODO", "Võrdle neid kahte faili"):
+            self.assertTrue(self.contract(request)["asks_for_work"], request)
+
+    def test_the_folder_is_read_off_the_right_side_of_the_word(self):
+        """Estonian marks the relation with a case ending, not a preposition.
+
+        One word list for both directions made "projektis uus leht" report the
+        folder as "uus" — the word that merely came next.
+        """
+        self.assertEqual(AuraAgent._extract_artifact_contract("Ehita leht kausta promo")[0],
+                         "promo")
+        self.assertEqual(AuraAgent._extract_artifact_contract("Tee aura_craft projektis uus leht")[0],
+                         "aura_craft")
+        self.assertEqual(AuraAgent._extract_artifact_contract("Vaata promo kaustas ringi")[0],
+                         "promo")
+
+    def test_a_granted_folder_is_recognised_in_estonian_too(self):
+        self.assertTrue(AuraAgent._targets_external_location("Loe fail väljaspool tööruumi"))
+        self.assertFalse(AuraAgent._targets_external_location("Loe fail notes.txt"))
 
     # ------------------------------------------------------------- refusals
 

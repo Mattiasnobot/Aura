@@ -5,6 +5,8 @@ from .errors import AuraError
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import json
+
+from . import language
 import os
 from typing import Callable
 from urllib.error import HTTPError, URLError
@@ -31,6 +33,12 @@ class ToolCall:
 class ProviderReply:
     content: str
     tool_calls: list[ToolCall]
+    #: Why the model stopped. "length" means it ran out of budget mid-answer,
+    #: which is a different problem from a model that chose to say nothing —
+    #: and an empty reply used to be reported without ever asking which it was.
+    finish_reason: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 class Provider(ABC):
@@ -183,8 +191,27 @@ class LMStudioProvider(Provider):
         self.model = (chat_models or models)[0]
         return self.model
 
+    #: Named because naming it works. A 9B model asked in Estonian drifts into
+    #: Finnish — the languages are close and Finnish is far better represented in
+    #: training data — and the observed failure was a whole reply in Finnish:
+    #: "Valmis! Kaikki kolme tiedostoa luotiin onnistuneesti". Nothing in the
+    #: prompt had ever said which language to answer in.
+    LANGUAGE_RULE = {
+        "et": ("The user is writing in Estonian. Reply in Estonian. Do not answer in "
+               "Finnish, Russian, or English, and do not mix languages — Finnish is "
+               "close to Estonian and is the mistake to avoid. File paths, code, and "
+               "tool names stay exactly as they are."),
+        "en": ("The user is writing in English. Reply in English, and do not switch "
+               "to another language."),
+    }
+
     def start_messages(self, message: str, context: ProviderContext) -> list[dict]:
         messages: list[dict] = [{"role": "system", "content": self.SYSTEM_PROMPT}]
+        # Every path into the model goes through here, including the file plan,
+        # whose descriptions came back in Finnish for the same reason.
+        rule = self.LANGUAGE_RULE.get(language.detect(message))
+        if rule:
+            messages.append({"role": "system", "content": rule})
         if context.name or context.preferences:
             profile = {"name": context.name, "preferences": context.preferences}
             messages.append({"role": "system", "content": f"Remembered user profile: {json.dumps(profile)}"})
@@ -289,6 +316,8 @@ class LMStudioProvider(Provider):
             message = result["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderError("LM Studio returned no assistant message.") from exc
+        finish_reason = str((result.get("choices") or [{}])[0].get("finish_reason") or "")
+        usage = result.get("usage") or {}
         content = message.get("content") or ""
         if not content.strip():
             # Reasoning models put their visible answer in reasoning_content and
@@ -307,7 +336,9 @@ class LMStudioProvider(Provider):
                                       str(function["name"]), arguments))
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ProviderError(f"LM Studio returned an invalid tool call: {exc}") from exc
-        return ProviderReply(str(content).strip(), calls)
+        return ProviderReply(str(content).strip(), calls, finish_reason,
+                             int(usage.get("prompt_tokens") or 0),
+                             int(usage.get("completion_tokens") or 0))
 
     def _stream_completion(self, payload: dict, on_token: Callable[[str], None]) -> ProviderReply:
         request = Request(

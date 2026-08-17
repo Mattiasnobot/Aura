@@ -347,7 +347,8 @@ class MemoryStore:
             return [{**item, "recall_reason": reason} for _, reason, item in chosen]
 
     def update_profile_memory(self, memory_id: str, *, value: str | None = None,
-                              category: str | None = None, pinned: bool | None = None) -> dict:
+                              category: str | None = None, pinned: bool | None = None,
+                              project: str | None = None) -> dict:
         with self._lock:
             item = next((entry for entry in self.data["profile_memories"]
                          if entry.get("id") == str(memory_id)), None)
@@ -376,6 +377,13 @@ class MemoryStore:
                          "last_confirmed": self._now()})
             if pinned is not None:
                 item["pinned"] = bool(pinned)
+            if project is not None:
+                # The only relationship in the graph the user owns: every other
+                # edge is derived, while this one comes from a guess made when
+                # the fact was learned. An empty string detaches it, which has
+                # to stay possible — a wrong link is worse than no link.
+                cleaned = " ".join(str(project).split())[:80]
+                item["project"] = cleaned or None
             self.save()
             return dict(item)
 

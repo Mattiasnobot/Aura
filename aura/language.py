@@ -163,6 +163,9 @@ ESTONIAN_HINTS: tuple[tuple[str, str], ...] = (
     ("kettaruum", "disk space"),
     ("süsteemi", "system info"),
     # what she can do
+    ("mida", "what"),
+    ("kuidas", "how"),
+    ("milline", "which"),
     ("mida sa oskad", "what can you do"),
     ("mis sa oskad", "what can you do"),
     ("sinu tööriistad", "your tools"),
@@ -231,6 +234,24 @@ def with_english_hints(message: str) -> str:
     return _CLAUSE.sub(annotate, text)
 
 
+def looks_finnish(message: str) -> bool:
+    """Did the model answer in Finnish?
+
+    Worth its own question rather than being folded into `detect`. Finnish is
+    neither of the two answers `detect` gives, and quietly relabelling it as one
+    of them is how a wrong-language reply becomes invisible. Asked in Estonian,
+    a 9B model produced "Valmis! Kaikki kolme tiedostoa luotiin onnistuneesti" —
+    which is worth saying out loud, not smoothing over.
+    """
+    words = [word.casefold() for word in _WORDS.findall(str(message or ""))]
+    if not words:
+        return False
+    hits = sum(word in FINNISH_MARKERS for word in words)
+    # Two, because a single borrowed word proves nothing: "voi" and "niin" turn
+    # up in Estonian text too.
+    return hits >= 2
+
+
 def looks_estonian(message: str) -> bool:
     """A cheap check, used only for reporting and tests."""
     return any(pattern.search(str(message or "")) for pattern, _ in _PATTERNS)
@@ -238,8 +259,21 @@ def looks_estonian(message: str) -> bool:
 
 # --------------------------------------------------------------- which language
 
-#: Estonian letters that no English word carries. One is enough to decide.
-ESTONIAN_LETTERS = frozenset("õäöüšž")
+#: Only these three are Estonian's alone. `ä`, `ö` and `ü` are shared with
+#: Finnish and German, and treating them as proof is what made a Finnish reply
+#: come back labelled Estonian.
+ESTONIAN_LETTERS = frozenset("õšž")
+
+#: Suggest "not English" and nothing more.
+SHARED_LETTERS = frozenset("äöü")
+
+#: Unmistakably Finnish, and worth naming because Finnish is exactly where a
+#: small model drifts when it is asked in Estonian. Chosen so that none is also
+#: an Estonian word.
+FINNISH_MARKERS = frozenset("""
+että kaikki tämä tässä myös sekä kanssa niin mutta kuin voi ovat olla sitten
+onnistuneesti tiedosto tiedostoa luotiin valmiina käyttää tehty joka jotka
+""".split())
 
 #: Short, extremely common Estonian words. Deliberately function words rather
 #: than topic words: a reply about files is full of English filenames either
@@ -285,10 +319,13 @@ def detect(text: str, default: str = "en") -> str:
     body = str(text or "")
     if not body.strip():
         return "en"
-    # One of these letters settles it: no English word carries them.
-    if ESTONIAN_LETTERS & set(body.casefold()):
-        return "et"
+    lowered = body.casefold()
     words = [word.casefold() for word in _WORDS.findall(body)]
+    # These three letters are Estonian's alone and settle it. `ä`, `ö` and `ü`
+    # do not: they are shared with Finnish, which is exactly where a small model
+    # drifts when it is asked in Estonian.
+    if ESTONIAN_LETTERS & set(lowered):
+        return "et"
     estonian = sum(word in _ESTONIAN_ONLY for word in words)
     english = sum(word in _ENGLISH_ONLY for word in words)
     if estonian != english:
@@ -297,5 +334,9 @@ def detect(text: str, default: str = "en") -> str:
     # special letter. The routing vocabulary already knows a hundred Estonian
     # stems, so ask it rather than inventing a second list.
     if looks_estonian(body):
+        return "et"
+    # ä/ö/ü say "not English" without saying which language, so they only break
+    # a tie rather than deciding one.
+    if SHARED_LETTERS & set(lowered) and default == "et":
         return "et"
     return default if default in {"et", "en"} else "en"
