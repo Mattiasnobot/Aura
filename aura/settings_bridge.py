@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 import threading
 
+from . import search_service
+from . import websearch
 from .provider import LMStudioProvider
 
 
@@ -36,7 +38,8 @@ class SettingsBridge:
             "voice_engine", "voice_device", "voice_language", "voice_calibration_ms",
             "voice_silence_ms", "voice_max_seconds", "voice_noise_floor",
             "whisper_cpp_path", "whisper_model_path",
-            "avatar_motion", "avatar_intensity", "avatar_quality",
+            "avatar_motion", "avatar_intensity", "avatar_quality", "search_endpoint",
+            "search_install_path", "search_mode",
         )}
 
     def save_settings(self, values: dict) -> dict:
@@ -62,6 +65,9 @@ class SettingsBridge:
             avatar_motion = str(values.get("avatar_motion", "natural"))
             avatar_intensity = int(values.get("avatar_intensity", 65))
             avatar_quality = str(values.get("avatar_quality", "auto"))
+            search_endpoint = str(values.get("search_endpoint", "")).strip().rstrip("/")
+            search_install_path = str(values.get("search_install_path", "")).strip()
+            search_mode = str(values.get("search_mode", "off")).strip().casefold()
             reasoning_depth = str(values.get("reasoning_depth", "deep"))
             autonomy_mode = str(values.get("autonomy_mode", "powerful"))
             vision_mode = str(values.get("vision_mode", "auto")).casefold()
@@ -100,6 +106,27 @@ class SettingsBridge:
                 raise ValueError("Avatar intensity must be between 0 and 100.")
             if avatar_quality not in {"auto", "high", "low"}:
                 raise ValueError("Avatar quality must be automatic, high, or low.")
+            if search_endpoint:
+                # Empty is a real setting: it means search is off. Anything else
+                # has to be an address Aura could actually use, checked here so
+                # the mistake surfaces on save rather than mid-question.
+                try:
+                    search_endpoint = websearch.endpoint_of(search_endpoint)
+                except websearch.SearchUnavailable as exc:
+                    raise ValueError(str(exc)) from exc
+            if search_mode not in {"off", "docker", "folder"}:
+                raise ValueError("Search must be off, Docker, or a folder.")
+            if search_mode == "folder" and not search_install_path:
+                raise ValueError("Choose the SearXNG folder, or pick a different search mode.")
+            if search_install_path:
+                # Checked on save so a wrong folder is a message here rather
+                # than a service that quietly never comes up next launch.
+                try:
+                    search_service.find_install(search_install_path)
+                except search_service.SearchServiceError as exc:
+                    raise ValueError(str(exc)) from exc
+            if len(search_install_path) > 500:
+                raise ValueError("That folder path is too long.")
             if reasoning_depth not in {"fast", "balanced", "deep"}:
                 raise ValueError("Reasoning depth must be fast, balanced, or deep.")
             if autonomy_mode not in {"careful", "balanced", "powerful"}:
@@ -134,7 +161,9 @@ class SettingsBridge:
                 voice_noise_floor=voice_noise_floor, whisper_cpp_path=whisper_cpp_path,
                 whisper_model_path=whisper_model_path,
                 avatar_motion=avatar_motion, avatar_intensity=avatar_intensity,
-                avatar_quality=avatar_quality,
+                avatar_quality=avatar_quality, search_endpoint=search_endpoint,
+                search_install_path=search_install_path,
+                search_mode=search_mode,
             )
             self.agent.set_provider(provider)
             self.speech.configure(

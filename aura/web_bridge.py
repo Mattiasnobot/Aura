@@ -5,6 +5,7 @@ import platform
 import sqlite3
 from collections import deque
 import queue
+from pathlib import Path
 import threading
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,7 @@ from .agent import AuraAgent
 from .graph_model import build_mind_graph
 from .preview_server import PreviewServer
 from .scheduler import Scheduler
+from .search_service import SearchService, SearchServiceError
 from .speech import SpeechOutput
 from .voice import VoiceInput
 from .memory_bridge import MemoryBridge
@@ -83,6 +85,46 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         self.scheduler.register("check", self._run_check)
         self._seed_default_checks()
         self.scheduler.start()
+        self.search_service = SearchService(self.agent.log)
+        self._start_search_service()
+
+    def _start_search_service(self) -> None:
+        """Bring search up with Aura, without ever letting it hold up the start.
+
+        A search engine that fails to launch is a reason to say so, never a
+        reason for Aura not to open. Every failure here is recorded and shown in
+        Settings, and Aura carries on with search switched off.
+        """
+        config = self.agent.config.data
+        mode = str(config.get("search_mode", "off"))
+        if mode not in {"docker", "folder"}:
+            return
+
+        def bring_up() -> None:
+            try:
+                if mode == "docker":
+                    status = self.search_service.start_docker(
+                        Path(self.agent.sandbox.root) / ".aura" / "searxng")
+                else:
+                    status = self.search_service.start_native(
+                        config.get("search_install_path"))
+            except SearchServiceError as exc:
+                # Not fatal, and not silent: the setting the user changed is
+                # exactly where the reason belongs.
+                self._push("search_service", running=False, error=str(exc))
+                return
+            if not str(config.get("search_endpoint") or "").strip():
+                # Starting the engine and leaving search switched off would be a
+                # running process nothing uses.
+                self.agent.config.update(search_endpoint=status["endpoint"])
+            self._push("search_service", running=True, endpoint=status["endpoint"])
+
+        # Off the startup path: SearXNG takes tens of seconds to answer the
+        # first time, and the interface must not wait for it.
+        threading.Thread(target=bring_up, daemon=True, name="aura-search-start").start()
+
+    def search_service_status(self) -> dict:
+        return {"ok": True, **self.search_service.status()}
 
     def _deliver_reminder(self, task: dict) -> str:
         """Say the reminder, in the conversation, as Aura.
@@ -756,4 +798,5 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         self.speech.stop()
         self.voice.stop()
         self.preview_server.stop_if_running()
+        self.search_service.stop()
         self._deny_pending_approvals()

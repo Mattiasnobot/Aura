@@ -168,7 +168,35 @@ This checks Python, the local HTML service and assets, the LM Studio server, and
 
 Optional capabilities that live outside this machine are declared in `aura/services.py`. A service names the tool the model sees, the domains it needs, and a handler that receives a fetch already bound to the `reach_domain` check — so it cannot open its own connection or reach past what you granted. Adding one means writing a module and calling `register()`; the tool list and the tool loop stay untouched.
 
-The one shipped service is keyless weather via Open-Meteo. Grant `geocoding-api.open-meteo.com` and `api.open-meteo.com` under **Permissions** and Aura can answer "what is the weather in Tartu right now?", citing both addresses she read. Until then the tool exists but refuses, naming the domains it would need. There is no general web search: that requires a third-party API key, and Aura holds no credentials.
+The one shipped service is keyless weather via Open-Meteo. Grant `geocoding-api.open-meteo.com` and `api.open-meteo.com` under **Permissions** and Aura can answer "what is the weather in Tartu right now?", citing both addresses she read. Until then the tool exists but refuses, naming the domains it would need.
+
+### Web search
+
+Aura still holds no search credentials. What she can do is read a [SearXNG](https://docs.searxng.org/) you run yourself: put its address in **Settings → Search** (empty means search is off) and `search_web` reads its results. Because SearXNG's own default is HTML only, add `json` under `search: formats:` in its `settings.yml` — if you forget, Aura says exactly that rather than "unreadable response".
+
+Three things are worth knowing about how this is built:
+
+- **Snippets only.** Aura reads titles, links, and the excerpt the engine produced, and never opens a result page. That is not a promise she keeps but a property of the permission model: a result URL is a domain you have not granted, so fetching it is refused like any other. A test asserts it.
+- **She does not claim to have read what she links to.** The tool result says so in as many words, because a reply that upgrades "a snippet said" into "I read that page" is a small lie that compounds.
+- **Five searches per turn.** A read-only tool costs nothing per call, which is why nothing stops it: the first live run produced twelve near-identical searches for one question. After the fifth, the tool tells the model to answer from what it already has.
+
+Search runs on a loopback address, so it needs no domain grant — the service is one you started on your own machine. Pointing it at a public instance instead works too, and then the ordinary grant applies.
+
+#### Aura starting SearXNG for you
+
+SearXNG is not bundled: it is a Flask application with a large dependency tree, and Aura's core is standard library only. What Aura does own is its **lifecycle**. Give it the folder in **Settings → Search**, leave *Start the search engine when Aura starts* on, and Aura launches SearXNG on startup, waits until it actually answers, and stops it when you quit.
+
+Owning the lifecycle removes the two things that otherwise fail quietly. Aura writes its own `aura-settings.yml` on every launch — never touching your `settings.yml` — so `json` is always among the formats, and `bind_address` is always `127.0.0.1`, because an engine you started for yourself should not answer the rest of the network.
+
+If something is already listening on the port, Aura **adopts** it: it reads that instance and does not stop it on the way out, since it did not start it.
+
+**Windows needs Docker.** SearXNG's `searx/valkeydb.py` imports `pwd`, a Unix-only module, so it does not import natively on Windows at all — a `pip install` there produces a service that cannot start. Aura says exactly this in Settings rather than reporting a missing package.
+
+Set **Search engine** to *Docker* and Aura runs the official `searxng/searxng` image itself: it writes the mounted settings, starts the container on launch, waits until it answers, and removes it when you quit. The port is published to `127.0.0.1` only, never `0.0.0.0`, so the engine answers this machine and nothing else. The image is **not** downloaded automatically — if it is missing, Aura tells you to run `docker pull searxng/searxng` once, because fetching a few hundred megabytes unasked is not a chat window's decision.
+
+Docker Desktop installs per-user and often leaves `docker` off `PATH`; Aura looks in its usual per-user location too, so "not on PATH" does not mean "not installed".
+
+A failing engine never blocks Aura: startup happens on its own thread, the reason appears under **Settings → Search**, and Aura opens normally with search switched off.
 
 ## Packaging
 

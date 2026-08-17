@@ -29,6 +29,15 @@ DEFAULTS = {
     # Recorded once, so a default check the user switches off never
     # comes back on the next launch.
     "default_checks_seeded": False,
+    # Empty means search is off. Aura holds no search credentials and never
+    # has; what this points at is a service the user started themselves.
+    "search_endpoint": "",
+    # The SearXNG checkout Aura starts alongside itself. Empty means Aura
+    # starts nothing and only reads whatever the user runs themselves.
+    "search_install_path": "",
+    # off | docker | folder. Docker is the only route that works on Windows,
+    # where SearXNG cannot run natively at all.
+    "search_mode": "off",
     "speak_responses": False,
     "speech_engine": "piper",
     "speech_model": "aura-voices/en_US-lessac-medium.onnx",

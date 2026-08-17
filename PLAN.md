@@ -807,3 +807,112 @@ happened while Aura and a headless browser were also running, which points at a 
 sensitivity in one of the browser- or port-dependent tests rather than a logic fault —
 but that is a hypothesis, not a finding. If it recurs, capture it with
 `python -m unittest discover -v > run.log 2>&1` and grep the log for `ERROR:`/`FAIL:`.
+
+
+## Web search, on the user's own terms — 2026-08-17
+
+Aura had no search at all, and the stated reason was honest: a general engine means an API
+key, and she holds no credentials. **A SearXNG the user runs answers that without changing
+the answer** — the index belongs to a service on their own machine, and Aura only reads it.
+
+- **`aura/websearch.py`** builds the query, parses the JSON, and cleans the results. It opens
+  no socket of its own: the caller passes in a fetch that has already been through the
+  permission checks.
+- **Snippets only, and not by promise.** The tool returns titles, links, and the engine's own
+  excerpt, and never opens a result page — because a result URL is an ungranted domain, so
+  `_http_get` refuses it. A test performs the fetch and asserts the refusal, which is the
+  difference between a rule the code remembers and a property it cannot violate.
+- **She does not claim to have read what she links to.** `NOT_READ` says so inside the tool
+  result. The citation is the search itself, which she did read; the pages behind the links
+  are not cited, because she did not open them.
+- **Loopback needs no grant**, which is pre-existing and is exactly right here: the service is
+  one the user started. Pointing it at a public instance works too, and then the ordinary
+  domain grant applies without any special case.
+- **The failure that will actually happen has its own message.** SearXNG serves HTML only by
+  default, so the first attempt returns a web page. Saying "unreadable response" would send
+  the user hunting in the wrong place; it names `settings.yml` and `search: formats:` instead.
+
+**Two bugs the live run found, neither of which any unit test would have.**
+
+1. **The tool existed and was never offered.** `select_tool_definitions` routes on English
+   keywords, and `search_web` was in none of them, so Aura answered *"Ma ei saa otse veebis
+   lehitada"* — **true of that turn and false of her** — and then invented plausible Estonian
+   sources that were in no result. The reply was honest about a capability it had been denied.
+   Fixed with a routing rule including Estonian (`veebist`, `internetist`, `netist`,
+   `guugelda`), following the `ilm`/`meelde` precedent already in that function. Worth saying
+   plainly: **that router is English-only apart from a handful of words, and the user writes in
+   Estonian.** This fixed search; it did not fix the router.
+2. **No budget, so twelve searches for one question.** Once routing worked, the model
+   rephrased the same query twelve times before the turn budget ran out. A read-only tool
+   costs nothing per call, which is precisely why nothing stops it. `MAX_SEARCHES_PER_TURN = 5`,
+   and an identical query returns the previous results without spending the budget or asking
+   the engine again.
+
+**Verified live**, against a stand-in SearXNG on localhost because none was installed: the
+Settings field rejected `not a url` and stored a real one; Aura called the tool, summarised
+the three snippets correctly in Estonian, invented nothing, and cited the one address she read.
+**What that run did not prove:** the budget never engaged, because the model made a single
+search that time — the cap is covered by tests, not by having been seen to fire live. And a
+stand-in is not a real engine, so the JSON quirks of an actual SearXNG remain untested.
+
+## Aura starts the search engine — 2026-08-17
+
+"Can we integrate SearXNG into Aura, so that starting Aura starts the search server too?"
+
+**The honest half of the answer first: SearXNG cannot go inside Aura.** It is a Flask
+application with roughly twenty dependencies, and a standard-library-only core is the promise
+the whole project is built on. What *can* be owned is its **lifecycle**, which turns out to be
+where the real value was anyway.
+
+- **`aura/search_service.py`** finds the install, writes its settings, starts it, waits until
+  the port actually answers, and stops it when Aura quits. Waiting matters: returning early
+  would hand back a working-looking setting and a first search that fails.
+- **Aura writes the settings file, so the two silent failures cannot happen.** `json` is always
+  in `formats` — without it SearXNG answers every request with a web page — and `bind_address`
+  is always `127.0.0.1`. It is Aura's own `aura-settings.yml`, regenerated each launch, never
+  an edit of the user's `settings.yml`; a test writes theirs and asserts it is untouched.
+- **An instance it did not start, it does not stop.** If the port already answers, the service
+  is adopted: read, used, and left running on the way out.
+- **A fixed command shape.** The user configures *where* SearXNG is, never *what runs*. There
+  is no tool for the path, for starting, or for stopping — a component that launches a program
+  is the last thing the model may aim, and a test asserts no such tool exists.
+- **Failure never blocks startup.** Bring-up is on its own thread, the reason lands under
+  Settings, and Aura opens with search off.
+
+**What the live run settled, and it is the important part: SearXNG does not run on Windows.**
+The install went through — after two Windows-specific detours, a `searxng.conf:socket` filename
+NTFS cannot represent, and a `setup.py` that imports the package it is building — and then the
+process died on import: `searx/valkeydb.py` imports `pwd`, which is Unix-only. This is not a
+configuration problem and no flag fixes it. Docker or WSL is the only route, and neither is
+installed on this machine.
+
+So the native supervisor is verified in every part that can be verified here: it found the
+install, wrote correct settings, launched the process, caught the immediate death, and reported
+it. It has never been seen to bring a real *native* SearXNG up, because nothing on this machine
+can run one.
+
+**Then Docker Desktop was installed, and the rest was finished properly.** `search_mode` is now
+`off` / `docker` / `folder`, and the Docker route does the whole job on Windows:
+
+- Aura writes the settings mounted into the container, because the image carries its own
+  `settings.yml` — the same JSON trap as a native install, one directory further away.
+- The port is published as `127.0.0.1:8888:8080`, never a bare `-p`. That single flag is what
+  decides whether a private search engine is private, so a test asserts it.
+- The image is never pulled automatically. A few hundred megabytes fetched unasked is not
+  something a chat window decides; Aura names the `docker pull` command instead.
+- **`docker` was not on PATH although Docker Desktop was installed and running** — it lives
+  under `%LOCALAPPDATA%\Programs\DockerDesktop`. `find_docker` looks there too, because
+  "absent from PATH" would otherwise be reported as "Docker is not installed", which was false.
+
+**Verified live, end to end, against the real engine.** With the manual container removed and
+port 8888 closed, Aura was restarted: it started the container itself, filled in its own
+endpoint, and answered *"Eesti pealinn on Tallinn. Rahvaarv on ligi 452 563 elanikku (andmed
+2026. aastast)"* citing the search it read. The figure was then checked against the engine's
+own output — it appears verbatim in a Vikipeedia snippet, year included, so nothing was
+invented. Quitting Aura removed the container: `docker ps -a` shows no `aura-searxng`.
+
+Two smaller things the same run exposed, both invisible to unit tests: SearXNG colours its log
+output, so terminal escape codes arrived intact in the settings panel; and the raw
+`ModuleNotFoundError: No module named 'pwd'` reads as a missing package, sending the reader
+after something that cannot exist on Windows. Both now go through `explain()`, which strips the
+escapes and names the actual problem.

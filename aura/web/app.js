@@ -673,6 +673,10 @@ async function handleEvent(event) {
     case "network": renderNetworkStatus(event); break;
     case "autonomy": renderAutonomyStatus(event); break;
     case "approval": showApproval(event); break;
+    case "search_service":
+      renderSearchServiceStatus();
+      if (event.error) toast(event.error, true);
+      break;
     case "approval_closed":
       // Answered elsewhere — Stop, an emergency stop, or shutdown.
       if (!currentApproval || currentApproval === event.approval_id) {
@@ -1519,6 +1523,19 @@ async function openSessions(focus = true) {
   }
 }
 
+async function renderSearchServiceStatus() {
+  const target = $("#searchServiceStatus");
+  if (!target) return;
+  const status = await callApi("search_service_status");
+  if (!status.ok) { target.textContent = status.error; return; }
+  if (status.error) target.textContent = status.error;
+  else if (status.running && status.adopted)
+    target.textContent = `Running on ${status.endpoint} — you started it, so Aura leaves it running when it quits.`;
+  else if (status.running)
+    target.textContent = `Running on ${status.endpoint} in ${status.container ? "a container" : "a local process"} — Aura started it and stops it on quit.`;
+  else target.textContent = "Not running. Set the folder above, or start SearXNG yourself.";
+}
+
 async function openWatchPanel(focus = true) {
   if (focus) openModal(elements.watchModal);
   const list = $("#watchList");
@@ -1881,6 +1898,10 @@ async function openSettings() {
     $("#settingWhisperModel").value = settings.whisper_model_path || "";
     $("#settingAvatarMotion").value = settings.avatar_motion || "natural";
     $("#settingAvatarQuality").value = settings.avatar_quality || "auto";
+    $("#settingSearchEndpoint").value = settings.search_endpoint || "";
+    $("#settingSearchInstallPath").value = settings.search_install_path || "";
+    $("#settingSearchMode").value = settings.search_mode || "off";
+    renderSearchServiceStatus();
     $("#settingAvatarIntensity").value = settings.avatar_intensity ?? 65;
     updateRangeOutputs();
     await refreshNeuralVoices(settings.speech_model || "");
@@ -2015,6 +2036,9 @@ async function saveSettings() {
     whisper_model_path: $("#settingWhisperModel").value,
     avatar_motion: $("#settingAvatarMotion").value,
     avatar_quality: $("#settingAvatarQuality").value,
+    search_endpoint: $("#settingSearchEndpoint").value,
+    search_install_path: $("#settingSearchInstallPath").value,
+    search_mode: $("#settingSearchMode").value,
     avatar_intensity: $("#settingAvatarIntensity").value,
   };
   const result = await callApi("save_settings", values);

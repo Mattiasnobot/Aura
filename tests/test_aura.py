@@ -9,9 +9,14 @@ import sqlite3
 import struct
 import subprocess
 import tempfile
+import shutil
+import socket
+import sys
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import time
 import unittest
+import unittest.mock
 import wave
 import zlib
 import zipfile
@@ -27,7 +32,9 @@ import aura_app
 from aura import __version__ as aura_version
 from aura import checks
 from aura import services
+from aura import search_service
 from aura import toolkit
+from aura import websearch
 from aura.turn import PASS, TurnState
 from aura.action_log import ActionLog
 from aura.autonomy import AutonomyGuard
@@ -3973,6 +3980,467 @@ class RecurringCheckTests(unittest.TestCase):
                             for item in listed["available_checks"]))
         self.assertTrue(self.bridge.cancel_scheduled(listed["scheduled"][0]["id"])["ok"])
         self.assertEqual(self.bridge.list_scheduled()["scheduled"], [])
+
+
+class SearchServiceTests(unittest.TestCase):
+    """Aura owns SearXNG's lifecycle without SearXNG living inside Aura.
+
+    The engine is a Flask application with a large dependency tree and cannot be
+    vendored into a standard-library-only core. What can be owned is when it
+    starts, when it stops, and what it is configured with — and those are the
+    parts that decide whether search quietly does not work.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "searxng"
+        (self.root / "searx").mkdir(parents=True)
+        (self.root / "searx" / "webapp.py").write_text("", encoding="utf-8")
+        scripts = self.root / "venv" / ("Scripts" if os.name == "nt" else "bin")
+        scripts.mkdir(parents=True)
+        self.python = scripts / ("python.exe" if os.name == "nt" else "python")
+        self.python.write_text("", encoding="utf-8")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_it_says_what_is_missing_rather_than_just_refusing(self):
+        with self.assertRaises(search_service.SearchServiceError) as empty:
+            search_service.find_install("")
+        self.assertIn("Settings", str(empty.exception))
+
+        missing = Path(self.temp.name) / "nowhere"
+        with self.assertRaises(search_service.SearchServiceError) as gone:
+            search_service.find_install(missing)
+        self.assertIn(str(missing), str(gone.exception))
+
+        wrong = Path(self.temp.name) / "wrong"
+        wrong.mkdir()
+        with self.assertRaises(search_service.SearchServiceError) as shape:
+            search_service.find_install(wrong)
+        self.assertIn("webapp.py", str(shape.exception))
+
+        bare = Path(self.temp.name) / "bare"
+        (bare / "searx").mkdir(parents=True)
+        (bare / "searx" / "webapp.py").write_text("", encoding="utf-8")
+        with self.assertRaises(search_service.SearchServiceError) as venv:
+            search_service.find_install(bare)
+        self.assertIn("virtual environment", str(venv.exception))
+
+    def test_a_complete_install_is_found_with_its_own_interpreter(self):
+        install = search_service.find_install(self.root)
+        self.assertEqual(install.root, self.root)
+        self.assertEqual(install.python, self.python)
+
+    def test_the_settings_file_turns_json_on_and_keeps_it_off_the_network(self):
+        """The two things that otherwise go wrong silently.
+
+        Without json in formats SearXNG answers every request with a web page,
+        and search simply does not work. Without a loopback bind address a
+        search engine started for one person answers the whole network.
+        """
+        install = search_service.find_install(self.root)
+        written = search_service.write_settings(install, 8888, secret="abc")
+        text = written.read_text(encoding="utf-8")
+        self.assertIn("- json", text)
+        self.assertIn('bind_address: "127.0.0.1"', text)
+        self.assertIn("port: 8888", text)
+        self.assertNotIn("0.0.0.0", text)
+
+    def test_the_settings_file_is_auras_own_not_an_edit_of_theirs(self):
+        install = search_service.find_install(self.root)
+        theirs = self.root / "searx" / "settings.yml"
+        untouched = "# the user's own file"
+        theirs.write_text(untouched, encoding="utf-8")
+        search_service.write_settings(install, 8888, secret="abc")
+        self.assertEqual(theirs.read_text(encoding="utf-8"), untouched)
+        self.assertNotEqual(install.settings_path, theirs)
+
+    def test_a_service_someone_else_started_is_read_and_never_stopped(self):
+        """Aura stopping a process it did not start would be a nasty surprise."""
+        server = HTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (server.shutdown(), server.server_close()))
+        service = search_service.SearchService()
+        status = service.start_native(self.root, port=server.server_port)
+        self.assertTrue(status["adopted"])
+        self.assertTrue(status["running"])
+        service.stop()
+        self.assertTrue(search_service.port_answers(server.server_port))
+
+    def test_stopping_something_never_started_is_harmless(self):
+        search_service.SearchService().stop()
+
+    def test_a_process_that_dies_at_once_reports_why(self):
+        service = search_service.SearchService()
+        # A real interpreter that exits immediately, which is what a broken
+        # install looks like from the outside.
+        install_root = Path(self.temp.name) / "broken"
+        (install_root / "searx").mkdir(parents=True)
+        (install_root / "searx" / "webapp.py").write_text("", encoding="utf-8")
+        scripts = install_root / "venv" / ("Scripts" if os.name == "nt" else "bin")
+        scripts.mkdir(parents=True)
+        shutil.copy(sys.executable, scripts / Path(sys.executable).name)
+        with self.assertRaises(search_service.SearchServiceError) as died:
+            service.start_native(install_root, port=_free_port())
+        self.assertIn("stopped immediately", str(died.exception))
+        self.assertFalse(service.running)
+
+    def test_the_container_settings_turn_json_on(self):
+        """The same trap as a native install, in a different place.
+
+        A container carries its own settings.yml, so JSON has to be switched on
+        from outside or every search comes back as a web page.
+        """
+        written = search_service.write_container_settings(Path(self.temp.name) / "cfg", "s3cret")
+        body = written.read_text(encoding="utf-8")
+        self.assertIn("- json", body)
+        self.assertIn('secret_key: "s3cret"', body)
+        # bind_address belongs to the native path only: a container binds inside
+        # its own namespace, and the published port is what keeps it local.
+        self.assertNotIn("bind_address", body)
+
+    def test_docker_is_found_even_when_it_is_not_on_the_path(self):
+        """Docker Desktop installs per-user; absent from PATH means nothing."""
+        fake = Path(self.temp.name) / "local"
+        binary = fake / "Programs" / "DockerDesktop" / "resources" / "bin" / "docker.exe"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("", encoding="utf-8")
+        with unittest.mock.patch.dict(os.environ, {"LOCALAPPDATA": str(fake)}), \
+                unittest.mock.patch.object(search_service.shutil, "which", return_value=None):
+            self.assertEqual(search_service.find_docker(), str(binary))
+
+    def test_no_docker_at_all_says_what_to_install(self):
+        with unittest.mock.patch.dict(os.environ, {"LOCALAPPDATA": self.temp.name,
+                                                   "ProgramFiles": self.temp.name}), \
+                unittest.mock.patch.object(search_service.shutil, "which", return_value=None), \
+                unittest.mock.patch.object(search_service.Path, "is_file", lambda self: False):
+            with self.assertRaises(search_service.SearchServiceError) as absent:
+                search_service.find_docker()
+        self.assertIn("Docker Desktop", str(absent.exception))
+
+    def _fake_docker(self, service, image_present=True):
+        """Record the commands rather than running them."""
+        service.calls = []
+
+        def run(docker, arguments):
+            service.calls.append(list(arguments))
+            code = 0 if (arguments[:2] != ["image", "inspect"] or image_present) else 1
+            return subprocess.CompletedProcess([docker, *arguments], code, "", "")
+
+        service._run_docker = run
+        return service
+
+    def test_the_container_is_published_to_this_machine_only(self):
+        """A bare -p would answer the whole network. This is the one flag that
+        decides whether a private search engine is private."""
+        service = self._fake_docker(search_service.SearchService())
+        with unittest.mock.patch.object(search_service, "find_docker", return_value="docker"), \
+                unittest.mock.patch.object(search_service, "port_answers", return_value=False), \
+                unittest.mock.patch.object(search_service, "START_TIMEOUT_SECONDS", 0.1):
+            with self.assertRaises(search_service.SearchServiceError):
+                service.start_docker(Path(self.temp.name) / "cfg", port=8899)
+        run = next(call for call in service.calls if call[0] == "run")
+        published = run[run.index("-p") + 1]
+        self.assertTrue(published.startswith("127.0.0.1:"), published)
+        self.assertNotIn("0.0.0.0", published)
+        self.assertIn(f"{Path(self.temp.name) / 'cfg'}:/etc/searxng:ro", run)
+        self.assertEqual(run[-1], search_service.DOCKER_IMAGE)
+
+    def test_a_missing_image_is_not_downloaded_behind_the_users_back(self):
+        service = self._fake_docker(search_service.SearchService(), image_present=False)
+        with unittest.mock.patch.object(search_service, "find_docker", return_value="docker"), \
+                unittest.mock.patch.object(search_service, "port_answers", return_value=False):
+            with self.assertRaises(search_service.SearchServiceError) as missing:
+                service.start_docker(Path(self.temp.name) / "cfg", port=8899)
+        self.assertIn("docker pull", str(missing.exception))
+        self.assertFalse(any(call[0] == "run" for call in service.calls))
+
+    def test_stopping_removes_the_container_aura_started(self):
+        service = self._fake_docker(search_service.SearchService())
+        service.container, service.docker = True, "docker"
+        service.stop()
+        self.assertIn(["rm", "-f", search_service.CONTAINER_NAME], service.calls)
+        self.assertFalse(service.container)
+
+    def test_a_container_someone_else_runs_is_adopted_not_replaced(self):
+        service = self._fake_docker(search_service.SearchService())
+        with unittest.mock.patch.object(search_service, "port_answers", return_value=True):
+            status = service.start_docker(Path(self.temp.name) / "cfg", port=8899)
+        self.assertTrue(status["adopted"])
+        self.assertEqual(service.calls, [])          # nothing was run or removed
+
+    def test_a_startup_failure_reads_as_something_a_person_can_act_on(self):
+        """Two things the live run exposed at once.
+
+        SearXNG colours its own log output, so the raw last line arrived in the
+        settings panel wearing terminal escape codes. And the failure that will
+        actually happen on Windows — `searx/valkeydb.py` imports the Unix-only
+        `pwd` module — reads as a missing package, sending the reader after a
+        package that cannot exist there.
+        """
+        escape = chr(27)
+        coloured = f"{escape}[31msomething broke{escape}[0m"
+        self.assertEqual(search_service.explain(coloured), "something broke")
+        self.assertNotIn(escape, search_service.explain(coloured))
+
+        windows = f"{escape}[1;35mModuleNotFoundError{escape}[0m: No module named 'pwd'"
+        explained = search_service.explain(windows)
+        self.assertIn("does not run natively on Windows", explained)
+        self.assertIn("Docker", explained)
+        self.assertNotIn("ModuleNotFoundError", explained)
+
+        # Ordinary square brackets are not escape codes and must survive.
+        self.assertEqual(search_service.explain("see [above]"), "see [above]")
+
+    def test_the_model_cannot_start_stop_or_point_the_service(self):
+        """A component that launches a program is the last thing the model may aim."""
+        with tempfile.TemporaryDirectory() as workspace:
+            agent = AuraAgent(Path(workspace) / "w", provider=MockProvider())
+            for definition in agent.tool_definitions():
+                spec = toolkit.get(definition["function"]["name"])
+                fields = set((spec.properties if spec else {}) or {})
+                self.assertNotIn("search_install_path", fields)
+                self.assertNotIn("install_path", fields)
+            names = {item["function"]["name"] for item in agent.tool_definitions()}
+            for forbidden in ("start_search_service", "stop_search_service",
+                              "set_search_endpoint", "search_service_status"):
+                self.assertNotIn(forbidden, names)
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+class WebSearchTests(unittest.TestCase):
+    """Search through a service the user runs, reading snippets and nothing else.
+
+    Aura still holds no search credentials. What changed is that she can read a
+    SearXNG on this machine — and the interesting assertions are all about what
+    she still cannot do with the results.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.payload = json.dumps({"results": [
+            {"title": "Python releases", "url": "https://example.org/python",
+             "content": "The latest version and its notes.", "engines": ["duckduckgo"]},
+            {"title": "Duplicate", "url": "https://example.org/python",
+             "content": "Same link again."},
+            {"title": "Not a web link", "url": "ftp://example.org/file"},
+            {"title": "Second", "url": "https://example.net/two", "content": "Another one."},
+        ]}).encode("utf-8")
+        self.content_type = "application/json"
+        self.requests = []
+        self.serve()
+
+    def serve(self):
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):                       # noqa: N802 - stdlib naming
+                outer.requests.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Type", outer.content_type)
+                self.send_header("Content-Length", str(len(outer.payload)))
+                self.end_headers()
+                self.wfile.write(outer.payload)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.endpoint = f"http://localhost:{self.server.server_port}"
+
+    def tearDown(self):
+        try:                                  # one test stops the server itself
+            self.server.shutdown()
+            self.server.server_close()
+        except OSError:
+            pass
+        self.thread.join(timeout=5)
+        self.temp.cleanup()
+
+    def search(self, query="python", count=5):
+        return self.agent._execute_tool(
+            ToolCall("1", "search_web", {"query": query, "count": count}), None)
+
+    def enable(self):
+        self.agent.config.update(search_endpoint=self.endpoint)
+
+    def test_search_is_off_until_the_user_configures_a_service(self):
+        result = self.search()
+        self.assertFalse(result["ok"])
+        self.assertIn("No search service is configured", result["error"])
+        self.assertEqual(self.requests, [])
+
+    def test_a_running_service_returns_clean_snippets(self):
+        self.enable()
+        result = self.search()
+        self.assertTrue(result["ok"])
+        self.assertEqual([item["url"] for item in result["results"]],
+                         ["https://example.org/python", "https://example.net/two"])
+        self.assertEqual(result["results"][0]["title"], "Python releases")
+        self.assertEqual(result["results"][0]["source"], "duckduckgo")
+        self.assertIn("format=json", self.requests[0])
+
+    def test_a_repeated_link_and_a_non_web_link_are_dropped(self):
+        self.enable()
+        urls = [item["url"] for item in self.search()["results"]]
+        self.assertEqual(len(urls), len(set(urls)))
+        self.assertNotIn("ftp://example.org/file", urls)
+
+    def test_the_result_says_plainly_that_no_page_was_opened(self):
+        self.enable()
+        result = self.search()
+        self.assertIn("did not open any of these pages", result["note"])
+
+    def test_a_result_page_is_still_an_ungranted_domain(self):
+        """The restriction is the permission model, not a rule search remembers.
+
+        Search hands the model a list of links. If any of them could then be
+        fetched, "snippets only" would be a promise rather than a property.
+        """
+        self.enable()
+        target = self.search()["results"][0]["url"]
+        fetched = self.agent._execute_tool(
+            ToolCall("2", "http_get", {"url": target}), None)
+        self.assertFalse(fetched["ok"])
+        # The search is cited because Aura read it. The page behind the link is
+        # not, because she did not — that distinction is the whole point.
+        self.assertEqual(len(self.agent.fetched_sources), 1)
+        self.assertNotIn(target, self.agent.fetched_sources)
+
+    def test_the_search_itself_is_recorded_as_a_source(self):
+        self.enable()
+        self.agent.fetched_sources = []
+        self.search()
+        self.assertEqual(len(self.agent.fetched_sources), 1)
+        self.assertIn("format=json", self.agent.fetched_sources[0])
+
+    def test_html_instead_of_json_names_the_setting_to_change(self):
+        """The mistake nearly everyone makes first, so the message must be exact."""
+        self.enable()
+        self.payload = b"<!doctype html><html><body>results</body></html>"
+        self.content_type = "text/html"
+        result = self.search()
+        self.assertFalse(result["ok"])
+        self.assertIn("settings.yml", result["error"])
+        self.assertIn("formats", result["error"])
+
+    def test_nothing_listening_says_so_rather_than_failing_obscurely(self):
+        port = self.server.server_port
+        self.server.shutdown()
+        self.server.server_close()
+        self.agent.config.update(search_endpoint=f"http://localhost:{port}")
+        result = self.search()
+        self.assertFalse(result["ok"])
+        self.assertIn("No search service answered", result["error"])
+        self.assertIn("Start it", result["error"])
+
+    def test_snippets_are_capped_and_stripped_of_control_characters(self):
+        self.enable()
+        self.payload = json.dumps({"results": [
+            {"title": "T" + chr(0) + "itle" + chr(10) + "with" + chr(9) + "junk",
+             "url": "https://example.org/a",
+             "content": "x" * 900}]}).encode("utf-8")
+        first = self.search()["results"][0]
+        self.assertLessEqual(len(first["snippet"]), websearch.SNIPPET_CHARS)
+        self.assertNotIn(chr(0), first["title"])
+        self.assertNotIn(chr(10), first["title"])
+        self.assertIn("junk", first["title"])
+
+    def test_an_empty_query_is_refused(self):
+        self.enable()
+        result = self.search(query="   ")
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.requests, [])
+
+    def test_a_turn_gets_a_search_budget(self):
+        """Live, one question produced twelve near-identical searches.
+
+        A read-only tool costs nothing per call, which is exactly why nothing
+        stops it: the model keeps rephrasing until the turn budget is gone.
+        """
+        self.enable()
+        for n in range(AuraAgent.MAX_SEARCHES_PER_TURN):
+            self.assertTrue(self.search(query=f"question {n}")["ok"])
+        spent = self.search(query="one more thing")
+        self.assertFalse(spent["ok"])
+        self.assertIn("enough", spent["error"])
+        self.assertEqual(len(self.requests), AuraAgent.MAX_SEARCHES_PER_TURN)
+
+    def test_asking_the_same_thing_twice_does_not_search_twice(self):
+        self.enable()
+        first = self.search(query="Estonia")
+        again = self.search(query="  estonia  ")
+        self.assertEqual(len(self.requests), 1)
+        self.assertTrue(again["repeat"])
+        self.assertEqual(again["results"], first["results"])
+        self.assertIn("already searched", again["note"])
+
+    def test_a_repeat_does_not_spend_the_budget(self):
+        """Otherwise the cheapest call would cost the same as a real one."""
+        self.enable()
+        for _ in range(AuraAgent.MAX_SEARCHES_PER_TURN + 3):
+            self.assertTrue(self.search(query="Estonia")["ok"])
+        self.assertEqual(len(self.requests), 1)
+
+    def test_the_budget_is_per_turn_rather_than_forever(self):
+        self.enable()
+        for n in range(AuraAgent.MAX_SEARCHES_PER_TURN):
+            self.search(query=f"question {n}")
+        self.assertFalse(self.search(query="blocked")["ok"])
+        self.agent.searches_this_turn = {}          # what a new turn does
+        self.assertTrue(self.search(query="a fresh question")["ok"])
+
+    def test_the_tool_is_offered_when_the_request_is_about_the_web(self):
+        """The live failure this catches, in the words that produced it.
+
+        Search worked and Aura still answered "I cannot browse the web" — true
+        of that turn, because keyword routing never offered her the tool, and
+        false of her. A capability nothing selects does not exist.
+        """
+        for request in ("Search the web for Estonia",
+                        "look it up online",
+                        "what is the latest news about Tallinn",
+                        "Otsi veebist Estonia ja ütle, mida katked ütlevad.",
+                        "guugelda seda",
+                        "vaata internetist järele"):
+            names = {item["function"]["name"] for item
+                     in AuraAgent.select_tool_definitions(request, "powerful", "balanced")}
+            self.assertIn("search_web", names, request)
+
+    def test_the_tool_is_not_offered_for_ordinary_workspace_work(self):
+        for request in ("search the workspace for TODO",
+                        "read notes.txt and summarise it",
+                        "build me a landing page"):
+            names = {item["function"]["name"] for item
+                     in AuraAgent.select_tool_definitions(request, "powerful", "balanced")}
+            self.assertNotIn("search_web", names, request)
+
+    def test_it_is_offered_even_when_no_service_is_configured(self):
+        """So the refusal can say what to set up, instead of Aura denying it."""
+        names = {item["function"]["name"] for item
+                 in AuraAgent.select_tool_definitions("search the web for x", "careful", "fast")}
+        self.assertIn("search_web", names)
+        self.assertEqual(self.agent.config.data["search_endpoint"], "")
+
+    def test_the_model_cannot_point_search_anywhere(self):
+        """There is no tool for the endpoint, only a setting the user edits."""
+        names = {item["function"]["name"] for item in self.agent.tool_definitions()}
+        self.assertIn("search_web", names)
+        for name in names:
+            spec = toolkit.get(name)
+            fields = set((spec.properties if spec else {}) or {})
+            self.assertNotIn("endpoint", fields)
+            self.assertNotIn("search_endpoint", fields)
 
 
 class DefaultCheckTests(unittest.TestCase):

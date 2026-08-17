@@ -34,7 +34,7 @@ API_METHODS = {
     "list_permissions", "grant_folder_access", "grant_domain_access", "network_status",
     "autonomy_status", "pause_autonomy", "emergency_stop",
     "list_reminders", "cancel_reminder", "list_scheduled", "cancel_scheduled",
-    "list_proposals", "approve_proposal", "dismiss_proposal", "set_check_enabled",
+    "list_proposals", "approve_proposal", "dismiss_proposal", "set_check_enabled", "search_service_status",
     "revoke_folder_access",
     "revoke_all_permissions", "external_changes", "undo_external_change", "resume_task",
     "list_sessions", "new_session", "open_session", "archive_session",

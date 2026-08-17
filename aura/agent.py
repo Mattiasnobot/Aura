@@ -31,6 +31,7 @@ from .memory import MemoryStore
 from .provider import LMStudioProvider, MockProvider, Provider, ProviderContext, ToolCall
 from . import checks
 from . import services
+from . import websearch
 from . import toolkit
 from .toolkit import tool
 from .turn import PASS, GateResult, TurnState
@@ -101,6 +102,9 @@ class AuraAgent:
         # Every external URL actually fetched in the current turn, so a reply
         # that used the network can name what it read.
         self.fetched_sources: list[str] = []
+        #: query -> results, for this turn only. A budget, and a memory of
+        #: what was already asked; see MAX_SEARCHES_PER_TURN.
+        self.searches_this_turn: dict[str, list] = {}
         # The envelope for anything done unasked. Built before the
         # scheduler that will use it, so nothing can be scheduled first.
         self.autonomy = AutonomyGuard(self.config, self.log)
@@ -375,6 +379,7 @@ class AuraAgent:
         self._remember("user", message)
         self.last_recalled = []
         self.fetched_sources = []
+        self.searches_this_turn = {}
         self.last_learned = (
             self.memory.learn_from_message(message, project=self._extract_artifact_contract(message)[0])
             if bool(self.config.data.get("learn_from_conversations", True)) else [])
@@ -973,6 +978,15 @@ class AuraAgent:
             names.add("http_get")
         if includes("weather", "forecast", "temperature outside", "raining", "ilm"):
             names.add("get_weather")
+        # Offered whether or not a search service is configured. When there is
+        # none the tool refuses and names what is missing, which is how the user
+        # finds out the option exists — withholding it instead makes Aura say
+        # "I cannot search the web", which is true of the turn and false of her.
+        if includes("search the web", "web search", "search online", "look it up",
+                    "look up online", "browse the web", "on the internet", "google",
+                    "latest news", "news about", "veebist", "internetist", "netist",
+                    "guugelda"):
+            names.add("search_web")
         if includes("remind", "reminder", "later", "in an hour", "tomorrow",
                     "don't let me forget", "meelde"):
             names.add("set_reminder")
@@ -1722,6 +1736,17 @@ class AuraAgent:
                                 max(1.0, min(float(args.get("timeout", 10)), 20.0)))
         return result
 
+    @tool('search_web',
+          'Search the web through the SearXNG instance the user runs on this machine. '
+          'Returns titles, links, and the snippet the engine already produced. It returns '
+          'snippets only and never opens the result pages, so never describe what a linked '
+          'page says as if you had read it — say the snippet said it. Refuses, with a reason, '
+          'when the user has no search service configured or running.',
+          {'query': {'type': 'string'},
+           'count': {'type': 'integer', 'minimum': 1, 'maximum': 8, 'default': 5}}, ['query'])
+    def _tool_search_web(self, name, args, approve, call):
+        return self._search_web(str(args["query"]), int(args.get("count", 5)))
+
     @tool('open_workspace_item', 'Open a workspace file or folder in its normal desktop application after approval.',
           {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['path'])
     def _tool_open_workspace_item(self, name, args, approve, call):
@@ -2022,6 +2047,46 @@ class AuraAgent:
         if abs(value) > 1e100:
             raise ValueError("result is too large")
         return value
+
+    #: A read-only tool with no budget will be called until the turn runs out.
+    #: Live, the model made twelve near-identical searches for one question
+    #: before anything stopped it.
+    MAX_SEARCHES_PER_TURN = 5
+
+    def _search_web(self, query: str, count: int) -> dict:
+        """Read the user's own search service. Snippets, never the pages behind them.
+
+        There is nothing to enforce here beyond what already exists: a result
+        URL is a domain the user has not granted, so `_http_get` refuses it. The
+        restriction is a property of the permission model rather than a rule
+        this method has to remember.
+        """
+        endpoint = websearch.endpoint_of(self.config.data.get("search_endpoint"))
+        url = websearch.build_url(endpoint, query, count)
+        asked = " ".join(str(query).split()).casefold()
+        if asked in self.searches_this_turn:
+            # Rephrasing the same question does not produce different results,
+            # and saying so is more useful than answering it again identically.
+            return {"query": query.strip(), "searched": endpoint, "repeat": True,
+                    "count": len(self.searches_this_turn[asked]),
+                    "results": self.searches_this_turn[asked],
+                    "note": "You already searched for this. " + websearch.NOT_READ}
+        if len(self.searches_this_turn) >= self.MAX_SEARCHES_PER_TURN:
+            raise websearch.SearchUnavailable(
+                f"That is {self.MAX_SEARCHES_PER_TURN} searches for one question, which "
+                "is enough. Answer from what the snippets already say, and say plainly "
+                "if they do not cover it.")
+        try:
+            response = self._http_get(url, 15.0)
+        except (RuntimeError, OSError) as exc:
+            raise websearch.unreachable(endpoint, str(exc)) from exc
+        results = websearch.parse(response, count)
+        # A loopback fetch is not recorded as a source, but this one is what the
+        # reply actually rests on, so it is cited like any other reading.
+        self.fetched_sources.append(url)
+        self.searches_this_turn[asked] = results
+        return {"query": query.strip(), "searched": endpoint, "count": len(results),
+                "results": results, "note": websearch.NOT_READ}
 
     def _http_get(self, url: str, timeout: float) -> dict:
         class NoRedirect(HTTPRedirectHandler):
