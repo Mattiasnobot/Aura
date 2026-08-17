@@ -51,6 +51,7 @@
       <div id="sideMenu" class="side-menu hidden" role="menu" aria-labelledby="menuButton">
         <button id="memoryButton" class="menu-item" role="menuitem"><span class="button-icon">◇</span> What Aura knows</button>
         <button id="tasksButton" class="menu-item" role="menuitem"><span class="button-icon">✓</span> Recent tasks</button>
+        <button id="healthButton" class="menu-item" role="menuitem"><span class="button-icon">◍</span> Is anything broken?</button>
         <button id="permissionsButton" class="menu-item" role="menuitem"><span class="button-icon">⚿</span> Permissions</button>
         <button id="settingsButton" class="menu-item" role="menuitem"><span class="button-icon">⚙</span> Settings</button>
         <button id="workspaceButton" class="menu-item" role="menuitem"><span class="button-icon">↗</span> Open workspace folder</button>
@@ -231,6 +232,14 @@
         <button id="welcomeBack" type="button" class="hidden">Back</button>
         <button id="welcomeNext" class="primary-button" type="button">Next</button>
       </footer>
+    </div>
+  </div>
+
+  <div id="healthModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="healthTitle">
+    <div class="modal-card memory-card">
+      <header><div><h2 id="healthTitle">Is anything broken?</h2><p id="healthSummary">Checking…</p></div><button class="modal-x" aria-label="Close" data-close="healthModal">×</button></header>
+      <div id="healthList" class="memory-list"></div>
+      <footer><span>Nothing here changes anything, apart from writing and deleting one probe file in the workspace.</span><button id="healthAgain" class="primary-button">Check again</button></footer>
     </div>
   </div>
 

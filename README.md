@@ -164,6 +164,16 @@ This checks Python, the local HTML service and assets, the LM Studio server, and
 - The local interface answers on `127.0.0.1` and `localhost` only, and every API call additionally needs the session cookie and Aura's own client header.
 - Recovery is kept for 30 days or 500 changes, whichever ends first. Expiring a change removes its backups in the same transaction, and Aura never deletes a backup another record still needs.
 
+## Is anything broken?
+
+**More → Is anything broken?** runs one pass over everything Aura depends on — the model
+server, the loaded model, images, the workspace, storage, speech, voice input, and web search —
+and says which of them is not working and what to do about it. Aura can run it herself too; the
+`self_check` tool is read-only.
+
+Nothing in it changes anything, apart from writing and deleting a single probe file in the
+workspace, because whether Aura can write there has no honest answer that avoids trying.
+
 ## Language
 
 Aura chooses which tools to offer by reading the request, and those keywords were English only.

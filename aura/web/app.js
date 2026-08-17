@@ -28,7 +28,7 @@ const elements = {
   settingsModal: $("#settingsModal"), tasksModal: $("#tasksModal"), memoryModal: $("#memoryModal"),
   permissionsModal: $("#permissionsModal"), sessionsModal: $("#sessionsModal"),
   welcomeModal: $("#welcomeModal"), watchModal: $("#watchModal"),
-  planStrip: $("#planStrip"),
+  planStrip: $("#planStrip"), healthModal: $("#healthModal"),
   memoryList: $("#memoryList"),
   promptModal: $("#promptModal"), promptForm: $("#promptForm"), promptTitle: $("#promptTitle"),
   promptHint: $("#promptHint"), promptInput: $("#promptInput"), promptStatus: $("#promptStatus"),
@@ -1569,6 +1569,48 @@ function renderPlan(steps, finished = false) {
   }
 }
 
+async function openHealthPanel(focus = true) {
+  if (focus) openModal(elements.healthModal);
+  const list = $("#healthList");
+  $("#healthSummary").textContent = "Checking…";
+  list.textContent = "";
+  const report = await callApi("self_check");
+  if (!report.ok) { $("#healthSummary").textContent = report.error; return; }
+  $("#healthSummary").textContent = report.status === "ok"
+    ? "Everything Aura depends on is working."
+    : `${report.failed} not working, ${report.warned} worth knowing about.`;
+  list.replaceChildren();
+  const marks = { ok: "✓", warn: "!", fail: "×", unknown: "?" };
+  for (const check of report.checks || []) {
+    const row = document.createElement("article");
+    row.className = "memory-item";
+    const copy = document.createElement("div");
+    copy.className = "memory-item-copy";
+    const head = document.createElement("div");
+    head.className = "memory-item-head";
+    const mark = document.createElement("i");
+    mark.className = `health-mark health-${check.status}`;
+    mark.textContent = marks[check.status] || "?";
+    mark.setAttribute("aria-hidden", "true");
+    const label = document.createElement("strong");
+    // The status is in the text as well as the colour: an icon alone is not
+    // readable by a screen reader, or by anyone who cannot separate the hues.
+    label.textContent = `${check.label} — ${check.status}`;
+    head.append(mark, label);
+    const detail = document.createElement("p");
+    detail.textContent = check.detail;
+    copy.append(head, detail);
+    if (check.remedy) {
+      const remedy = document.createElement("small");
+      remedy.className = "health-remedy";
+      remedy.textContent = check.remedy;
+      copy.append(remedy);
+    }
+    row.append(copy);
+    list.append(row);
+  }
+}
+
 async function renderSearchServiceStatus() {
   const target = $("#searchServiceStatus");
   if (!target) return;
@@ -2893,6 +2935,8 @@ function bindControls() {
   $("#permissionGrant").addEventListener("submit", grantFolderAccess);
   $("#domainGrant").addEventListener("submit", grantDomainAccess);
   $("#watchButton").addEventListener("click", () => openWatchPanel());
+  $("#healthButton").addEventListener("click", () => openHealthPanel());
+  $("#healthAgain").addEventListener("click", () => openHealthPanel(false));
   elements.menuButton.addEventListener("click", () => toggleSideMenu());
   document.addEventListener("click", event => {
     // Clicking anywhere else closes it, which is what a menu is expected to do.

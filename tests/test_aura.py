@@ -32,6 +32,7 @@ import package
 import aura_app
 from aura import __version__ as aura_version
 from aura import checks
+from aura import health
 from aura import language
 from aura import services
 from aura import search_service
@@ -3984,6 +3985,141 @@ class RecurringCheckTests(unittest.TestCase):
                             for item in listed["available_checks"]))
         self.assertTrue(self.bridge.cancel_scheduled(listed["scheduled"][0]["id"])["ok"])
         self.assertEqual(self.bridge.list_scheduled()["scheduled"], [])
+
+
+class SelfCheckTests(unittest.TestCase):
+    """Improvement 4: one answer to "is anything broken?".
+
+    Every part already reported itself somewhere; what was missing was a place
+    that asks all of them, so the diagnosis stopped being the user's job.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def statuses(self, report):
+        return {check["name"]: check["status"] for check in report["checks"]}
+
+    # ------------------------------------------------------------ it answers
+
+    def test_it_reports_on_every_part_without_raising(self):
+        report = health.run(self.agent)
+        names = {check["name"] for check in report["checks"]}
+        self.assertLessEqual({"provider", "model", "vision", "workspace",
+                              "database", "speech", "voice", "search"}, names)
+        self.assertIn(report["status"], {health.OK, health.WARN, health.FAIL, health.UNKNOWN})
+
+    def test_a_check_that_breaks_reports_itself_rather_than_the_report(self):
+        """The whole point is to work when things are wrong."""
+        broken = unittest.mock.Mock(side_effect=RuntimeError("boom"))
+        with unittest.mock.patch.object(health, "_check_workspace", broken):
+            report = health.run(self.agent)
+        self.assertTrue(any(check["status"] == health.UNKNOWN
+                            and "could not run" in check["detail"]
+                            for check in report["checks"]))
+
+    # -------------------------------------------------- honest about not knowing
+
+    def test_a_provider_that_is_not_a_server_is_not_given_a_verdict(self):
+        """MockProvider has no server, and inventing one either way is a lie."""
+        statuses = self.statuses(health.run(self.agent))
+        self.assertEqual(statuses["provider"], health.UNKNOWN)
+        self.assertEqual(statuses["model"], health.UNKNOWN)
+
+    def test_no_speech_engine_is_unknown_not_unsupported(self):
+        """Saying "Windows only" on Windows is the kind of confident wrong
+        answer a self-check must never give."""
+        detail = next(check for check in health.run(self.agent, speech=None)["checks"]
+                      if check["name"] == "speech")
+        self.assertEqual(detail["status"], health.UNKNOWN)
+        self.assertNotIn("Windows only", detail["detail"])
+
+    # ------------------------------------------------------------- it is honest
+
+    def test_an_unreachable_server_fails_and_says_what_to_do(self):
+        class Dead:
+            base_url = "http://127.0.0.1:9/v1"
+
+            def available_models(self):
+                raise OSError("connection refused")
+
+        self.agent.provider = Dead()
+        checks_by_name = {check["name"]: check for check in health.run(self.agent)["checks"]}
+        self.assertEqual(checks_by_name["provider"]["status"], health.FAIL)
+        self.assertIn("LM Studio", checks_by_name["provider"]["remedy"])
+        # The model question cannot be answered while the server is silent.
+        self.assertEqual(checks_by_name["model"]["status"], health.UNKNOWN)
+
+    def test_a_server_with_no_model_is_a_different_failure(self):
+        """Rolling the two together produced the unhelpful "LM Studio is not
+        working" when the server was fine."""
+        class Empty:
+            base_url = "http://127.0.0.1:1234/v1"
+
+            def available_models(self):
+                return []
+
+            def selected_model(self):
+                return None
+
+        self.agent.provider = Empty()
+        checks_by_name = {check["name"]: check for check in health.run(self.agent)["checks"]}
+        self.assertEqual(checks_by_name["provider"]["status"], health.OK)
+        self.assertEqual(checks_by_name["model"]["status"], health.FAIL)
+
+    def test_an_unwritable_workspace_is_reported(self):
+        missing = Path(self.temp.name) / "gone"
+        self.agent.sandbox.root = missing
+        result = next(check for check in health.run(self.agent)["checks"]
+                      if check["name"] == "workspace")
+        self.assertEqual(result["status"], health.FAIL)
+
+    def test_the_overall_verdict_is_the_worst_one(self):
+        self.assertEqual(
+            health.run(self.agent)["status"],
+            max((check["status"] for check in health.run(self.agent)["checks"]),
+                key=lambda status: {health.OK: 0, health.UNKNOWN: 0,
+                                    health.WARN: 1, health.FAIL: 2}[status]))
+
+    # --------------------------------------------------------- it changes nothing
+
+    def test_it_leaves_the_workspace_exactly_as_it_found_it(self):
+        """One probe file is written and removed; nothing else is touched."""
+        root = Path(self.temp.name) / "workspace"
+        (root / "keep.txt").write_text("mine", encoding="utf-8")
+        # Aura's own .aura folder is internal state, and SQLite writes its WAL
+        # files there simply by being opened. The claim is about the user's
+        # workspace content.
+        listing = lambda: sorted(item.name for item in root.rglob("*")
+                                 if item.is_file() and ".aura" not in item.parts)
+        before = listing()
+        health.run(self.agent)
+        after = listing()
+        self.assertEqual(before, after)
+        self.assertFalse((root / ".aura-write-probe").exists())
+
+    def test_the_bridge_method_itself_works(self):
+        """The unit tests called health.run directly and never the method the
+        button calls, so a bad log call sat behind a green suite until the
+        panel was actually opened."""
+        bridge = AuraWebBridge(agent=self.agent, speech=SpeechOutput(enabled=False))
+        bridge.scheduler.stop()
+        self.addCleanup(bridge.shutdown)
+        report = bridge.self_check()
+        self.assertTrue(report["ok"])
+        self.assertTrue(report["checks"])
+        recorded = [item for item in self.agent.db.recent_actions(20)
+                    if item.get("action") == "self_check"]
+        self.assertEqual(len(recorded), 1)
+
+    def test_the_model_may_ask_but_only_to_read(self):
+        names = {item["function"]["name"] for item in self.agent.tool_definitions()}
+        self.assertIn("self_check", names)
+        self.assertNotIn("self_check", set(toolkit.mutating_names()))
 
 
 class PatternCheckTests(unittest.TestCase):

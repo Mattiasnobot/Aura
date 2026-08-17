@@ -125,12 +125,46 @@ from nothing.
 **Open question for the user:** how often several projects are actually in play.
 That decision is theirs more than mine.
 
-## 4. A self-check
+## 4. A self-check — **done 2026-08-17**
 
 **Small, and there are now a lot of moving parts.** One command that answers: is
 LM Studio reachable, is a model loaded, does vision work, does the voice work, is
 the workspace writable, is the database healthy. Turns "something is broken" into
 one click.
+
+**Built as `aura/health.py`**, reached from **More → Is anything broken?**, and offered to the
+model as a read-only `self_check` tool so Aura can answer the question when it is asked of her.
+Eight checks: the model server, the loaded model, images, the workspace, storage, speech out,
+voice in, and web search.
+
+Three rules decided the shape:
+
+- **Nothing changes.** The single exception is the workspace check, which writes one probe file
+  and removes it, because "can Aura write here?" has no honest answer that avoids trying. A
+  test asserts the workspace is left exactly as found.
+- **Nothing can hang.** A self-check that freezes is worse than none.
+- **"I cannot tell" is a real answer.** A provider that is not a server gets `unknown`, not a
+  verdict — inventing either one would be a guess dressed as a diagnosis.
+
+Two questions were deliberately separated that used to be one: *is the server there* and *is a
+model loaded*. They fail independently and need different answers, and rolling them together
+produced the unhelpful "LM Studio is not working" when the server was fine.
+
+**Two bugs came out of building it, and only one was findable by unit tests.**
+
+1. `with sqlite3.connect(...)` manages the transaction, **not** the connection. Every
+   self-check leaked a handle, and on Windows that kept the WAL files locked. Caught because
+   nine tests failed to clean up their temporary folder.
+2. `self_check` passed `status` both positionally and as a keyword to `log.record`, so the
+   method raised the moment it was actually called. **The suite was green**: the tests called
+   `health.run` directly and never the method behind the button. Found by opening the panel.
+   There is now a test for the bridge method itself.
+
+**Verified live**: all eight report `ok` on the real install — including things that had never
+been visible in one place before, such as *"Piper is ready (en_US-lessac-medium.onnx)"*,
+*"pocketsphinx, microphone available"*, and *"Answering on http://127.0.0.1:8888"*. Status is
+carried in the text as well as the colour, since an icon alone is not readable by a screen
+reader; measured in the running page at 4.91–11.62:1.
 
 ## 5. Undoing a whole conversation
 
@@ -142,7 +176,7 @@ it — sessions and changes are both recorded, and changes carry their task id.
 
 ## Order
 
-**2 → 1 → 4 → 5 → 3.** Items 2 and 1 are done; **4 is next.**
+**2 → 1 → 4 → 5 → 3.** Items 2, 1 and 4 are done; **5 is next.**
 
 Item 2 first because it repairs what is measurably broken. Item 1 next because it
 is the one that makes her feel independent, and it rides on the phase 48

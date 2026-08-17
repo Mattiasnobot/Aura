@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from . import __version__
 from . import checks
+from . import health
 from . import language
 from .agent import AuraAgent
 from .graph_model import build_mind_graph
@@ -126,6 +127,20 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         # Off the startup path: SearXNG takes tens of seconds to answer the
         # first time, and the interface must not wait for it.
         threading.Thread(target=bring_up, daemon=True, name="aura-search-start").start()
+
+    def self_check(self) -> dict:
+        """One answer to "is anything broken?", for the user and for Aura.
+
+        Read-only apart from a workspace write probe, so it is safe to run at
+        any moment, including while something else is going on.
+        """
+        report = health.run(self.agent, speech=self.speech, voice=self.voice,
+                            search_service=self.search_service)
+        # `verdict`, not `status`: record() already takes status positionally, and
+        # passing both made the call fail only when it was actually used.
+        self.agent.log.record("self_check", "ok", verdict=report["status"],
+                              failed=report["failed"], warned=report["warned"])
+        return {"ok": True, **report}
 
     def search_service_status(self) -> dict:
         return {"ok": True, **self.search_service.status()}

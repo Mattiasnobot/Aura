@@ -1831,6 +1831,15 @@ class AuraAgent:
                   "count": len(extracted)}
         return result
 
+    @tool('self_check',
+          'Check whether everything Aura depends on is working: the model server, the '
+          'loaded model, images, the workspace, storage, speech, voice input, and search. '
+          'Read-only. Use it when the user asks whether something is broken.',
+          {}, [])
+    def _tool_self_check(self, name, args, approve, call):
+        from . import health
+        return health.run(self)
+
     @tool('capability_summary', "List Aura's currently available tools and autonomy policy.",
           {}, [])
     def _tool_capability_summary(self, name, args, approve, call):
