@@ -41,7 +41,9 @@ def _comparable(value: object) -> str:
 
 
 def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
-                     max_files: int = 60) -> tuple[list[MindNode], list[MindEdge]]:
+                     max_files: int = 60, scheduled: list[dict] | None = None,
+                     proposals: list[dict] | None = None,
+                     ) -> tuple[list[MindNode], list[MindEdge]]:
     """Build a bounded graph from Aura's real local state without reading file contents."""
     nodes: dict[str, MindNode] = {}
     edges: list[MindEdge] = []
@@ -59,6 +61,8 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
             edge_keys.add(key)
             edges.append(MindEdge(source, target))
 
+    scheduled = list(scheduled or [])
+    proposals = list(proposals or [])
     conversations = list(memory.get("conversation", []))
     preferences = dict(memory.get("preferences", {}))
     personal_memories = list(memory.get("profile_memories", []))
@@ -75,6 +79,8 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
         ("conversation", "Recent conversation"),
         ("tasks", "Recent tasks"),
         ("capabilities", "Tools used"),
+        ("watching", "What I watch"),
+        ("waiting", "Waiting for you"),
         ("workspace", "Workspace"),
     ]
     for node_id, label in categories:
@@ -211,6 +217,42 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
     if not tool_nodes:
         add("tool:empty", "No tools used yet", "empty", "Tools appear after Aura acts on a task.")
         link("capabilities", "tool:empty")
+
+    # Everything phase 48 built was stored and never drawn: a map claiming to
+    # show what Aura knows and does was silent about the half she does unasked.
+    checks = [item for item in scheduled if item.get("kind") == "check"]
+    reminders = [item for item in scheduled if item.get("kind") == "reminder"]
+    if checks:
+        for item in checks:
+            node_id = f"check:{item.get('id', '')}"
+            outcome = str(item.get("last_outcome") or "").strip()
+            add(node_id, _shorten(str(item.get("request", "")).replace("_", " "), 30), "check",
+                f"Runs on its own, read-only\nEvery {item.get('every_minutes', 0)} minutes\n"
+                f"Next: {item.get('next_run', 'not scheduled')}\n"
+                + (f"Last said: {outcome}" if outcome else "Has not run yet"))
+            link("watching", node_id)
+    else:
+        add("check:empty", "Watching nothing", "empty",
+            "Aura runs no checks of her own. Turn one on under What Aura watches.")
+        link("watching", "check:empty")
+
+    for item in reminders:
+        node_id = f"reminder:{item.get('id', '')}"
+        add(node_id, _shorten(item.get("request", ""), 30), "reminder",
+            f"Reminder\nDue {item.get('next_run', '')}")
+        link("watching", node_id)
+
+    if proposals:
+        for item in proposals:
+            node_id = f"proposal:{item.get('id', '')}"
+            add(node_id, _shorten(item.get("request", ""), 34), "proposal",
+                f"Waiting for your answer\n{item.get('request', '')}\n\n"
+                f"Found by: {item.get('source', 'a check')}")
+            link("waiting", node_id)
+    else:
+        add("proposal:empty", "Nothing waiting", "empty",
+            "Aura changes nothing on her own; anything she suggests waits here.")
+        link("waiting", "proposal:empty")
 
     visible_files = sorted(files)[:max_files]
     for file_path in visible_files:

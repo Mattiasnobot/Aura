@@ -1549,13 +1549,36 @@ legacy-preference adoption would stop recognising what they already hold. If tha
 touched at all it needs the same treatment as a schema migration, rehearsed on a copy of the
 real `memory.json` first.
 
-### 53.3 — Aura Mind does not show what Aura does on her own
+### 53.3 — Aura Mind does not show what Aura does on her own — **done 2026-08-17**
 
 `graph_model.py` contains **zero** references to scheduled checks, reminders, or proposals.
 Everything phase 48 built — what she watches, what she will do unprompted, what she is waiting
 to ask about — is missing from the map that claims to show what she knows and does. The layer
 mechanism is already there and derives itself from the graph, so this is new nodes and edges
 rather than new machinery.
+
+**Built.** Two branches: **What I watch** (checks and reminders) and **Waiting for you**
+(pending proposals). A check carries what it is, how often it runs, when it runs next, and what
+it said last time — the things that answer *should I trust this* rather than merely naming it.
+
+**An empty branch says so rather than disappearing.** *"Watching nothing"* and *"Nothing
+waiting"* are drawn when there is nothing to draw, because a branch that vanishes when empty
+reads as a feature that does not exist — which is the exact impression this step was written to
+correct.
+
+**The legend needed the same two entries**, since layers derive from the graph but their colour
+and their off-switch do not: a branch with no legend entry would be drawn in a default colour
+and could not be hidden.
+
+**Verified live on the real install**: the map went from 46 to **51 nodes**, showing the four
+checks actually scheduled — broken links, recent failures, model producing nothing, failing
+streak — and *Nothing waiting*, which is true. Switching **Watching** off hid five nodes and
+five edges and switching it back restored them.
+
+**One false alarm, from the probe rather than the product.** The toggle looked stuck off,
+because the legend is rebuilt with `replaceChildren` on every change and the test was holding a
+reference to the old, detached button. Re-checked by looking the button up fresh each time: off
+and on both behave.
 
 ### Order, and why
 

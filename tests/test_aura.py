@@ -4583,6 +4583,57 @@ class MindRelationshipTests(unittest.TestCase):
         # A memory with no project gains no edge and no phantom node.
         self.assertIsNone(by_id["personal:m2"].project)
 
+    # ------------------------------------------ what Aura does on her own
+
+    SCHEDULED = [
+        {"id": "c1", "kind": "check", "request": "broken_links", "every_minutes": 1440,
+         "next_run": "2026-08-18T05:00:00Z", "last_outcome": "nothing to report"},
+        {"id": "r1", "kind": "reminder", "request": "venita", "next_run": "2026-08-18T09:00:00Z"},
+    ]
+    PROPOSALS = [{"id": "p1", "request": "Fix the dead link in promo/index.html",
+                  "source": "broken_links"}]
+
+    def test_the_map_shows_what_she_watches_and_what_waits(self):
+        """Everything phase 48 built was stored and never drawn: a map claiming
+        to show what Aura knows and does was silent about the half she does
+        without being asked."""
+        nodes, edges = build_mind_graph({}, [], [], scheduled=self.SCHEDULED,
+                                        proposals=self.PROPOSALS)
+        kinds = {node.node_id: node.kind for node in nodes}
+        self.assertEqual(kinds.get("check:c1"), "check")
+        self.assertEqual(kinds.get("reminder:r1"), "reminder")
+        self.assertEqual(kinds.get("proposal:p1"), "proposal")
+        drawn = {(edge.source, edge.target) for edge in edges}
+        self.assertIn(("watching", "check:c1"), drawn)
+        self.assertIn(("watching", "reminder:r1"), drawn)
+        self.assertIn(("waiting", "proposal:p1"), drawn)
+
+    def test_a_check_says_when_it_runs_and_what_it_last_said(self):
+        nodes, _edges = build_mind_graph({}, [], [], scheduled=self.SCHEDULED)
+        detail = next(n.detail for n in nodes if n.node_id == "check:c1")
+        self.assertIn("read-only", detail)
+        self.assertIn("nothing to report", detail)
+
+    def test_an_empty_autonomy_layer_says_so_rather_than_vanishing(self):
+        """A branch that disappears when empty reads as a feature that is not
+        there, which is exactly the impression this step exists to correct."""
+        nodes, edges = build_mind_graph({}, [], [])
+        labels = {node.node_id: node.label for node in nodes}
+        self.assertIn("check:empty", labels)
+        self.assertIn("proposal:empty", labels)
+        drawn = {(edge.source, edge.target) for edge in edges}
+        self.assertIn(("watching", "check:empty"), drawn)
+        self.assertIn(("waiting", "proposal:empty"), drawn)
+
+    def test_the_interface_can_colour_and_hide_the_new_layers(self):
+        """Layers are derived from the graph, so a branch with no legend entry
+        would be drawn in a default colour and could not be switched off."""
+        script = (Path(__file__).parents[1] / "aura" / "web" / "app.js").read_text(encoding="utf-8")
+        for layer in ('id: "watching"', 'id: "waiting"'):
+            self.assertIn(layer, script)
+        for kind in ("check:", "reminder:", "proposal:"):
+            self.assertIn(kind, script)
+
     def test_only_memory_nodes_offer_editing(self):
         """Offering to edit a derived edge would be a lie about what happens."""
         memory = {"profile_memories": [

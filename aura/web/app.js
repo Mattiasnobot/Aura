@@ -2456,6 +2456,9 @@ const MIND_LAYERS = [
   { id: "conversation", label: "Conversation", color: "#60a5fa" },
   { id: "tasks", label: "Tasks", color: "#4ade80" },
   { id: "capabilities", label: "Tools", color: "#fb923c" },
+  // The half Aura does unasked. It was built, stored, and never drawn.
+  { id: "watching", label: "Watching", color: "#5be0c8" },
+  { id: "waiting", label: "Waiting for you", color: "#fbbf24" },
   { id: "workspace", label: "Workspace", color: "#38bdf8" },
 ];
 const hiddenMindLayers = new Set();
@@ -2465,6 +2468,7 @@ const NODE_COLORS = {
   conversation_user: "#60a5fa", conversation_aura: "#a78bfa", task_completed: "#4ade80",
   task_error: "#f87171", task_running: "#fbbf24", tool: "#fb923c", folder: "#22d3ee",
   file: "#38bdf8", personal_memory: "#f0abfc", personal_memory_pinned: "#facc15", empty: "#64748b",
+  check: "#5be0c8", reminder: "#7dd3fc", proposal: "#fbbf24", project: "#c4b5fd",
 };
 
 function renderMindLegend() {

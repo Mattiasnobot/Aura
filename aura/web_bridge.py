@@ -776,6 +776,8 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
                 self.agent.memory.data,
                 self.agent.tasks.recent(10),
                 self.agent.sandbox.list_files(),
+                scheduled=self.agent.db.scheduled_tasks(include_disabled=False),
+                proposals=self.agent.db.proposals("pending"),
             )
             return {
                 "ok": True,

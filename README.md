@@ -164,6 +164,17 @@ This checks Python, the local HTML service and assets, the LM Studio server, and
 - The local interface answers on `127.0.0.1` and `localhost` only, and every API call additionally needs the session cookie and Aura's own client header.
 - Recovery is kept for 30 days or 500 changes, whichever ends first. Expiring a change removes its backups in the same transaction, and Aura never deletes a backup another record still needs.
 
+## Aura Mind
+
+The map shows what Aura knows and what she does on her own: identity, memory, preferences, the
+conversation, recent tasks, the tools she used, the workspace — and **What I watch** (the checks
+and reminders that run without being asked) with **Waiting for you** (anything she is proposing
+but has not done). Each layer in the legend is also its off-switch.
+
+Selecting a memory lets you set or clear the project it belongs to. That is the only
+relationship on the map you can edit, because every other one is derived from the data and
+editing it would be a lie about what happens next.
+
 ## Project memory
 
 Aura remembers things about you, and separately about each project. A project is a top-level
