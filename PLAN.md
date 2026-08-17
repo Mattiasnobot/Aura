@@ -378,7 +378,7 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
      is no dedicated single-call tool for it.
    - **Gate:** Aura can use a supplied visual reference, inspect its own rendered result, and explain evidence-based differences before finishing.
 
-46. **Scoped autonomy and OS bridge — In progress (P2)**
+46. **Scoped autonomy and OS bridge — Steps 1 and 2 complete (P2)**
    - **Step 1 complete 2026-08-15:** the permission foundation, built before any
      capability that needs it. `aura/permissions.py` holds a durable, revocable grant
      registry (`once` / `session` / `project` / `persistent`) stored in
@@ -503,7 +503,7 @@ Audit basis: live browser inspection of chat, avatar, settings, memory, recent t
    - **Not done:** general web search, which needs a third-party API key. Per the user's decision, no key handling was added.
    - **Gate:** met — an approved lookup works, cites what it read, and Aura is fully functional with no grants at all.
 
-48. **Proactive companion — Planned (P2)**
+48. **Proactive companion — Complete (P2)**
 
    The original entry put three things on one line that carry very different risk, and building them together would have smuggled the third in behind the first two:
 
@@ -1158,3 +1158,93 @@ straight to LM Studio and got HTTP 400 on every single request — the model's t
 more than one system message. That looked like a serious bug in Aura until checking showed
 `merge_system_messages` is applied on the real path and folds them into one. The defect was in
 the probe, not the product.
+
+
+## Which model to run — measured, 2026-08-17
+
+Nearly every failure on 2026-08-17 was model behaviour rather than Aura's code: empty replies,
+Finnish drift, answering without calling a tool, a line count invented rather than read. The
+obvious question was whether a bigger model would simply remove them.
+
+**Six models, six requests, one provider call each** — Aura's real system prompt, real language
+rule, real selected tool list. It measures the model's **first decision**: reach for a tool or
+answer from nothing, which is exactly where the failures happened. No tool is executed, so the
+workspace is untouched, and the content of an answer is not scored — only whether the model
+went and looked.
+
+| model | correct tool decisions | seconds |
+|---|---|---|
+| **qwen/qwen3.5-9b** (in use) | **6 / 6** | 41 |
+| meta-llama-3.1-8b-instruct | 5 / 6 | 125 |
+| mistralai/ministral-3-14b-reasoning | 4 / 6 | 110 |
+| qwen3-14b-claude-4.5-opus-distill | 4 / 6 | 195 |
+| google/gemma-4-12b-qat | 4 / 4 answered | 103 |
+| qwen3-coder-30b-a3b-instruct | no answer | — |
+
+**The model already in use won, and not narrowly.** Six correct decisions out of six, and
+4–10 seconds each after loading, against 100–195 seconds for every other candidate.
+
+**Two results needed correcting before they could be reported.** The 30B and two of gemma's
+requests came back as `ProviderError`, which reads like a model that cannot call tools. Asking
+for the actual message showed **timeouts** — 300 seconds, including load. That is still a real
+finding for a companion that answers while you wait, but it is slowness, not incapability, and
+reporting it as the latter would have been wrong.
+
+The one blemish on the current model needed the same care. Scored 5/6 on language, and the
+failing case turned out to be the **reasoning preamble** in English while the tool call itself
+was correct — and reasoning is never shown in the chat. Counting it against the model would
+have been counting something the user cannot see.
+
+**The conclusion is a negative one, which makes it worth recording.** Swapping the model is not
+where the remaining reliability lives. The guards built today — the routing fixes, the language
+rule, the completion gates, the search budget — are doing the work that a larger model was
+supposed to make unnecessary, and the larger models on this machine are too slow to be a
+companion at all.
+
+**Limits of this, stated plainly:** six requests, one run each, single-turn only. A difference
+of one is noise. It says nothing about how a model behaves over a long multi-step build, which
+is where a different kind of failure lives.
+
+
+## Keep the router, or send every tool — measured, 2026-08-17
+
+Three separate bugs on 2026-08-17 came from one place: the keyword router decided for the model
+and decided wrongly. Estonian requests got **no tools at all** sixteen times out of twenty,
+`search_web` existed but was in no rule, and the completion checks used the same English
+vocabulary. None of that could happen if every tool were simply offered every time. So: does
+the router help, or only get in the way?
+
+**Six requests, both ways, three runs each — thirty-six calls in all.** Three runs because a
+single one cannot tell a real difference from the model having a bad moment.
+
+| | correct | median prompt | median time |
+|---|---|---|---|
+| router's selection | **16 / 18** | **1624 tokens** | 7.0s |
+| all 53 tools | **16 / 18** | 6490 tokens | 7.7s |
+
+**A dead heat on correctness, and the router costs a quarter of the prompt.** The predicted
+cost held up exactly: 1989 tokens against 6497 on the same request.
+
+**And the two failures were the same case in both columns**, which makes them a fact about the
+model rather than about routing: asked *"Otsi veebist, mis on Eesti pealinn"*, it answered from
+its own knowledge instead of searching, two runs out of three, whichever tools it was given.
+
+**That is my test case being poor rather than the model being wrong.** Estonia's capital is
+something a model knows; declining to search for it is sensible. Scoring it as a failure said
+more about how I wrote the case than about anything measured. The honest reading is that the
+two conditions are indistinguishable at 18/18.
+
+**So the router stays.** Removing it buys nothing measurable and costs four times the prompt on
+every request, every retry, and every step of a multi-step task.
+
+**What the measurement did settle is a smaller change.** The router's real defect is not that
+it selects narrowly — it is that when it matches *nothing*, the model gets nothing. That is now
+softened with six read-only tools, chosen because guessing is acceptable for reading and never
+for writing. Since offering everything turns out not to hurt the decision, the unrouted case
+could be given the full catalogue instead, and the 4× cost would be paid only in the rare
+situation where the router has already failed.
+
+**The reason that is not simply done:** it would hand the *widest* capability to the request we
+understood *least*. Mutations stay recoverable and dangerous actions still ask first, so it is
+defensible — but it is a safety-shaped decision rather than a performance one, and it belongs
+to the user.
