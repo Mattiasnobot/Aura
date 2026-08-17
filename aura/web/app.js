@@ -673,6 +673,12 @@ async function handleEvent(event) {
     case "network": renderNetworkStatus(event); break;
     case "autonomy": renderAutonomyStatus(event); break;
     case "approval": showApproval(event); break;
+    case "speech_language":
+      // Only ever raised when the language has no voice, so it is news.
+      if (!event.covered) {
+        toast("No Estonian voice is installed — that reply was read by the English voice. Settings → Speech.", true);
+      }
+      break;
     case "search_service":
       renderSearchServiceStatus();
       if (event.error) toast(event.error, true);
@@ -1886,6 +1892,7 @@ async function openSettings() {
     $("#settingLearning").checked = settings.learn_from_conversations;
     $("#settingSpeechEngine").value = settings.speech_engine;
     setSelectValue($("#settingVoice"), settings.speech_voice || "");
+    setSelectValue($("#settingVoiceEt"), settings.speech_voice_et || "");
     $("#settingRate").value = settings.speech_rate;
     $("#settingVolume").value = settings.speech_volume;
     $("#settingSpeak").checked = settings.speak_responses;
@@ -1940,6 +1947,16 @@ async function refreshVoices() {
   select.replaceChildren();
   for (const voice of result.voices || []) select.add(new Option(voice, voice));
   setSelectValue(select, previous || result.voices?.[0] || "");
+  // The Estonian list is the same voices with an explicit "none", because
+  // none is the shipped state and has to be choosable rather than implied.
+  const estonian = $("#settingVoiceEt");
+  if (estonian) {
+    const keep = estonian.value;
+    estonian.replaceChildren();
+    estonian.add(new Option("None installed — Estonian read by the English voice", ""));
+    for (const voice of result.voices || []) estonian.add(new Option(voice, voice));
+    setSelectValue(estonian, keep);
+  }
   status.textContent = result.voices?.length ? `Found ${result.voices.length} local voice(s).` : "No SAPI fallback voices found.";
 }
 
@@ -2022,6 +2039,7 @@ async function saveSettings() {
     learn_from_conversations: $("#settingLearning").checked,
     speech_engine: $("#settingSpeechEngine").value,
     speech_voice: $("#settingVoice").value,
+    speech_voice_et: $("#settingVoiceEt").value,
     speech_model: $("#settingSpeechModel").value,
     speech_rate: $("#settingRate").value,
     speech_volume: $("#settingVolume").value,

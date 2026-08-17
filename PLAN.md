@@ -916,3 +916,137 @@ output, so terminal escape codes arrived intact in the settings panel; and the r
 `ModuleNotFoundError: No module named 'pwd'` reads as a missing package, sending the reader
 after something that cannot exist on Windows. Both now go through `explain()`, which strips the
 escapes and names the actual problem.
+
+
+## The router learns Estonian — 2026-08-17
+
+Left open by the search work, in its own words: *"that router is English-only apart from a
+handful of words, and the user writes in Estonian. This fixed search; it did not fix the
+router."*
+
+**Measured first, because the size of it was not obvious.** Twenty ordinary requests, each in
+Estonian and in English, through `select_tool_definitions`:
+
+| | requests with **no tools at all** |
+|---|---|
+| Estonian | **16 / 20** |
+| English | 0 / 20 |
+
+So for this user Aura was, most of the time, a chatbot with no hands — and the failure was
+invisible, because a model with no tools does not report an error. It says it cannot help. The
+four Estonian requests that did work worked by accident: *meelde*, *testid* and *zipiks*
+contain fragments of English.
+
+**`aura/language.py`** annotates Estonian stems with the English words the existing rules
+already match, so not one routing rule was duplicated or rewritten:
+
+    "loe fail notes.txt"  ->  "loe fail notes.txt read file"
+
+Stems are matched at the start of a word and allowed to run on, because Estonian inflects by
+suffix — `fail` catches *failid*, *failist*, *failide*.
+
+**Two design mistakes, both caught by tests rather than by reasoning.**
+
+1. **Hints were first inserted inline, next to the word they explained.** That broke English:
+   some rules match whole phrases, so "look it up" became "look create it up" and stopped
+   matching — `loo` (create) fires inside *look*. Worse, it made a read-only English request
+   register as a build. Hints now attach at the end of **their own clause**.
+2. **Collecting them at the end of the message would have been worse**, and less visibly: a
+   hint would escape the negative clause meant to suppress it, so "ehita leht, aga ära käivita
+   seda" would have offered the run tool it had just been forbidden. Per clause, commas
+   included, is the only placement that survives both. `NEGATIONS` teaches the existing
+   clause-stripper *ära / ärge / mitte / ilma*, and a test asserts the build half of that
+   sentence survives while the run half does not.
+
+A collision test scans every tool description for English words an Estonian stem would fire on.
+It found `fail`→*failed* and `ava`→*available* on top of `loo`→*look*; all three are recorded
+in `ENGLISH_LOOKALIKES`, and a stem added later that collides now fails that test rather than
+quietly rewriting English requests.
+
+**A second English-only chokepoint was found on the way.** `_requires_mutation` decides whether
+a request changes anything, and it too matched English verbs only — so "tee mulle veebileht"
+was not even considered a build. It goes through the same annotation now.
+
+**The empty tool list was its own bug**, separate from language. When nothing matched, the
+model got *nothing*, so Aura could not even look before saying she could not help.
+`FALLBACK_TOOLS` offers six read-only tools in that case — guessing is acceptable for reading
+and never for writing, and a test asserts no mutating tool can appear there. A greeting is the
+one case where nothing remains the right answer, and `_is_greeting` now recognises Estonian
+too: *tere hommikust* and a bare *hommik* were being routed as ordinary requests.
+
+**Verified live**, against the real model: *"Näita, mis failid tööruumis on, ja loe kõige
+väiksem neist ette"* — a request that produced zero tools an hour earlier — called
+`list_files`, `workspace_summary` and `read_file`, and answered with the contents of `test.ts`.
+That it really is the smallest file was then checked independently; it is, at 36 bytes.
+
+Negation is covered by tests rather than by a live run: proving it live would have meant
+letting Aura build files unattended, which is not something to do while nobody is watching.
+
+
+## Two languages, two voices — 2026-08-17
+
+"The speech model should be able to read both Estonian and English."
+
+**It cannot, because no such model is installed and none is easily available.** Checked rather
+than assumed:
+
+- **Piper publishes no Estonian voice at all.** 174 voices, 55 languages; Finnish, Latvian and
+  Russian are there, Estonian is not. espeak-ng, which Piper uses to phonemize, *does* know
+  Estonian (`urj/et`) — but a phonemizer is not a voice.
+- **Windows had only Hazel and Zira**, both English. So every Estonian reply was being read
+  aloud by an English voice, which sounds like a fault in Aura rather than a missing voice.
+- **TartuNLP**, the chosen source, has no light option: the TTS worker is TensorFlow + HDF5
+  behind RabbitMQ; the Neurokone app is TFLite and its weights are not published standalone;
+  and `tartuNLP/XTTS-v2-est` on HuggingFace is PyTorch/Coqui, roughly 2 GB of model on top of
+  ~2.5 GB of Torch, under a "license:other". `coqui-tts` does support Python 3.13, so the route
+  is open — it is the size and the CPU latency that need deciding, not the compatibility.
+
+So the answer is **two voices and an automatic switch**, which is needed whichever Estonian
+voice is eventually installed. That part is built, and it is the part that makes any of the
+above actually get used.
+
+**`language.detect(text, default)`** decides per reply, never per sentence: Aura's answers are
+Estonian prose wrapped around English filenames, tool names and code, and switching voice
+mid-sentence would sound worse than one voice throughout.
+
+Three findings from building it, each caught by a probe rather than by reasoning:
+
+1. **A word that is evidence for both languages is evidence for neither.** `on` is everywhere
+   in Estonian and is also an English preposition; counted on both sides it made *"Eesti
+   pealinn on Tallinn"* score one-all and come out English. `AMBIGUOUS_MARKERS` is now the
+   intersection of the two lists, subtracted from both.
+2. **Some replies carry no signal at all.** *"Meeldetuletus: venita"* has no Estonian letter and
+   no function word. Rather than inventing a second word list, detection falls back to the
+   hundred Estonian stems the tool router already knows.
+3. **The best signal was not in the reply.** *"Eesti pealinn on Tallinn"* is four words with no
+   giveaway — and completely obvious to anyone who saw the question. Aura answers in the
+   language she is addressed in, so the bridge detects the *request* and passes it as the
+   default. Evidence in the reply still wins over the hint; a test asserts both directions.
+
+**Being honest about the gap matters as much as the switch.** With no Estonian voice installed
+Aura still speaks — silence would be a worse surprise than a wrong accent — and pushes a
+`speech_language` event so the interface can say *"No Estonian voice is installed — that reply
+was read by the English voice"*. The alternative is leaving the user to conclude Aura is
+broken.
+
+The voice swap is per utterance and restored afterwards, so a reply in the other language
+cannot quietly repoint the configured voice. A test covers exactly that.
+
+**Verified live**: *"Vasta ühe lühikese lausega eesti keeles: kuidas läheb?"* produced *"Hea!
+Olen siin ja valmis aitama."*, was detected as Estonian, and raised the missing-voice notice.
+An English reply in the same session raised nothing, which is the half that keeps the notice
+worth reading.
+
+**Decided 2026-08-17: no Estonian voice is installed, and that is deliberate.** The options
+were put with their real costs — XTTS-v2-est at roughly 5 GB with an unmeasured CPU latency,
+espeak-ng at 10 MB and robotic — and the answer was to leave it. Nothing here downloads a
+voice. The switch is in place, so the day an Estonian SAPI voice or a Piper model exists on
+this machine, choosing it in Settings is the whole job.
+
+One correction recorded rather than quietly dropped: "Windows' own Estonian voice" was offered
+as an option before checking whether Windows offers a local Estonian speech voice at all. The
+user then checked, and **it does not** — so that option never existed, and the recommendation
+was wrong. Only Hazel and Zira are available on this machine.
+
+That leaves exactly two routes to Estonian speech, both weighed and both declined for now:
+XTTS-v2-est at roughly 5 GB with unmeasured CPU latency, or espeak-ng at 10 MB and robotic.

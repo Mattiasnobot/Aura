@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from . import __version__
 from . import checks
+from . import language
 from .agent import AuraAgent
 from .graph_model import build_mind_graph
 from .preview_server import PreviewServer
@@ -509,13 +510,27 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
             if selected:
                 self._push("provider", online=True, label=selected)
             if self.speech.enabled:
+                # Aura answers in the language she was asked in, so the
+                # request settles what a short reply is: "Eesti pealinn on
+                # Tallinn" has no Estonian letter and no giveaway word.
+                asked_in = language.detect(text)
+                spoken_language = language.detect(response, default=asked_in)
+
                 def speak() -> None:
                     self._push("speech", active=True)
                     try:
                         self.speech.speak(
                             response,
                             on_cues=lambda payload: self._push("speech_cues", **payload),
+                            language=spoken_language,
                         )
+                        if not self.speech.last_language_covered:
+                            # Said once per reply rather than swallowed: an
+                            # English voice reading Estonian is not a subtle
+                            # defect, and the user should know it is the missing
+                            # voice rather than Aura being broken.
+                            self._push("speech_language", language=spoken_language,
+                                       covered=False)
                     finally:
                         self._push("speech", active=False)
                 threading.Thread(target=speak, daemon=True, name="aura-speech").start()

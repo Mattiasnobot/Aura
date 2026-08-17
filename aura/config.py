@@ -31,6 +31,11 @@ DEFAULTS = {
     "default_checks_seeded": False,
     # Empty means search is off. Aura holds no search credentials and never
     # has; what this points at is a service the user started themselves.
+    # Estonian speech. Empty is the shipped state and an honest one: Piper
+    # publishes no Estonian voice, and Windows ships none until the language
+    # is added. Aura still speaks, and says why it sounds wrong.
+    "speech_voice_et": "",
+    "speech_model_et": "",
     "search_endpoint": "",
     # The SearXNG checkout Aura starts alongside itself. Empty means Aura
     # starts nothing and only reads whatever the user runs themselves.

@@ -30,6 +30,7 @@ from .config import ConfigStore
 from .memory import MemoryStore
 from .provider import LMStudioProvider, MockProvider, Provider, ProviderContext, ToolCall
 from . import checks
+from . import language
 from . import services
 from . import websearch
 from . import toolkit
@@ -925,18 +926,29 @@ class AuraAgent:
         "forget_personal_fact", "correct_personal_fact"}
     VERIFICATION_TOOLS = {"read_file", "read_many_files", "file_info", "inspect_code"}
 
+    #: Offered when keyword routing matches nothing at all. Read-only by
+    #: design: guessing is acceptable for looking, never for changing.
+    FALLBACK_TOOLS = ("list_files", "read_file", "file_info", "search_files",
+                      "find_relevant_files", "workspace_summary")
+
     @classmethod
     def select_tool_definitions(cls, message: str, autonomy: str = "balanced",
                                 reasoning_depth: str = "balanced") -> list[dict]:
-        raw_lower = message.casefold().replace("don’t", "don't")
+        # Estonian stems are annotated with the English words these rules already
+        # match, in place, so every rule below fires unchanged. Measured before
+        # this existed: sixteen of twenty ordinary Estonian requests produced no
+        # tools at all, and Aura reported that as being unable to help.
+        raw_lower = language.with_english_hints(
+            message.casefold().replace("don’t", "don't"))
         lower = cls._strip_negative_clauses(raw_lower)
         names: set[str] = set()
         def includes(*words: str) -> bool:
             return any(word in lower for word in words)
         build_intent = includes("create", "make", "build", "generate", "write", "improve", "polish",
                                 "enhance")
-        run_forbidden = bool(re.search(r"\b(?:do not|don't|dont|never|without)\b[^.!?;\n]*\b(?:run|execute)\b",
-                                       raw_lower))
+        run_forbidden = bool(re.search(
+            r"\b(?:do not|don't|dont|never|without|" + "|".join(language.NEGATIONS)
+            + r")\b[^.!?;\n]*\b(?:run|execute)\b", raw_lower))
         if build_intent:
             names.update({"list_files", "read_file", "create_file", "write_file", "validate_project"})
             if autonomy == "powerful" or reasoning_depth == "deep":
@@ -1037,6 +1049,14 @@ class AuraAgent:
         lowered = message.casefold()
         names.update(definition["function"]["name"] for definition in definitions
                      if definition["function"]["name"] in lowered)
+        if not names and not cls._is_greeting(message):
+            # Nothing matched, and an empty tool list is the worst possible
+            # answer: Aura cannot even look before saying she cannot help. These
+            # are all read-only, so an unrouted request can still be understood
+            # without anything being changed on the strength of a guess.
+            # A greeting is the one case where nothing really is the right
+            # answer: "tere" is not a request to go and look at anything.
+            names.update(cls.FALLBACK_TOOLS)
         return [definition for definition in definitions if definition["function"]["name"] in names]
 
     def _routing_request(self, message: str) -> str:
@@ -1068,8 +1088,15 @@ class AuraAgent:
     @staticmethod
     def _is_greeting(message: str) -> bool:
         cleaned = re.sub(r"[^\wõäöüšž]+", " ", message.casefold(), flags=re.UNICODE).strip()
+        # Estonian greetings inflect and pair up the way English ones do, and
+        # "tere hommikust" was landing in the routing chain as an ordinary
+        # request. It is the same English-only assumption as everywhere else.
         return bool(re.fullmatch(
-            r"(?:hei|tere|tsau|hello|hi|hey|good morning|good afternoon|good evening)(?: aura)?",
+            r"(?:hei|tere|tsau|nami|hello|hi|hey|yo)"
+            r"(?: (?:there|hommikust|päevast|õhtust|aura))?"
+            r"|(?:good (?:morning|afternoon|evening))(?: aura)?"
+            r"|(?:tere (?:hommikust|päevast|õhtust))(?: aura)?"
+            r"|(?:hommik|hommikust|päevast|õhtust)(?: aura)?",
             cleaned,
         ))
 
@@ -1095,14 +1122,16 @@ class AuraAgent:
             return " "
 
         return re.sub(
-            r"\b(?:do\s+not|don't|dont|never|without)\b[^.!?;\n]*",
+            r"\b(?:do\s+not|don't|dont|never|without|"
+            + "|".join(language.NEGATIONS) + r")\b[^.!?;\n]*",
             without_negative_clause,
             message,
         )
 
     @staticmethod
     def _requires_mutation(message: str) -> bool:
-        lower = AuraAgent._strip_negative_clauses(message.casefold().replace("don’t", "don't"))
+        lower = AuraAgent._strip_negative_clauses(
+            language.with_english_hints(message.casefold().replace("don’t", "don't")))
         return any(re.search(rf"\b{word}\b", lower) for word in (
             "create", "make", "build", "generate", "write", "edit", "change", "replace",
             "update", "modify", "fix", "refactor", "improve", "polish", "enhance", "append",

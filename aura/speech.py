@@ -19,18 +19,29 @@ except ImportError:  # pragma: no cover - Windows app
     winsound = None
 
 
+from . import language as languages
+
+
 class SpeechOutput:
     """Local Piper neural speech with a paced Windows SAPI fallback."""
 
     def __init__(self, enabled: bool = False, voice: str = "Microsoft Zira Desktop - English (United States)",
                  rate: int = -1, volume: int = 95, engine: str = "sapi",
-                 neural_model: str | Path = "aura-voices/en_US-lessac-medium.onnx") -> None:
+                 neural_model: str | Path = "aura-voices/en_US-lessac-medium.onnx",
+                 voice_et: str = "", neural_model_et: str | Path = "") -> None:
         self.enabled = enabled
         self.voice = voice
         self.rate = max(-10, min(int(rate), 10))
         self.volume = max(0, min(int(volume), 100))
         self.engine = engine if engine in {"piper", "sapi"} else "sapi"
         self.neural_model = Path(neural_model).resolve()
+        #: The Estonian half. Empty means none is installed, which is the
+        #: shipped state: Piper publishes no Estonian voice at all, and Windows
+        #: ships none unless the language is added.
+        self.voice_et = voice_et
+        self.neural_model_et = Path(neural_model_et).resolve() if str(neural_model_et) else None
+        self.last_language = "en"
+        self.last_language_covered = True
         self._lock = threading.Lock()
         self._process: subprocess.Popen | None = None
         self._neural_voice = None
@@ -41,7 +52,9 @@ class SpeechOutput:
         return os.name == "nt"
 
     def configure(self, *, enabled: bool, voice: str, rate: int, volume: int,
-                  engine: str = "piper", neural_model: str | Path | None = None) -> None:
+                  engine: str = "piper", neural_model: str | Path | None = None,
+                  voice_et: str | None = None,
+                  neural_model_et: str | Path | None = None) -> None:
         self.enabled = enabled
         self.voice = voice
         self.rate = max(-10, min(int(rate), 10))
@@ -52,6 +65,13 @@ class SpeechOutput:
             if resolved != self.neural_model:
                 self._neural_voice = None
             self.neural_model = resolved
+        if voice_et is not None:
+            self.voice_et = voice_et
+        if neural_model_et is not None:
+            resolved = Path(neural_model_et).resolve() if str(neural_model_et) else None
+            if resolved != self.neural_model_et:
+                self._neural_voice_et = None
+            self.neural_model_et = resolved
         if not enabled:
             self.stop()
 
@@ -266,16 +286,51 @@ class SpeechOutput:
                 except RuntimeError:
                     pass
 
-    def speak(self, text: str, on_cues: Callable[[dict], None] | None = None) -> tuple[bool, str]:
+    def voice_for(self, spoken_language: str) -> tuple[str, Path | None, bool]:
+        """The SAPI voice, neural model, and whether this language is covered.
+
+        "Covered" is the honest part. With no Estonian voice installed, Aura
+        still speaks — silence would be a worse surprise than a wrong accent —
+        but the caller can say why it sounds like an English speaker reading
+        Estonian off a card, instead of leaving the user to wonder.
+        """
+        if spoken_language != "et":
+            return self.voice, self.neural_model, True
+        if self.neural_model_et and self.neural_model_et.is_file():
+            return self.voice_et or self.voice, self.neural_model_et, True
+        if self.voice_et:
+            return self.voice_et, None, True
+        return self.voice, self.neural_model, False
+
+    def speak(self, text: str, on_cues: Callable[[dict], None] | None = None,
+              language: str | None = None) -> tuple[bool, str]:
         if not self.enabled:
             return False, "Speech output is disabled."
         if not self.available():
             return False, "Local speech output is currently supported on Windows."
-        if self.engine == "piper" and self.neural_available():
-            neural_result = self._speak_piper(text, on_cues) if on_cues else self._speak_piper(text)
-            if neural_result[0]:
-                return neural_result
-        return self._speak_sapi(text, on_cues) if on_cues else self._speak_sapi(text)
+        spoken_language = language if language in {"et", "en"} else languages.detect(text)
+        voice, model, covered = self.voice_for(spoken_language)
+        self.last_language = spoken_language
+        self.last_language_covered = covered
+        # Swapped for this utterance only, so a reply in the other language does
+        # not permanently repoint the configured voice.
+        previous_voice, previous_model = self.voice, self.neural_model
+        self.voice = voice
+        if model != self.neural_model:
+            self.neural_model = model if model is not None else previous_model
+            self._neural_voice = None
+        try:
+            use_neural = model is not None and self.engine == "piper" and self.neural_available()
+            if use_neural:
+                neural_result = (self._speak_piper(text, on_cues) if on_cues
+                                 else self._speak_piper(text))
+                if neural_result[0]:
+                    return neural_result
+            return self._speak_sapi(text, on_cues) if on_cues else self._speak_sapi(text)
+        finally:
+            if self.voice != previous_voice or self.neural_model != previous_model:
+                self._neural_voice = None
+            self.voice, self.neural_model = previous_voice, previous_model
 
     SENTENCE_PAUSE_MS = 190
     PARAGRAPH_PAUSE_MS = 420

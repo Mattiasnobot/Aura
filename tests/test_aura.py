@@ -31,6 +31,7 @@ import package
 import aura_app
 from aura import __version__ as aura_version
 from aura import checks
+from aura import language
 from aura import services
 from aura import search_service
 from aura import toolkit
@@ -2798,8 +2799,10 @@ class WebBridgeTests(unittest.TestCase):
     def test_bridge_streams_local_speech_cues_to_the_avatar(self):
         class CueSpeech:
             enabled = True
+            last_language_covered = True
 
-            def speak(self, _text, on_cues=None):
+            def speak(self, _text, on_cues=None, language=None):
+                self.spoken_language = language
                 if on_cues:
                     on_cues({"source": "audio-envelope", "duration_ms": 110,
                              "cues": [{"at_ms": 0, "open": 0.1},
@@ -3980,6 +3983,209 @@ class RecurringCheckTests(unittest.TestCase):
                             for item in listed["available_checks"]))
         self.assertTrue(self.bridge.cancel_scheduled(listed["scheduled"][0]["id"])["ok"])
         self.assertEqual(self.bridge.list_scheduled()["scheduled"], [])
+
+
+class BilingualSpeechTests(unittest.TestCase):
+    """Aura answers in two languages and had one voice for both.
+
+    There is no single model that reads Estonian and English: Piper publishes
+    no Estonian voice at all (174 voices, 55 languages, none of them Estonian),
+    and Windows ships none until the language is added. So the answer is two
+    voices and an automatic switch — plus saying so when one of them is missing,
+    because an English voice reading Estonian sounds like Aura is broken rather
+    than like a voice that was never installed.
+    """
+
+    def voice(self, **kwargs):
+        return SpeechOutput(enabled=True, engine="piper", **kwargs)
+
+    # ------------------------------------------------------------- detection
+
+    def test_a_reply_is_recognised_by_its_own_words(self):
+        self.assertEqual(language.detect("Tööruumis on 10 faili"), "et")
+        self.assertEqual(language.detect("The workspace has 10 files"), "en")
+        self.assertEqual(language.detect("Ma ei saa seda teha"), "et")
+        self.assertEqual(language.detect("I removed the broken link"), "en")
+
+    def test_a_word_that_is_evidence_for_both_is_evidence_for_neither(self):
+        """`on` is everywhere in Estonian and also an English preposition.
+
+        Counted on both sides it made "Eesti pealinn on Tallinn" score one-all
+        and come out English.
+        """
+        self.assertIn("on", language.AMBIGUOUS_MARKERS)
+        self.assertEqual(language.detect("The build is on hold"), "en")
+
+    def test_a_short_reply_falls_back_to_the_language_of_the_question(self):
+        """Aura answers in the language she was addressed in.
+
+        "Eesti pealinn on Tallinn" carries no Estonian letter and no give-away
+        word, and is obvious to anyone who saw the question.
+        """
+        short = "Eesti pealinn on Tallinn."
+        self.assertEqual(language.detect(short, default="et"), "et")
+        self.assertEqual(language.detect(short, default="en"), "en")
+
+    def test_evidence_in_the_reply_beats_the_hint(self):
+        self.assertEqual(language.detect("The workspace has 10 files", default="et"), "en")
+        self.assertEqual(language.detect("Kõik on tehtud", default="en"), "et")
+
+    def test_an_estonian_letter_settles_it_on_its_own(self):
+        for letter in "õäöüšž":
+            self.assertEqual(language.detect(f"x{letter}x", default="en"), "et", letter)
+
+    # ------------------------------------------------------- picking a voice
+
+    def test_each_language_gets_its_own_voice(self):
+        speech = self.voice(voice="English Voice", voice_et="Eesti Hääl")
+        self.assertEqual(speech.voice_for("en")[0], "English Voice")
+        self.assertEqual(speech.voice_for("et")[0], "Eesti Hääl")
+        self.assertTrue(speech.voice_for("et")[2])
+
+    def test_a_missing_estonian_voice_still_speaks_but_says_so(self):
+        """Silence would be a worse surprise than a wrong accent."""
+        speech = self.voice(voice="English Voice")
+        spoken_voice, _model, covered = speech.voice_for("et")
+        self.assertEqual(spoken_voice, "English Voice")
+        self.assertFalse(covered)
+
+    def test_speaking_one_language_does_not_repoint_the_other(self):
+        """The swap is for one utterance: the configured voice has to survive."""
+        speech = self.voice(voice="English Voice", voice_et="Eesti Hääl")
+        speech.available = staticmethod(lambda: True)
+        speech._speak_sapi = lambda text, on_cues=None: (True, "spoken")
+        speech.neural_available = lambda: False
+        speech.speak("Tere", language="et")
+        self.assertEqual(speech.last_language, "et")
+        self.assertEqual(speech.voice, "English Voice")
+        speech.speak("Hello", language="en")
+        self.assertEqual(speech.last_language, "en")
+        self.assertEqual(speech.voice, "English Voice")
+
+    def test_the_estonian_voice_is_the_users_choice_not_the_models(self):
+        """Nothing the model can call points speech anywhere."""
+        with tempfile.TemporaryDirectory() as workspace:
+            agent = AuraAgent(Path(workspace) / "w", provider=MockProvider())
+            for definition in agent.tool_definitions():
+                spec = toolkit.get(definition["function"]["name"])
+                fields = set((spec.properties if spec else {}) or {})
+                self.assertNotIn("voice", fields)
+                self.assertNotIn("speech_voice_et", fields)
+
+
+class EstonianRoutingTests(unittest.TestCase):
+    """Tools are routed by keyword, and the keywords were English only.
+
+    Measured on twenty ordinary requests before this existed: sixteen Estonian
+    ones produced no tools at all, against none of their English translations.
+    Aura then said she could not help — the same shape as the search bug, where
+    a capability she had been denied read as one she lacked.
+    """
+
+    #: Deliberately mundane: the everyday things this user actually asks for.
+    ORDINARY = (
+        ("Loe fail notes.txt ette", "read_file"),
+        ("Näita, mis failid tööruumis on", "list_files"),
+        ("Tee mulle lihtne veebileht", "create_file"),
+        ("Paranda see viga index.html-is", "replace_in_file"),
+        ("Otsi failidest sõna TODO", "search_text"),
+        ("Kustuta fail vana.txt", "safe_delete_file"),
+        ("Nimeta see fail ümber", "move_file"),
+        ("Võta viimane muudatus tagasi", "undo_last_change"),
+        ("Mida sa minu kohta tead?", "list_personal_memory"),
+        ("Tee ekraanipilt lehest", "capture_page"),
+        ("Kontrolli, kas leht on ligipääsetav", "check_accessibility"),
+        ("Võrdle neid kahte faili", "compare_files"),
+        ("Arvuta 15% 240-st", "calculate"),
+        ("Pakenda see kaust zipiks", "create_archive"),
+        ("Ava tööruumi kaust", "open_workspace_item"),
+        ("Tuleta mulle tunni pärast meelde", "set_reminder"),
+    )
+
+    def names(self, message, autonomy="powerful", depth="deep"):
+        return {item["function"]["name"]
+                for item in AuraAgent.select_tool_definitions(message, autonomy, depth)}
+
+    def test_an_ordinary_estonian_request_gets_the_tool_it_needs(self):
+        for request, expected in self.ORDINARY:
+            with self.subTest(request=request):
+                self.assertIn(expected, self.names(request))
+
+    def test_no_ordinary_request_comes_back_empty_handed(self):
+        for request, _ in self.ORDINARY:
+            self.assertTrue(self.names(request), request)
+
+    # ------------------------------------------------------ english is intact
+
+    def test_english_requests_are_not_rewritten_at_all(self):
+        """The regression that caught this design out.
+
+        Hints were first inserted next to the word they explained, which split
+        English phrases the rules match whole: "look it up" became
+        "look create it up" and stopped matching. Worse, `loo` (create) firing
+        inside *look* made a read-only request look like a build.
+        """
+        for request in ("look it up online", "look at notes.txt", "read notes.txt",
+                        "build the page but do not run it", "delete old.txt",
+                        "what can you do", "compare a.txt and b.txt"):
+            self.assertEqual(language.with_english_hints(request), request, request)
+
+    def test_no_estonian_stem_starts_an_english_routing_word(self):
+        """The guard that makes the list above provable rather than plausible.
+
+        A stem added later that collides with English fails here, instead of
+        quietly turning English requests into something else.
+        """
+        english = set()
+        for definition in AuraAgent.tool_definitions():
+            english.update(re.findall(r"[a-z]{3,}",
+                                      definition["function"]["description"].casefold()))
+        english.update("look read write create make build show find search list delete remove "
+                       "move copy rename undo revert compare check run open image page online "
+                       "internet news remember forget preference file folder code".split())
+        collisions = []
+        for stem, hint in language.ESTONIAN_HINTS:
+            for word in english:
+                if word.startswith(stem.strip()) and word not in language.ENGLISH_LOOKALIKES:
+                    collisions.append((stem, hint, word))
+        self.assertEqual(collisions, [], f"Estonian stems firing on English: {collisions}")
+
+    # ------------------------------------------------------------- refusals
+
+    def test_estonian_negation_still_withholds_the_tool(self):
+        """`ära käivita` means the same as `do not run`, and must cost the same.
+
+        This is why hints attach to their own clause: put them at the end of the
+        message instead and the hint escapes the clause meant to suppress it.
+        """
+        self.assertIn("run_command", self.names("Käivita testid"))
+        self.assertNotIn("run_command", self.names("Ära käivita testid"))
+        self.assertNotIn("run_command", self.names("Ehita leht, aga ära käivita seda"))
+        # The permitted half of that sentence survives the stripped half.
+        self.assertIn("create_file", self.names("Ehita leht, aga ära käivita seda"))
+
+    def test_estonian_read_only_wording_is_not_read_as_a_change(self):
+        self.assertTrue(AuraAgent._requires_mutation("Tee mulle veebileht"))
+        self.assertTrue(AuraAgent._requires_mutation("Kustuta fail vana.txt"))
+        self.assertFalse(AuraAgent._requires_mutation("Loe fail notes.txt ette"))
+        self.assertFalse(AuraAgent._requires_mutation("Ära muuda midagi, ainult loe"))
+
+    # ------------------------------------------------------------- fallback
+
+    def test_an_unrouted_request_can_still_look_before_answering(self):
+        """An empty tool list is the worst answer: Aura cannot even check."""
+        for odd in ("hmm", "aiuto per favore", "asdf qwerty"):
+            offered = self.names(odd)
+            self.assertEqual(offered, set(AuraAgent.FALLBACK_TOOLS), odd)
+
+    def test_the_fallback_can_only_look_never_change(self):
+        """Guessing is acceptable for reading and never for writing."""
+        self.assertEqual(set(AuraAgent.FALLBACK_TOOLS) & set(toolkit.mutating_names()), set())
+
+    def test_a_greeting_still_gets_nothing(self):
+        """"Tere" is not a request to go and look at anything."""
+        for greeting in ("Tere!", "hello", "hi there"):
+            self.assertEqual(AuraAgent.select_tool_definitions(greeting, "powerful", "deep"), [])
 
 
 class SearchServiceTests(unittest.TestCase):

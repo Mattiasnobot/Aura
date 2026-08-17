@@ -34,7 +34,7 @@ class SettingsBridge:
             "lm_studio_url", "model", "timeout", "temperature", "max_tokens",
             "reasoning_depth", "autonomy_mode", "learn_from_conversations", "vision_mode",
             "speak_responses", "speech_engine", "speech_voice", "speech_model",
-            "speech_rate", "speech_volume",
+            "speech_rate", "speech_volume", "speech_voice_et", "speech_model_et",
             "voice_engine", "voice_device", "voice_language", "voice_calibration_ms",
             "voice_silence_ms", "voice_max_seconds", "voice_noise_floor",
             "whisper_cpp_path", "whisper_model_path",
@@ -67,6 +67,8 @@ class SettingsBridge:
             avatar_quality = str(values.get("avatar_quality", "auto"))
             search_endpoint = str(values.get("search_endpoint", "")).strip().rstrip("/")
             search_install_path = str(values.get("search_install_path", "")).strip()
+            speech_voice_et = str(values.get("speech_voice_et", "")).strip()
+            speech_model_et = str(values.get("speech_model_et", "")).strip()
             search_mode = str(values.get("search_mode", "off")).strip().casefold()
             reasoning_depth = str(values.get("reasoning_depth", "deep"))
             autonomy_mode = str(values.get("autonomy_mode", "powerful"))
@@ -155,6 +157,7 @@ class SettingsBridge:
                 speak_responses=enabled, speech_engine=engine, speech_voice=voice,
                 speech_model=speech_model or self.agent.config.data["speech_model"],
                 speech_rate=speech_rate, speech_volume=speech_volume,
+                speech_voice_et=speech_voice_et, speech_model_et=speech_model_et,
                 voice_engine=voice_engine, voice_device=voice_device,
                 voice_language=voice_language, voice_calibration_ms=voice_calibration_ms,
                 voice_silence_ms=voice_silence_ms, voice_max_seconds=voice_max_seconds,
@@ -169,6 +172,7 @@ class SettingsBridge:
             self.speech.configure(
                 enabled=enabled, voice=voice, rate=speech_rate, volume=speech_volume,
                 engine=engine, neural_model=str(self.agent.config.data["speech_model"]),
+                voice_et=speech_voice_et, neural_model_et=speech_model_et,
             )
             self.voice.configure(
                 engine=voice_engine, device=voice_device, language=voice_language,

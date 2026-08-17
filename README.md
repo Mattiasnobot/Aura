@@ -164,6 +164,36 @@ This checks Python, the local HTML service and assets, the LM Studio server, and
 - The local interface answers on `127.0.0.1` and `localhost` only, and every API call additionally needs the session cookie and Aura's own client header.
 - Recovery is kept for 30 days or 500 changes, whichever ends first. Expiring a change removes its backups in the same transaction, and Aura never deletes a backup another record still needs.
 
+## Language
+
+Aura chooses which tools to offer by reading the request, and those keywords were English only.
+Measured on twenty ordinary requests, sixteen Estonian ones produced **no tools at all** — and
+a model with no tools does not report a problem, it says it cannot help.
+
+`aura/language.py` annotates Estonian stems with the English words the rules already match, so
+the rules themselves are unchanged and adding another language means adding words in one place.
+Hints attach to the end of the clause they were found in, which is what keeps "ehita leht, aga
+ära käivita seda" from offering the very tool it forbids: Estonian negation (*ära, ärge, mitte,
+ilma*) strips the clause and the hint with it.
+
+When nothing matches at all, Aura is offered six read-only tools rather than none, so she can
+look before answering. Guessing is acceptable for reading and never for writing — a test
+asserts no tool that changes anything can appear in that fallback.
+
+### Speaking two languages
+
+Aura answers in whichever language you write in, so speech picks a voice per reply.
+`language.detect` reads the whole reply rather than each sentence — Estonian prose around
+English filenames is normal, and switching voice mid-sentence sounds worse than one voice
+throughout — and falls back to the language of your *request* when a short reply gives nothing
+away.
+
+**There is no Estonian voice in the box.** Piper publishes none at all (174 voices, 55
+languages, no Estonian), and Windows ships none until you add the language. Set one under
+**Settings → Speech → Estonian voice** once you have one. Until then Aura still reads Estonian
+aloud with the English voice and tells you that is what happened, because an English voice
+reading Estonian sounds like a fault rather than a missing voice.
+
 ## Network services
 
 Optional capabilities that live outside this machine are declared in `aura/services.py`. A service names the tool the model sees, the domains it needs, and a handler that receives a fetch already bound to the `reach_domain` check — so it cannot open its own connection or reach past what you granted. Adding one means writing a module and calling `register()`; the tool list and the tool loop stay untouched.
