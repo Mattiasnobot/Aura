@@ -731,9 +731,7 @@ class AuraAgent:
                     "description was assembled from the recorded actions")
                 state_of_turn.empty_response = False
             elif state_of_turn.empty_response:
-                raise RuntimeError(
-                    "the model kept returning an empty response. Check that a model "
-                    "is loaded in LM Studio, or try a shorter request")
+                raise RuntimeError(self._empty_response_reason(state_of_turn))
 
             missing = set(state_of_turn.missing_artifacts)
             present = [path for path in state_of_turn.expected_paths if path not in missing]
@@ -814,6 +812,29 @@ class AuraAgent:
             lines.append(f"What actually ran: {summary}.")
         return "\n\n".join(lines)
 
+    @staticmethod
+    def _empty_response_reason(turn: TurnState) -> str:
+        """Explain the silence with what the server actually reported.
+
+        Measured on two real occurrences: `finish_reason` was `stop` with a
+        completion of one token, against a 32k budget and a 3.7k prompt. The
+        model was loaded, fast, and answering — it simply chose to say nothing.
+        The old message sent the user to check LM Studio, which is the one place
+        the evidence had already cleared.
+        """
+        if turn.finish_reason == "length":
+            return ("the model ran out of room mid-answer. Raise the maximum "
+                    "response length in Settings, or ask for less at once")
+        if turn.finish_reason == "stop" and turn.completion_tokens <= 2:
+            return ("the model chose not to answer that — it stopped after a "
+                    "single token rather than failing. Rephrasing usually helps; "
+                    "asking about something it was just told tends to produce this")
+        if turn.finish_reason:
+            return ("the model returned nothing usable and stopped with "
+                    f"{turn.finish_reason!r}")
+        return ("the model kept returning an empty response. Check that a model "
+                "is loaded in LM Studio, or try a shorter request")
+
     def _gate_empty_response(self, turn: TurnState, response) -> GateResult:
         """An empty completion is usually a stumble, not a verdict.
 
@@ -821,6 +842,8 @@ class AuraAgent:
         the turn outright while the shared budget sat unused beside it.
         """
         turn.empty_response = not response.content
+        turn.finish_reason = getattr(response, "finish_reason", "") or ""
+        turn.completion_tokens = int(getattr(response, "completion_tokens", 0) or 0)
         if response.content:
             return PASS
         # Measured rather than merely reported. "It kept returning an empty

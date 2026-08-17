@@ -4210,6 +4210,72 @@ class ConversationUndoTests(unittest.TestCase):
         self.assertNotIn("rollback_session", names)
 
 
+class SilenceAndRecallTests(unittest.TestCase):
+    """The three defects measured on 2026-08-17 and fixed the same evening."""
+
+    # --------------------------------------------- explaining the silence
+
+    def reason(self, finish, tokens):
+        turn = TurnState()
+        turn.finish_reason, turn.completion_tokens = finish, tokens
+        return AuraAgent._empty_response_reason(turn)
+
+    def test_a_model_that_declines_is_not_reported_as_a_broken_server(self):
+        """Measured twice: finish_reason `stop`, one completion token, a 3.7k
+        prompt against a 32k budget. The model was loaded, fast and answering —
+        the old message sent the user to check the one thing already cleared."""
+        message = self.reason("stop", 1)
+        self.assertIn("chose not to answer", message)
+        self.assertNotIn("loaded in LM Studio", message)
+
+    def test_running_out_of_room_says_so_instead(self):
+        message = self.reason("length", 4096)
+        self.assertIn("ran out of room", message)
+        self.assertIn("Settings", message)
+
+    def test_an_unknown_reason_keeps_the_original_advice(self):
+        """With nothing reported, checking the server is still the right guess."""
+        self.assertIn("loaded in LM Studio", self.reason("", 0))
+
+    def test_the_streaming_path_reports_the_reason_too(self):
+        """The first capture in the wild read "(not given)" and two zeros: the
+        instrument had been added to the non-streaming parser while the app
+        streams. The measurement had the same shape as the bug."""
+        source = (Path(__file__).parents[1] / "aura" / "provider.py").read_text(encoding="utf-8")
+        streaming = source[source.index("def _stream_completion"):]
+        self.assertIn("include_usage", streaming)
+        self.assertIn("finish_reason", streaming)
+
+    # ------------------------------------------------ finding Estonian words
+
+    def test_a_word_with_estonian_letters_is_no_longer_cut_in_half(self):
+        """`[a-z0-9]` made "tööruum" into "ruum" and "kõik" into nothing, so the
+        most distinctively Estonian words were the ones recall could not see."""
+        with tempfile.TemporaryDirectory() as temporary:
+            memory = MemoryStore(Path(temporary) / "memory.json")
+            memory.learn_fact("preference", "eelistab tumedaid taustu kõikjal", source="t")
+            memory.learn_fact("project", "tööruumis on kolm projekti", source="t")
+            self.assertTrue(memory.relevant_memories("kõikjal", 5))
+            found = [item["value"] for item in memory.relevant_memories("mis on tööruumis", 5)]
+            self.assertIn("tööruumis on kolm projekti", found)
+
+    def test_the_stored_key_is_deliberately_left_alone(self):
+        """It is written onto every memory, so widening it would re-identify
+        them all and break deduplication against what is already held."""
+        source = (Path(__file__).parents[1] / "aura" / "memory.py").read_text(encoding="utf-8")
+        key = source[source.index("def _fact_key"):source.index("def _comparable_fact")]
+        self.assertIn("[^a-z0-9]+", key)
+
+    # ------------------------------------------------------ capability asks
+
+    def test_asking_what_aura_can_do_is_not_a_build_request(self):
+        """`teha` -> make sits inside "teha oskad", and before the longest match
+        won, asking what she could do registered as asking her to make something."""
+        for request in ("Mis sa teha oskad?", "Mida sa teha saad?"):
+            self.assertFalse(AuraAgent._requires_mutation(request), request)
+        self.assertTrue(AuraAgent._requires_mutation("Tee mulle veebileht"))
+
+
 class SelfCheckTests(unittest.TestCase):
     """Improvement 4: one answer to "is anything broken?".
 

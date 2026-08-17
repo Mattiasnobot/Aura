@@ -1609,3 +1609,36 @@ added to the *non-streaming* parser while the live app **streams**. The measurem
 shape as the bug it was measuring. Fixed by reading the finish reason from the final chunk and
 requesting `stream_options: {include_usage: true}`, without which a streamed reply carries no
 totals at all.
+
+
+## The three fixes — 2026-08-17, evening
+
+Everything measured during the day and left open, closed in one pass.
+
+**1. The silence now explains itself.** `TurnState` carries the finish reason and the completion
+size, and the message is chosen from them: `length` says the answer ran out of room and points
+at Settings; `stop` with a one-token completion says the model chose not to answer and that
+rephrasing helps; anything unreported keeps the original advice, because with no evidence at all
+"check the server" is still the right guess. The old sentence — *"check that a model is loaded"* —
+now appears only in the one case where it might be true.
+
+**2. Estonian words can be found again.** The recall scorer and the conflict check used
+`[a-z0-9]`, which cut every word carrying `õäöüšž` in half: "tööruum" became "ruum" and "kõik"
+disappeared. Both widened to a Unicode-aware match. `_fact_key` was **deliberately left ASCII**
+and now says so in the code: it is stored on every memory, so widening it would silently
+re-identify every fact already held and break deduplication against them. It is only ever
+compared with itself, so being crude there is harmless — being crude in recall was not.
+
+**3. Asking what Aura can do is no longer a build request.** `teha` → *make* sits inside
+"teha oskad", and until the longest match won, *"Mis sa teha oskad?"* registered as a request to
+make something. Noted honestly earlier in the day as a known rough edge and left; the
+longest-match fix made it cheap to close properly.
+
+**Verified live, and what that did and did not show.** The exact request that produced the
+misleading message was repeated: the streaming instrument recorded `finish_reason=stop`,
+`prompt_tokens=3775`, `completion_tokens=1` — confirming the fix to the instrument itself works
+against the real server. The turn then **recovered on a retry** and answered properly, which is
+the retry ladder doing its job. So the new wording could not be seen live; it is covered by
+tests, not by having been witnessed. Worth saying rather than implying otherwise.
+
+**474 tests, all green.**

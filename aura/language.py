@@ -175,6 +175,10 @@ ESTONIAN_HINTS: tuple[tuple[str, str], ...] = (
     ("mida", "what"),
     ("kuidas", "how"),
     ("milline", "which"),
+    # `teha` -> make sits inside these, and before the longest match won it made
+    # "what can you do?" register as a request to build something.
+    ("teha oskad", "what can you do"),
+    ("teha saad", "what can you do"),
     ("mida sa oskad", "what can you do"),
     ("mis sa oskad", "what can you do"),
     ("sinu tööriistad", "your tools"),

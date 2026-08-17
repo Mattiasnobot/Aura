@@ -171,6 +171,11 @@ class MemoryStore:
 
     @staticmethod
     def _fact_key(category: str, value: str) -> str:
+        # Deliberately left ASCII-only, unlike the matching above. This key is
+        # *stored* on every memory, so widening it would change the identity of
+        # every fact already held and break deduplication against them. It is
+        # only ever compared with itself, so being crude is harmless here —
+        # whereas being crude in recall meant Estonian words could not be found.
         normalized = re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
         return f"{category}:{normalized}"
 
@@ -181,7 +186,10 @@ class MemoryStore:
         negated = lowered.startswith("dislikes ")
         if negated:
             lowered = lowered[len("dislikes "):]
-        words = frozenset(word for word in re.findall(r"[a-z0-9]{3,}", lowered)
+        # `[a-z0-9]` cut every word carrying õäöüšž in half — "tööruum" became
+        # "ruum" and "kõik" disappeared entirely — so the most distinctively
+        # Estonian words were exactly the ones matching could not see.
+        words = frozenset(word for word in re.findall(r"[^\W\d_]{3,}", lowered, re.UNICODE)
                           if word not in cls.COMPARISON_STOPWORDS)
         return words, negated
 
@@ -308,7 +316,7 @@ class MemoryStore:
 
     def relevant_memories(self, query: str, limit: int = 12,
                           project: str | None = None) -> list[dict]:
-        words = {word for word in re.findall(r"[a-z0-9]{3,}", query.casefold())
+        words = {word for word in re.findall(r"[^\W\d_]{3,}", query.casefold(), re.UNICODE)
                  if word not in {"the", "and", "that", "this", "with", "from", "have", "what"}}
         with self._lock:
             scored = []

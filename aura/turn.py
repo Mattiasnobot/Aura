@@ -71,6 +71,11 @@ class TurnState:
 
     # ---- shortfalls, recomputed before every gate pass
     empty_response: bool = False
+    #: Why the model stopped, straight from the server. `stop` with a
+    #: one-token completion means it chose to say nothing, which needs a
+    #: different sentence from a model that fell over.
+    finish_reason: str = ""
+    completion_tokens: int = 0
     missing_artifacts: list[str] = field(default_factory=list)
     missing_action: bool = False
     missing_mutation: bool = False
