@@ -214,18 +214,23 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         the user switches off must not reappear on the next launch, which is the
         classic way a helpful default becomes an annoyance.
         """
-        if self.agent.config.data.get("default_checks_seeded"):
+        seeded = list(self.agent.config.data.get("seeded_checks") or [])
+        if not seeded and self.agent.config.data.get("default_checks_seeded"):
+            # An install from before this was tracked by name. The two it was
+            # given then are recorded so they are not offered a second time.
+            seeded = ["broken_links", "recent_failures"]
+        fresh = [name for name in checks.DEFAULT_CHECKS
+                 if name not in seeded and checks.get(name) is not None]
+        if not fresh:
             return
         first = datetime.now(timezone.utc) + timedelta(hours=2)
-        for name in checks.DEFAULT_CHECKS:
-            if checks.get(name) is None:
-                continue
+        for name in fresh:
             self.agent.db.add_scheduled("check", name,
                                         every_minutes=checks.DEFAULT_EVERY_MINUTES,
                                         next_run=first.isoformat())
-        self.agent.config.update(default_checks_seeded=True)
-        self.agent.log.record("seed_default_checks", "ok",
-                              checks=list(checks.DEFAULT_CHECKS))
+        self.agent.config.update(default_checks_seeded=True,
+                                 seeded_checks=sorted(set(seeded) | set(fresh)))
+        self.agent.log.record("seed_default_checks", "ok", checks=fresh)
 
     def set_check_enabled(self, name: str, enabled: bool = True) -> dict:
         """Turn one check on or off. Only the user calls this."""

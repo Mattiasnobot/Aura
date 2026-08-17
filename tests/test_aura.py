@@ -13,6 +13,7 @@ import shutil
 import socket
 import sys
 import threading
+from uuid import uuid4
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import time
 import unittest
@@ -3222,7 +3223,7 @@ class WebBridgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             agent = AuraAgent(Path(temporary) / "workspace", provider=MockProvider())
             agent.log.record("older_process_event", "error")
-            agent.config.update(default_checks_seeded=True)
+            agent.config.update(seeded_checks=list(checks.DEFAULT_CHECKS))
             bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
             try:
                 agent.log.record("current_process_event", "ok")
@@ -3781,7 +3782,7 @@ class ProposalTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
         agent.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00",
-                            default_checks_seeded=True)
+                            seeded_checks=list(checks.DEFAULT_CHECKS))
         self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
         self.bridge.scheduler.stop()
         self.agent = agent
@@ -3878,7 +3879,7 @@ class RecurringCheckTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
         agent.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00",
-                            default_checks_seeded=True)
+                            seeded_checks=list(checks.DEFAULT_CHECKS))
         self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
         self.bridge.scheduler.stop()
         self.agent = agent
@@ -3985,6 +3986,129 @@ class RecurringCheckTests(unittest.TestCase):
         self.assertEqual(self.bridge.list_scheduled()["scheduled"], [])
 
 
+class PatternCheckTests(unittest.TestCase):
+    """Improvement 1: Aura reads her own journals and says when a pattern forms.
+
+    Measured on the real journal before writing any of this: 139 tasks, 33 of
+    them failed. The most common single cause was "the model returned neither
+    text nor a tool request" — eleven times, against two for the empty-response
+    message that was actually being chased. Nothing looked at any of it.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def fail(self, message, *, times=1, action="request", status="error", hours_ago=0.0):
+        when = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        for _ in range(times):
+            self.agent.db.add_action({"time": when.isoformat(), "action": action,
+                                      "status": status, "error": message})
+
+    def finish(self, status, *, times=1):
+        for index in range(times):
+            task_id = uuid4().hex[:12]
+            now = datetime.now(timezone.utc).isoformat()
+            self.agent.db.add_task_event({"task_id": task_id, "event": "started",
+                                          "time": now, "request": f"request {index}"})
+            self.agent.db.add_task_event({"task_id": task_id, "event": "finished",
+                                          "time": now, "status": status})
+
+    # -------------------------------------------------------- silence is normal
+
+    def test_a_quiet_journal_says_nothing(self):
+        for name in checks.names():
+            self.assertIsNone(checks.get(name).run(self.agent), name)
+
+    def test_two_of_the_same_thing_is_not_yet_a_pattern(self):
+        """One is an event, two is a coincidence. A check that speaks too early
+        teaches its reader to skip it, and then the once it matters it is
+        skipped too."""
+        self.fail("the model returned neither text nor a tool request", times=2)
+        self.assertIsNone(checks.get("model_producing_nothing").run(self.agent))
+        self.fail("the model returned neither text nor a tool request")
+        self.assertIsNotNone(checks.get("model_producing_nothing").run(self.agent))
+
+    # ------------------------------------------------------------ the window
+
+    def test_an_old_pattern_is_not_a_current_one(self):
+        """Counting over all history makes a complaint nobody can silence by
+        fixing the problem, which is the definition of a nag."""
+        self.fail("the model returned neither text nor a tool request",
+                  times=6, hours_ago=checks.WINDOW_HOURS + 2)
+        self.assertIsNone(checks.get("model_producing_nothing").run(self.agent))
+
+    # ---------------------------------------------------- one pattern, one voice
+
+    def test_the_generic_check_leaves_this_family_to_the_specific_one(self):
+        """Two checks describing one pattern is noise, so the one that can say
+        something actionable owns it."""
+        self.fail("the model returned neither text nor a tool request", times=5)
+        self.assertIsNone(checks.get("recent_failures").run(self.agent))
+        self.assertIsNotNone(checks.get("model_producing_nothing").run(self.agent))
+
+    def test_the_generic_check_still_reports_anything_else(self):
+        self.fail("the disk is full", times=4)
+        finding = checks.get("recent_failures").run(self.agent)
+        self.assertIsNotNone(finding)
+        self.assertIn("disk is full", finding.message)
+
+    # --------------------------------------------------- decisions are not faults
+
+    def test_a_declined_plan_is_not_a_failure(self):
+        """Counting it as one told the user their own "no" three times back."""
+        self.fail("file_plan", times=5, action="file_plan", status="declined")
+        self.assertIsNone(checks.get("recent_failures").run(self.agent))
+
+    # ---------------------------------------------------------------- the streak
+
+    def test_a_run_of_failures_is_reported_as_a_run(self):
+        """Different from "some things fail": a run says something changed now."""
+        self.finish("error", times=3)
+        finding = checks.get("failing_streak").run(self.agent)
+        self.assertIsNotNone(finding)
+        self.assertIn("3 tasks in a row", finding.message)
+        self.assertIn("LM Studio", finding.message)
+
+    def test_a_success_ends_the_run(self):
+        self.finish("error", times=3)
+        self.finish("completed")
+        self.assertIsNone(checks.get("failing_streak").run(self.agent))
+
+    def test_a_cancellation_neither_breaks_nor_extends_the_run(self):
+        """Stopping something is the user's decision, not a fault."""
+        self.finish("error", times=2)
+        self.finish("cancelled")
+        self.finish("error")
+        self.assertIsNotNone(checks.get("failing_streak").run(self.agent))
+
+    # -------------------------------------------------------- unkept promises
+
+    def test_a_file_promised_and_never_written_is_named(self):
+        self.fail("required artifacts are still missing: report.txt", times=3)
+        finding = checks.get("unkept_promises").run(self.agent)
+        self.assertIsNotNone(finding)
+        self.assertIn("report.txt", finding.message)
+        # It proposes understanding the cause, never quietly creating the file.
+        self.assertIn("Do not create", finding.proposal)
+
+    def test_every_pattern_check_is_read_only(self):
+        """These run unattended, so none of them may change anything."""
+        before = sorted(path.name for path in
+                        (Path(self.temp.name) / "workspace").rglob("*") if path.is_file())
+        self.fail("the model returned neither text nor a tool request", times=5)
+        self.fail("required artifacts are still missing: report.txt", times=5)
+        self.finish("error", times=5)
+        for name in checks.names():
+            checks.get(name).run(self.agent)
+        after = sorted(path.name for path in
+                       (Path(self.temp.name) / "workspace").rglob("*") if path.is_file())
+        self.assertEqual(before, after)
+
+
 class MindRelationshipTests(unittest.TestCase):
     """The one edge on the map the user owns.
 
@@ -4055,7 +4179,7 @@ class LivePlanTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
-        agent.config.update(default_checks_seeded=True)
+        agent.config.update(seeded_checks=list(checks.DEFAULT_CHECKS))
         self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
         self.bridge.scheduler.stop()
         self.events = []
@@ -4929,7 +5053,40 @@ class DefaultCheckTests(unittest.TestCase):
         first = self.launch()
         first.set_check_enabled("broken_links", False)
         self.assertNotIn("broken_links", self.watched(first))
-        self.assertEqual(self.watched(self.launch()), {"recent_failures"})
+        # Stated as intent rather than as a fixed set: the default list grows,
+        # and a test that pins its exact contents fails for the wrong reason.
+        after = self.watched(self.launch())
+        self.assertNotIn("broken_links", after)
+        self.assertEqual(after, set(checks.DEFAULT_CHECKS) - {"broken_links"})
+
+    def test_a_default_added_later_is_offered_without_reviving_the_others(self):
+        """A bare flag could only answer "all of them or none".
+
+        So a check added to the defaults after an install either never arrived,
+        or arrived dragging back the ones already switched off.
+        """
+        first = self.launch()
+        first.set_check_enabled("broken_links", False)
+        first.agent.config.update(
+            seeded_checks=[name for name in checks.DEFAULT_CHECKS if name != "failing_streak"])
+        watching = self.watched(self.launch())
+        self.assertIn("failing_streak", watching)
+        self.assertNotIn("broken_links", watching)
+
+    def test_an_install_from_before_names_were_tracked_keeps_its_choices(self):
+        """The two that install was given are treated as already offered.
+
+        Without that, switching one off and relaunching would hand it straight
+        back — the exact annoyance the seeding guard exists to prevent.
+        """
+        first = self.launch()
+        first.agent.config.update(seeded_checks=[], default_checks_seeded=True)
+        first.set_check_enabled("broken_links", False)
+        watching = self.watched(self.launch())
+        self.assertNotIn("broken_links", watching)
+        # The ones added to the defaults since then still arrive.
+        self.assertIn("failing_streak", watching)
+        self.assertIn("model_producing_nothing", watching)
 
     def test_a_check_can_be_switched_on_and_off(self):
         bridge = self.launch()
@@ -4966,7 +5123,7 @@ class ReminderTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
         agent.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00",
-                            default_checks_seeded=True)
+                            seeded_checks=list(checks.DEFAULT_CHECKS))
         self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
         self.bridge.scheduler.stop()          # tick by hand, not by clock
 

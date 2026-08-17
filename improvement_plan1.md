@@ -8,7 +8,7 @@ real machine, not impressions.
 
 ---
 
-## 1. She notices patterns in her own data
+## 1. She notices patterns in her own data — **done 2026-08-17**
 
 **Evidence: strongest.** The most useful thing built in this project was the
 diagnostics report — it turned a vague "it breaks sometimes" into nine dated
@@ -23,6 +23,54 @@ loaded"*.
 Needs no new capability. The data is already there; nothing looks at it.
 
 **Depends on:** phase 48's scheduler, so it can run without being asked.
+
+**Built, and the measurement came first.** The real journal held **139 tasks, 33 of them
+failed** — and the most common single cause was not the one being chased:
+
+| times | failure |
+|---|---|
+| **11** | the model returned neither text nor a tool request |
+| 6 | the model did not perform the requested workspace action |
+| 4 + 3 | a promised file was never written |
+| 2 | the model kept returning an empty response |
+
+Those top three are one problem — the model produced nothing usable — and counting them
+separately is what hid how big it was.
+
+Three checks were added beside `recent_failures`, all read-only and all silent unless something
+is actually forming:
+
+- **`model_producing_nothing`** aggregates that family and says what to do about it — check the
+  model is still loaded. This is, almost word for word, the example this item was written with.
+- **`failing_streak`** reports *runs*, which are a different claim from counts. "Some things
+  fail" is something the user already knows; "the last three in a row failed" says something
+  changed just now.
+- **`unkept_promises`** names a file that keeps being promised and never written, and proposes
+  finding out why — explicitly *not* creating it.
+
+**Three judgements that decide whether this is useful or merely noisy**, each of which was got
+wrong first and then measured:
+
+1. **A window, not all of history.** The first version reported "19 failures" — true, and
+   spread over two days, most of them long since fixed. A complaint nobody can silence by
+   fixing the problem is the definition of a nag. Bounded to 48 hours, the same journal reports
+   4.
+2. **One pattern, one voice.** `recent_failures` and `model_producing_nothing` both fired on the
+   same failures, so the user would have been told twice. The generic check now leaves that
+   family to the specific one that can say something actionable about it.
+3. **A decision is not a fault.** Declined plans and cancellations were being counted as
+   failures, so Aura reported the user's own "no" back to them three times. Excluded.
+
+**Seeding had to learn names.** `default_checks_seeded` was a bare flag, which can only answer
+"all of them or none" — so a default added later either never arrived on an existing install,
+or arrived dragging back the ones already switched off. It now records *which* checks have been
+offered, with the pre-existing installs treated as having been given the original two.
+
+**Verified live on the real install**: the two new defaults appeared without duplicating the
+two already there, and forcing one due produced, unprompted in the conversation:
+*"While you were away — 4 times in the last two days the model answered with nothing Aura could
+use — no text and no tool call. That is usually the model rather than the request: check it is
+still loaded, or try a smaller one."*
 
 ## 2. She gets better at the thing she does most — **done 2026-08-16**
 
@@ -94,7 +142,7 @@ it — sessions and changes are both recorded, and changes carry their task id.
 
 ## Order
 
-**2 → 1 → 4 → 5 → 3.**
+**2 → 1 → 4 → 5 → 3.** Items 2 and 1 are done; **4 is next.**
 
 Item 2 first because it repairs what is measurably broken. Item 1 next because it
 is the one that makes her feel independent, and it rides on the phase 48

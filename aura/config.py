@@ -29,6 +29,10 @@ DEFAULTS = {
     # Recorded once, so a default check the user switches off never
     # comes back on the next launch.
     "default_checks_seeded": False,
+    # Which defaults have been offered already, by name. A bare flag could
+    # only ever answer "all of them or none", so a default added later either
+    # never arrived or dragged back the ones already switched off.
+    "seeded_checks": [],
     # Empty means search is off. Aura holds no search credentials and never
     # has; what this points at is a service the user started themselves.
     # Estonian speech. Empty is the shipped state and an honest one: Piper
