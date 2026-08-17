@@ -54,6 +54,7 @@
         <button id="permissionsButton" class="menu-item" role="menuitem"><span class="button-icon">⚿</span> Permissions</button>
         <button id="settingsButton" class="menu-item" role="menuitem"><span class="button-icon">⚙</span> Settings</button>
         <button id="workspaceButton" class="menu-item" role="menuitem"><span class="button-icon">↗</span> Open workspace folder</button>
+        <button id="watchButton" class="menu-item" role="menuitem"><span class="button-icon">◷</span> What Aura watches</button>
         <button id="toggleLogButton" class="menu-item" role="menuitem"><span class="button-icon">▤</span> <span id="toggleLogLabel">Show action log</span></button>
         <div class="menu-separator" role="separator"></div>
         <div class="menu-status">
@@ -229,6 +230,14 @@
         <button id="welcomeBack" type="button" class="hidden">Back</button>
         <button id="welcomeNext" class="primary-button" type="button">Next</button>
       </footer>
+    </div>
+  </div>
+
+  <div id="watchModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="watchTitle">
+    <div class="modal-card memory-card">
+      <header><div><h2 id="watchTitle">What Aura watches</h2><p>Read-only checks that run on their own and speak only when something is wrong. Nothing here changes a file without asking.</p></div><button class="modal-x" aria-label="Close" data-close="watchModal">×</button></header>
+      <div id="watchList" class="memory-list"></div>
+      <footer><span id="watchNote">Quiet hours and the daily limit still apply.</span><button class="primary-button" data-close="watchModal">Done</button></footer>
     </div>
   </div>
 

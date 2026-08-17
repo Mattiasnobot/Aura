@@ -7,7 +7,7 @@ from collections import deque
 import queue
 import threading
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -77,12 +77,11 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         self._task_approved_exact: dict[str, set[str]] = {}
         self._approval_lock = threading.Lock()
         self.preview_server = PreviewServer(self.agent.sandbox, self.agent.log)
-        # Nothing is registered yet, so the loop has nothing to run: the
-        # kinds of background work arrive in 48.3 and 48.4.
         self.scheduler = Scheduler(self.agent.db, self.agent.autonomy,
                                    self.agent.log, busy=self._is_busy)
         self.scheduler.register("reminder", self._deliver_reminder)
         self.scheduler.register("check", self._run_check)
+        self._seed_default_checks()
         self.scheduler.start()
 
     def _deliver_reminder(self, task: dict) -> str:
@@ -161,11 +160,56 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         self._push("proposals_changed", pending=len(self.agent.db.proposals("pending")))
         return {"ok": True}
 
+    def _seed_default_checks(self) -> None:
+        """Switch on a small, quiet default set — once, and only once.
+
+        Everything in phase 48 was built and nothing was ever scheduled, so Aura
+        could watch and never did. The flag is what makes this safe: a default
+        the user switches off must not reappear on the next launch, which is the
+        classic way a helpful default becomes an annoyance.
+        """
+        if self.agent.config.data.get("default_checks_seeded"):
+            return
+        first = datetime.now(timezone.utc) + timedelta(hours=2)
+        for name in checks.DEFAULT_CHECKS:
+            if checks.get(name) is None:
+                continue
+            self.agent.db.add_scheduled("check", name,
+                                        every_minutes=checks.DEFAULT_EVERY_MINUTES,
+                                        next_run=first.isoformat())
+        self.agent.config.update(default_checks_seeded=True)
+        self.agent.log.record("seed_default_checks", "ok",
+                              checks=list(checks.DEFAULT_CHECKS))
+
+    def set_check_enabled(self, name: str, enabled: bool = True) -> dict:
+        """Turn one check on or off. Only the user calls this."""
+        wanted = str(name)
+        if checks.get(wanted) is None:
+            return {"ok": False, "error": f"There is no check called {wanted!r}."}
+        existing = [task for task in self.agent.db.scheduled_tasks(include_disabled=False)
+                    if task.get("kind") == "check" and task.get("request") == wanted]
+        if enabled and not existing:
+            due = datetime.now(timezone.utc) + timedelta(minutes=5)
+            self.agent.db.add_scheduled("check", wanted,
+                                        every_minutes=checks.DEFAULT_EVERY_MINUTES,
+                                        next_run=due.isoformat())
+        elif not enabled:
+            for task in existing:
+                self.agent.db.delete_scheduled_task(task["id"])
+        self.agent.log.record("set_check_enabled", "ok", check=wanted, enabled=bool(enabled))
+        return self.list_scheduled()
+
     def list_scheduled(self) -> dict:
         """Everything waiting to happen on its own, reminders and checks alike."""
         tasks = self.agent.db.scheduled_tasks(include_disabled=False)
+        watching = {task["request"] for task in tasks if task.get("kind") == "check"}
         return {"ok": True, "scheduled": tasks,
-                "available_checks": [{"name": name, "description": checks.get(name).description}
+                "reminders": [task for task in tasks if task.get("kind") == "reminder"],
+                "available_checks": [{"name": name,
+                                      "description": checks.get(name).description,
+                                      "enabled": name in watching,
+                                      "next_run": next((task["next_run"] for task in tasks
+                                                        if task.get("request") == name), None)}
                                      for name in checks.names()]}
 
     def cancel_scheduled(self, task_id: str) -> dict:

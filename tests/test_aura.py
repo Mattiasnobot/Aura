@@ -37,7 +37,7 @@ from aura.errors import AuraError
 from aura.memory import MemoryStore
 from aura.config import ConfigStore
 from aura.commands import CommandResult
-from aura.http_app import create_server, existing_aura_url
+from aura.http_app import API_METHODS, create_server, existing_aura_url
 from aura.graph_model import build_mind_graph
 from aura.image_diff import UnsupportedImage, compare_images, decode_png
 from aura.permissions import (ExternalReader, ExternalWriter, PermissionDenied,
@@ -3212,6 +3212,7 @@ class WebBridgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             agent = AuraAgent(Path(temporary) / "workspace", provider=MockProvider())
             agent.log.record("older_process_event", "error")
+            agent.config.update(default_checks_seeded=True)
             bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
             try:
                 agent.log.record("current_process_event", "ok")
@@ -3363,6 +3364,29 @@ class HTMLServerTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as obsolete_renderer:
             urlopen(self.base + "/avatar3d.js", timeout=3)
         self.assertEqual(obsolete_renderer.exception.code, 404)
+
+    def test_every_api_call_in_the_page_actually_exists(self):
+        """The class of bug this catches: the UI calls a name nothing answers.
+
+        A panel wired to a method that was renamed, or never registered in
+        API_METHODS, fails only when a user clicks the button — which is exactly
+        the kind of thing a test should find first.
+        """
+        script = (Path(__file__).parents[1] / "aura" / "web" / "app.js").read_text(encoding="utf-8")
+        called = set(re.findall(r'callApi\(\s*"([a-z_]+)"', script))
+        self.assertIn("set_check_enabled", called)
+        unknown = sorted(name for name in called if name not in API_METHODS)
+        self.assertEqual(unknown, [], f"the page calls unregistered methods: {unknown}")
+        missing = sorted(name for name in called if not hasattr(self.bridge, name))
+        self.assertEqual(missing, [], f"registered but not implemented: {missing}")
+
+    def test_the_watch_panel_is_reachable_and_wired(self):
+        self.assertIn('id="watchButton"', self.index)
+        self.assertIn('id="watchModal"', self.index)
+        self.assertIn('id="watchList"', self.index)
+        script = (Path(__file__).parents[1] / "aura" / "web" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("openWatchPanel", script)
+        self.assertIn('$("#watchButton").addEventListener', script)
 
     def test_workspace_preview_serves_relative_assets_read_only(self):
         self.bridge.agent.sandbox.write_file(
@@ -3746,7 +3770,8 @@ class ProposalTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
-        agent.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00")
+        agent.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00",
+                            default_checks_seeded=True)
         self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
         self.bridge.scheduler.stop()
         self.agent = agent
@@ -3842,7 +3867,8 @@ class RecurringCheckTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
-        agent.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00")
+        agent.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00",
+                            default_checks_seeded=True)
         self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
         self.bridge.scheduler.stop()
         self.agent = agent
@@ -3949,13 +3975,85 @@ class RecurringCheckTests(unittest.TestCase):
         self.assertEqual(self.bridge.list_scheduled()["scheduled"], [])
 
 
+class DefaultCheckTests(unittest.TestCase):
+    """Phase 48 was fully built and nothing was ever scheduled. A default set
+    only helps if it is quiet, visible, and stays off once switched off."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.temp.name) / "workspace"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def launch(self):
+        """A launch: a fresh agent over the same workspace, as a restart is."""
+        agent = AuraAgent(self.workspace, provider=MockProvider())
+        bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+        bridge.scheduler.stop()
+        self.addCleanup(bridge.shutdown)
+        return bridge
+
+    def watched(self, bridge):
+        return {check["name"] for check in bridge.list_scheduled()["available_checks"]
+                if check["enabled"]}
+
+    def test_a_fresh_install_starts_watching_the_quiet_defaults(self):
+        bridge = self.launch()
+        self.assertEqual(self.watched(bridge), set(checks.DEFAULT_CHECKS))
+        # Deliberately excluded: a workspace mid-edit is often briefly invalid,
+        # and a check that nags during ordinary work is worse than no check.
+        self.assertNotIn("validate_workspace", self.watched(bridge))
+        for task in bridge.list_scheduled()["scheduled"]:
+            self.assertEqual(task["every_minutes"], checks.DEFAULT_EVERY_MINUTES)
+
+    def test_seeding_happens_once_rather_than_every_launch(self):
+        self.launch()
+        second = self.launch()
+        self.assertEqual(len(second.list_scheduled()["scheduled"]), len(checks.DEFAULT_CHECKS))
+
+    def test_a_default_switched_off_does_not_come_back_next_launch(self):
+        first = self.launch()
+        first.set_check_enabled("broken_links", False)
+        self.assertNotIn("broken_links", self.watched(first))
+        self.assertEqual(self.watched(self.launch()), {"recent_failures"})
+
+    def test_a_check_can_be_switched_on_and_off(self):
+        bridge = self.launch()
+        bridge.set_check_enabled("validate_workspace", True)
+        self.assertIn("validate_workspace", self.watched(bridge))
+        row = [task for task in bridge.list_scheduled()["scheduled"]
+               if task["request"] == "validate_workspace"]
+        self.assertEqual(len(row), 1)
+        bridge.set_check_enabled("validate_workspace", True)   # twice, not doubled
+        self.assertEqual(len([task for task in bridge.list_scheduled()["scheduled"]
+                              if task["request"] == "validate_workspace"]), 1)
+        bridge.set_check_enabled("validate_workspace", False)
+        self.assertNotIn("validate_workspace", self.watched(bridge))
+
+    def test_only_a_known_check_can_be_switched_on(self):
+        bridge = self.launch()
+        result = bridge.set_check_enabled("read_my_email", True)
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.watched(bridge), set(checks.DEFAULT_CHECKS))
+
+    def test_the_panel_shows_reminders_alongside_checks(self):
+        bridge = self.launch()
+        bridge.agent._execute_tool(
+            ToolCall("1", "set_reminder", {"text": "stretch", "in_minutes": 30}), None)
+        listing = bridge.list_scheduled()
+        self.assertEqual([item["request"] for item in listing["reminders"]], ["stretch"])
+        self.assertTrue(all(item["next_run"] for item in listing["reminders"]))
+
+
 class ReminderTests(unittest.TestCase):
     """The first real handler: it proves 48.1 and 48.2 work together."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
-        agent.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00")
+        agent.config.update(quiet_hours_start="00:00", quiet_hours_end="00:00",
+                            default_checks_seeded=True)
         self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
         self.bridge.scheduler.stop()          # tick by hand, not by clock
 

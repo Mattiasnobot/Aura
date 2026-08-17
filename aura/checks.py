@@ -115,6 +115,15 @@ REGISTRY: dict[str, Check] = {
 }
 
 
+#: Switched on for a new installation. Both are silent unless something is
+#: actually wrong, which is the bar for anything that speaks unprompted.
+#: `validate_workspace` is deliberately *not* here: a workspace mid-edit is
+#: often temporarily invalid, and a check that nags during normal work is worse
+#: than no check.
+DEFAULT_CHECKS = ("broken_links", "recent_failures")
+DEFAULT_EVERY_MINUTES = 24 * 60
+
+
 def names() -> list[str]:
     return sorted(REGISTRY)
 

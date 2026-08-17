@@ -27,7 +27,7 @@ const elements = {
   previewAsk: $("#previewAsk"), previewOpen: $("#previewOpen"), previewCompare: $("#previewCompare"),
   settingsModal: $("#settingsModal"), tasksModal: $("#tasksModal"), memoryModal: $("#memoryModal"),
   permissionsModal: $("#permissionsModal"), sessionsModal: $("#sessionsModal"),
-  welcomeModal: $("#welcomeModal"),
+  welcomeModal: $("#welcomeModal"), watchModal: $("#watchModal"),
   memoryList: $("#memoryList"),
   promptModal: $("#promptModal"), promptForm: $("#promptForm"), promptTitle: $("#promptTitle"),
   promptHint: $("#promptHint"), promptInput: $("#promptInput"), promptStatus: $("#promptStatus"),
@@ -1519,6 +1519,69 @@ async function openSessions(focus = true) {
   }
 }
 
+async function openWatchPanel(focus = true) {
+  if (focus) openModal(elements.watchModal);
+  const list = $("#watchList");
+  list.textContent = "Reading what Aura watches…";
+  try {
+    const result = await callApi("list_scheduled");
+    if (!result.ok) throw new Error(result.error);
+    list.replaceChildren();
+    for (const check of result.available_checks || []) {
+      const card = document.createElement("article"); card.className = "memory-item";
+      const copy = document.createElement("div"); copy.className = "memory-item-copy";
+      const head = document.createElement("div"); head.className = "memory-item-head";
+      const badge = document.createElement("span");
+      badge.className = check.enabled ? "memory-category" : "memory-category off";
+      badge.textContent = check.enabled ? "Watching" : "Off";
+      head.append(badge);
+      const value = document.createElement("p");
+      value.textContent = check.description;
+      const meta = document.createElement("small");
+      meta.textContent = check.enabled && check.next_run
+        ? `Next look ${new Date(check.next_run).toLocaleString()}`
+        : "Not scheduled";
+      copy.append(head, value, meta);
+      const actions = document.createElement("div"); actions.className = "memory-actions";
+      const toggle = document.createElement("button");
+      toggle.className = "control-button";
+      toggle.textContent = check.enabled ? "Stop watching" : "Watch this";
+      toggle.addEventListener("click", async () => {
+        const changed = await callApi("set_check_enabled", check.name, !check.enabled);
+        if (!changed.ok) return toast(changed.error, true);
+        await openWatchPanel(false);
+      });
+      actions.append(toggle);
+      card.append(copy, actions); list.append(card);
+    }
+    // Reminders had no interface at all: they could be set but not seen.
+    for (const reminder of result.reminders || []) {
+      const card = document.createElement("article"); card.className = "memory-item";
+      const copy = document.createElement("div"); copy.className = "memory-item-copy";
+      const head = document.createElement("div"); head.className = "memory-item-head";
+      const badge = document.createElement("span"); badge.className = "memory-category";
+      badge.textContent = "Reminder";
+      head.append(badge);
+      const value = document.createElement("p"); value.textContent = reminder.request;
+      const meta = document.createElement("small");
+      meta.textContent = `Due ${new Date(reminder.next_run).toLocaleString()}`;
+      copy.append(head, value, meta);
+      const actions = document.createElement("div"); actions.className = "memory-actions";
+      const cancel = document.createElement("button");
+      cancel.className = "control-button danger"; cancel.textContent = "Cancel";
+      cancel.addEventListener("click", async () => {
+        const dropped = await callApi("cancel_scheduled", reminder.id);
+        if (!dropped.ok) return toast(dropped.error, true);
+        await openWatchPanel(false);
+      });
+      actions.append(cancel);
+      card.append(copy, actions); list.append(card);
+    }
+  } catch (error) {
+    list.textContent = String(error);
+  }
+}
+
 async function openPermissions(focus = true) {
   if (focus) openModal(elements.permissionsModal);
   const list = $("#permissionList");
@@ -2728,6 +2791,7 @@ function bindControls() {
   $("#newSessionButton").addEventListener("click", startNewSession);
   $("#permissionGrant").addEventListener("submit", grantFolderAccess);
   $("#domainGrant").addEventListener("submit", grantDomainAccess);
+  $("#watchButton").addEventListener("click", () => openWatchPanel());
   elements.menuButton.addEventListener("click", () => toggleSideMenu());
   document.addEventListener("click", event => {
     // Clicking anywhere else closes it, which is what a menu is expected to do.

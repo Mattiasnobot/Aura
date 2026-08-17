@@ -26,6 +26,9 @@ DEFAULTS = {
     "quiet_hours_end": "08:00",
     "autonomy_daily_runs": 12,
     "autonomy_run_seconds": 120,
+    # Recorded once, so a default check the user switches off never
+    # comes back on the next launch.
+    "default_checks_seeded": False,
     "speak_responses": False,
     "speech_engine": "piper",
     "speech_model": "aura-voices/en_US-lessac-medium.onnx",
