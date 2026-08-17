@@ -352,6 +352,37 @@ class WorkspaceSandbox:
         return {"task_id": task_id, "changes_undone": len(changes),
                 "operations": operations, "paths": restored}
 
+    def rollback_session(self, task_ids: list[str]) -> dict:
+        """Undo a whole conversation, newest task first.
+
+        Order is the whole correctness argument: undoing oldest-first would
+        restore an early backup and then have a later one overwrite it, leaving
+        the workspace in a state that never existed.
+
+        One task failing does not abandon the rest. A conversation is undone as
+        far as it can be, and what could not be undone is named — stopping
+        halfway without saying so would be the worst of both.
+        """
+        undone: list[dict] = []
+        skipped: list[dict] = []
+        paths: list[str] = []
+        for task_id in task_ids:
+            try:
+                result = self.rollback_task(task_id)
+            except FileNotFoundError:
+                # Nothing left to undo for this one: already rolled back, or it
+                # never touched a file. Not a failure worth alarming about.
+                skipped.append({"task_id": task_id, "reason": "nothing to undo"})
+                continue
+            except (OSError, ValueError) as exc:
+                skipped.append({"task_id": task_id, "reason": str(exc)})
+                continue
+            undone.append(result)
+            paths.extend(result["paths"])
+        return {"tasks_undone": len(undone), "tasks_skipped": len(skipped),
+                "changes_undone": sum(item["changes_undone"] for item in undone),
+                "paths": paths, "skipped": skipped}
+
     def _restore_change(self, change: dict) -> dict:
         restored: list[str] = []
         for item in reversed(change["items"]):

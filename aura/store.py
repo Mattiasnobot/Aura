@@ -172,6 +172,17 @@ class Database:
         # existing database through SCHEMA, and the version is what lets code
         # ask whether this database understands proposals.
         (),
+        # 4 — the first migration that earns the mechanism. `task_events` gained
+        # `session_id`, and no `CREATE TABLE IF NOT EXISTS` can add a column to a
+        # table that already holds the user's history. Without it there is no way
+        # to say which work belongs to which conversation, which is precisely
+        # what "undo this conversation" has to know.
+        #
+        # Deliberately not backfilled: old rows keep NULL, so a conversation
+        # from before this reports that it does not know rather than matching by
+        # timestamp. Guessing is the one thing an action this destructive must
+        # never do.
+        ("ALTER TABLE task_events ADD COLUMN session_id TEXT",),
     )
 
     def _migrate(self, connection: sqlite3.Connection) -> int:
@@ -181,7 +192,16 @@ class Database:
             return current
         for index in range(current, target):
             for statement in self.MIGRATIONS[index]:
-                connection.execute(statement)
+                try:
+                    connection.execute(statement)
+                except sqlite3.OperationalError as exc:
+                    # Every migration up to 3 was empty, so re-running one was
+                    # free and this never came up. `ADD COLUMN` has no
+                    # `IF NOT EXISTS`, so a database whose version was reset —
+                    # or restored oddly — would refuse to open at all. Applying
+                    # an already-applied column is a success, not a failure.
+                    if "duplicate column name" not in str(exc).casefold():
+                        raise
         # PRAGMA does not accept a bound parameter, and `target` is a length.
         connection.execute(f"PRAGMA user_version = {int(target)}")
         return target
@@ -286,16 +306,41 @@ class Database:
     def add_task_event(self, event: dict) -> None:
         self._execute(
             "INSERT INTO task_events "
-            "(task_id, event, time, request, tool, arguments, result, status, summary) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(task_id, event, time, request, tool, arguments, result, status, summary, "
+            "session_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (str(event.get("task_id")), str(event.get("event")), str(event.get("time")),
              event.get("request"), event.get("tool"),
              json.dumps(event.get("arguments"), ensure_ascii=False)
              if event.get("arguments") is not None else None,
              json.dumps(event.get("result"), ensure_ascii=False)
              if event.get("result") is not None else None,
-             event.get("status"), event.get("summary")),
+             event.get("status"), event.get("summary"), event.get("session_id")),
         )
+
+    def undoable_paths_for_tasks(self, task_ids: list[str]) -> list[str]:
+        """Which files a rollback would touch, so it can be shown before it runs."""
+        if not task_ids:
+            return []
+        marks = ",".join("?" for _ in task_ids)
+        rows = self._query(
+            "SELECT DISTINCT i.path FROM change_items i JOIN changes c ON c.id = i.change_id "
+            f"WHERE c.task_id IN ({marks}) AND c.undone_at IS NULL ORDER BY i.path",
+            tuple(str(item) for item in task_ids))
+        return [str(row["path"]) for row in rows]
+
+    def tasks_for_session(self, session_id: str) -> list[str]:
+        """Task ids started in one conversation, newest first.
+
+        Rows from before `session_id` existed carry NULL and are simply not
+        returned — a conversation that predates the column reports nothing
+        rather than claiming someone else's work.
+        """
+        rows = self._query(
+            "SELECT DISTINCT task_id, MAX(rowid_alias) AS last_seen FROM task_events "
+            "WHERE session_id = ? AND task_id IS NOT NULL "
+            "GROUP BY task_id ORDER BY last_seen DESC", (str(session_id),))
+        return [str(row["task_id"]) for row in rows]
 
     def task_events(self, task_limit: int) -> list[dict]:
         """Every event for the most recent `task_limit` tasks, oldest first."""

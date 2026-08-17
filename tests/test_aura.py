@@ -3987,6 +3987,127 @@ class RecurringCheckTests(unittest.TestCase):
         self.assertEqual(self.bridge.list_scheduled()["scheduled"], [])
 
 
+class ConversationUndoTests(unittest.TestCase):
+    """Improvement 5: undo everything one conversation changed.
+
+    A single change and a single task could already be rolled back. The link
+    that was missing was which conversation a task belonged to — `task_events`
+    had no session id, so "this conversation" could not be expressed at all.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        agent.config.update(seeded_checks=list(checks.DEFAULT_CHECKS))
+        self.agent = agent
+        self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+        self.bridge.scheduler.stop()
+        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(self.bridge.shutdown)
+
+    def build(self, name, text, session_id):
+        """One task in one conversation that writes one file."""
+        task_id = self.agent.tasks.start(f"write {name}", session_id=session_id)
+        self.agent.sandbox.active_task_id = task_id
+        self.agent.sandbox.write_file(name, text)
+        return task_id
+
+    def read(self, name):
+        return (Path(self.temp.name) / "workspace" / name).read_text(encoding="utf-8")
+
+    # ------------------------------------------------------------- the link
+
+    def test_a_task_records_the_conversation_it_belonged_to(self):
+        task_id = self.build("a.txt", "first", "session-one")
+        self.assertEqual(self.agent.db.tasks_for_session("session-one"), [task_id])
+        self.assertEqual(self.agent.db.tasks_for_session("session-two"), [])
+
+    def test_work_from_before_the_column_existed_is_not_claimed(self):
+        """Old rows carry NULL. Matching them by timestamp would be a guess, and
+        an action this destructive must never guess."""
+        self.agent.tasks.start("older work")       # no session id
+        self.assertEqual(self.agent.db.tasks_for_session("session-one"), [])
+
+    # ------------------------------------------------------------- the undo
+
+    def test_it_undoes_every_task_in_that_conversation_only(self):
+        self.build("mine.txt", "from this conversation", "session-one")
+        self.build("also-mine.txt", "also from it", "session-one")
+        self.build("theirs.txt", "from another", "session-two")
+
+        result = self.bridge.undo_session("session-one", confirm=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tasks_undone"], 2)
+        workspace = Path(self.temp.name) / "workspace"
+        self.assertFalse((workspace / "mine.txt").exists())
+        self.assertFalse((workspace / "also-mine.txt").exists())
+        # The other conversation is untouched, which is the whole point.
+        self.assertEqual(self.read("theirs.txt"), "from another")
+
+    def test_the_newest_change_is_undone_first(self):
+        """Oldest-first would restore an early backup and then let a later one
+        overwrite it, leaving a state that never existed."""
+        first = self.agent.tasks.start("write once", session_id="session-one")
+        self.agent.sandbox.active_task_id = first
+        self.agent.sandbox.write_file("page.txt", "version one")
+        second = self.agent.tasks.start("write twice", session_id="session-one")
+        self.agent.sandbox.active_task_id = second
+        self.agent.sandbox.write_file("page.txt", "version two")
+
+        self.bridge.undo_session("session-one", confirm=True)
+        workspace = Path(self.temp.name) / "workspace"
+        self.assertFalse((workspace / "page.txt").exists())
+
+    # ------------------------------------------------------- it asks first
+
+    def test_it_shows_what_it_would_touch_before_doing_anything(self):
+        """"Are you sure" answers nothing; the list of files does."""
+        self.build("mine.txt", "content", "session-one")
+        preview = self.bridge.undo_session("session-one")
+        self.assertTrue(preview["confirm_needed"])
+        self.assertIn("mine.txt", preview["paths"])
+        # Nothing happened yet.
+        self.assertEqual(self.read("mine.txt"), "content")
+
+    def test_a_conversation_with_nothing_to_undo_says_so_plainly(self):
+        answer = self.bridge.undo_session("never-existed")
+        self.assertFalse(answer["ok"])
+        self.assertIn("before Aura recorded", answer["error"])
+
+    def test_an_empty_id_is_refused(self):
+        self.assertFalse(self.bridge.undo_session("")["ok"])
+
+    # ------------------------------------------------- partial is reported
+
+    def test_one_task_with_nothing_left_does_not_abandon_the_rest(self):
+        """Stopping halfway without saying so would be the worst of both."""
+        done = self.build("first.txt", "one", "session-one")
+        self.build("second.txt", "two", "session-one")
+        self.agent.sandbox.rollback_task(done)     # already undone by hand
+
+        result = self.bridge.undo_session("session-one", confirm=True)
+        self.assertEqual(result["tasks_undone"], 1)
+        self.assertEqual(result["tasks_skipped"], 1)
+        self.assertFalse((Path(self.temp.name) / "workspace" / "second.txt").exists())
+
+    # ------------------------------------------------------ it is recoverable
+
+    def test_what_it_removes_is_itself_recoverable(self):
+        self.build("mine.txt", "content", "session-one")
+        self.bridge.undo_session("session-one", confirm=True)
+        trash = list((Path(self.temp.name) / "workspace" / ".aura-trash").glob("*mine.txt"))
+        self.assertTrue(trash, "the current version should be kept in the trash")
+
+    # ------------------------------------------------------- only the user
+
+    def test_the_model_cannot_undo_a_whole_conversation(self):
+        """`rollback_task` is a tool for the task in hand. A whole conversation
+        is a different size of action, and nothing the model says reaches it."""
+        names = {item["function"]["name"] for item in self.agent.tool_definitions()}
+        self.assertNotIn("undo_session", names)
+        self.assertNotIn("rollback_session", names)
+
+
 class SelfCheckTests(unittest.TestCase):
     """Improvement 4: one answer to "is anything broken?".
 

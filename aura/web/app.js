@@ -1450,6 +1450,29 @@ async function startNewSession() {
   toast("Started a new conversation. The previous one is kept.");
 }
 
+async function undoConversation(session) {
+  // Asked twice on purpose, and the first ask is not a warning but a list:
+  // "are you sure" answers nothing, while the names of the files it will put
+  // back is the thing a person actually needs in order to decide.
+  const preview = await callApi("undo_session", session.id, false);
+  if (!preview.ok) return toast(preview.error, true);
+  const files = preview.paths || [];
+  const summary = files.length
+    ? `${files.length} file(s) would be put back:\n\n${files.slice(0, 20).join("\n")}`
+      + (files.length > 20 ? `\n… and ${files.length - 20} more` : "")
+    : "This conversation made no file changes that are still undoable.";
+  if (!files.length) return toast(summary);
+  if (!window.confirm(`Undo everything this conversation changed?\n\n${summary}`
+                      + "\n\nThe current versions go to the workspace trash, so this is "
+                      + "itself recoverable.")) return;
+  const result = await callApi("undo_session", session.id, true);
+  if (!result.ok) return toast(result.error, true);
+  const skipped = result.tasks_skipped
+    ? `, ${result.tasks_skipped} task(s) had nothing to undo` : "";
+  toast(`Undid ${result.changes_undone} change(s) across ${result.tasks_undone} task(s)${skipped}.`);
+  await openSessions(false);
+}
+
 async function openSessions(focus = true) {
   // Opening the panel starts from the whole list; refreshes keep what was typed.
   if (focus) { $("#sessionSearch").value = ""; openModal(elements.sessionsModal); }
@@ -1526,6 +1549,11 @@ async function openSessions(focus = true) {
         });
         actions.append(archive);
       }
+      const undo = document.createElement("button");
+      undo.type = "button"; undo.className = "control-button danger";
+      undo.textContent = "Undo its changes";
+      undo.addEventListener("click", () => undoConversation(session));
+      actions.append(undo);
       // Exporting the conversation you are in is fine — it only reads it.
       const exportButton = document.createElement("button");
       exportButton.type = "button"; exportButton.textContent = "Export";

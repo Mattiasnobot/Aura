@@ -166,17 +166,54 @@ been visible in one place before, such as *"Piper is ready (en_US-lessac-medium.
 carried in the text as well as the colour, since an icon alone is not readable by a screen
 reader; measured in the running page at 4.91–11.62:1.
 
-## 5. Undoing a whole conversation
+## 5. Undoing a whole conversation — **done 2026-08-17**
 
 Today a single change or one task can be rolled back. *"Undo everything you did
 in this conversation"* is the natural next step, and the data already supports
 it — sessions and changes are both recorded, and changes carry their task id.
 
+**The data did not quite support it.** Changes carry a task id and messages carry a session id,
+but nothing joined the two: `task_events` had no session, so "this conversation" could not be
+expressed at all. That needed **migration 4** — and it is the first one that actually changes a
+column, which is exactly the case the note on migration 2 said the mechanism existed for. No
+`CREATE TABLE IF NOT EXISTS` can add a column to a table already holding someone's history.
+
+**Old rows are deliberately not backfilled.** A conversation from before this reports that it
+cannot be undone, rather than matching tasks by timestamp. Guessing is the one thing an action
+this destructive must never do, and a near-miss would undo somebody else's work.
+
+**Two decisions about how it behaves:**
+
+- **Newest task first.** Oldest-first would restore an early backup and then let a later one
+  overwrite it, leaving the workspace in a state that never existed. A test pins the order by
+  writing the same file twice.
+- **A failure does not abandon the rest.** The conversation is undone as far as it can be and
+  what could not be is named. Stopping halfway in silence would be the worst of both.
+
+**It asks first, and the asking is a list rather than a warning.** "Are you sure?" answers
+nothing; the names of the files that would come back is what a person actually needs. The
+current versions go to the workspace trash, so the undo is itself recoverable.
+
+**Only the user reaches it.** `rollback_task` remains a tool the model may call for the task in
+hand; a whole conversation is a different size of action, and no tool exposes it.
+
+**Verified live.** The real database migrated to v4 with all 406 task rows intact — after the
+same migration was rehearsed on a copy first. Aura then built `undo-test/index.html` and
+`undo-test/style.css` in a fresh conversation, and undoing it through the real handler showed
+both paths in the confirmation, removed the folder, left both versions in `.aura-trash`, and
+reported honestly: *"Undid 2 change(s) across 1 task(s), 1 task(s) had nothing to undo."* The
+`promo/` work from other conversations was untouched.
+
+**One robustness gap this exposed.** Every migration until now was empty, so re-running one was
+free. `ADD COLUMN` has no `IF NOT EXISTS`, so a database whose `user_version` was ever reset
+would have refused to open at all. Applying an already-applied column is now treated as
+success.
+
 ---
 
 ## Order
 
-**2 → 1 → 4 → 5 → 3.** Items 2, 1 and 4 are done; **5 is next.**
+**2 → 1 → 4 → 5 → 3.** Items 2, 1, 4 and 5 are done. **Only item 3 remains**, and it still carries its open question for the user: how often several projects are actually in play.
 
 Item 2 first because it repairs what is measurably broken. Item 1 next because it
 is the one that makes her feel independent, and it rides on the phase 48

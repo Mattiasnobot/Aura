@@ -377,7 +377,7 @@ class AuraAgent:
                token: Callable[[str], None] | None = None) -> str:
         set_state = state or (lambda _: None)
         self.cancel_event.clear()
-        task_id = self.tasks.start(message)
+        task_id = self.tasks.start(message, session_id=self.session_id)
         self.current_task_id = task_id
         self.sandbox.active_task_id = task_id
         self._remember("user", message)

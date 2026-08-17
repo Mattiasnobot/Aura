@@ -18,10 +18,11 @@ class TaskJournal:
             self.db = Database(Path(path).parent / "aura.db")
             self._owns_db = True
 
-    def start(self, request: str) -> str:
+    def start(self, request: str, session_id: str = "") -> str:
         task_id = uuid4().hex[:12]
         self.db.add_task_event({"event": "started", "task_id": task_id, "time": self._now(),
-                                "request": request[:4000]})
+                                "request": request[:4000],
+                                "session_id": str(session_id) or None})
         return task_id
 
     def record_tool(self, task_id: str, name: str, arguments: dict, result: dict) -> None:

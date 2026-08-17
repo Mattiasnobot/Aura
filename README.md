@@ -164,6 +164,17 @@ This checks Python, the local HTML service and assets, the LM Studio server, and
 - The local interface answers on `127.0.0.1` and `localhost` only, and every API call additionally needs the session cookie and Aura's own client header.
 - Recovery is kept for 30 days or 500 changes, whichever ends first. Expiring a change removes its backups in the same transaction, and Aura never deletes a backup another record still needs.
 
+## Undoing a whole conversation
+
+**Conversations → Undo its changes** puts back every file that conversation changed, newest
+task first. It shows the list of files before doing anything, and the versions it removes go to
+the workspace trash, so the undo is itself recoverable.
+
+A conversation that happened before Aura recorded which conversation each task belonged to
+reports that it cannot be undone this way, rather than matching by timestamp — a near-miss
+would undo somebody else's work. Single changes and single tasks can still be rolled back as
+before.
+
 ## Is anything broken?
 
 **More → Is anything broken?** runs one pass over everything Aura depends on — the model

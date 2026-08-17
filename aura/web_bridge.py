@@ -128,6 +128,37 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         # first time, and the interface must not wait for it.
         threading.Thread(target=bring_up, daemon=True, name="aura-search-start").start()
 
+    def undo_session(self, session_id: str, confirm: bool = False) -> dict:
+        """Undo everything one conversation changed in the workspace.
+
+        Only the user reaches this. `rollback_task` is a tool the model may
+        call for the task it is running; a whole conversation is a different
+        size of action, and nothing the model can say should reach for it.
+        """
+        wanted = str(session_id or "").strip()
+        if not wanted:
+            return {"ok": False, "error": "Name the conversation to undo."}
+        task_ids = self.agent.db.tasks_for_session(wanted)
+        if not task_ids:
+            # Said plainly rather than reported as success. A conversation from
+            # before session ids were recorded genuinely cannot be undone this
+            # way, and matching it by timestamp would be a guess.
+            return {"ok": False, "error": (
+                "Nothing in this conversation can be undone. Either it changed "
+                "no files, or it happened before Aura recorded which "
+                "conversation each task belonged to.")}
+        preview = self.agent.db.undoable_paths_for_tasks(task_ids)
+        if not confirm:
+            return {"ok": True, "confirm_needed": True, "tasks": len(task_ids),
+                    "paths": preview}
+        result = self.agent.sandbox.rollback_session(task_ids)
+        self.agent.log.record("undo_session", "ok", session_id=wanted,
+                              tasks_undone=result["tasks_undone"],
+                              tasks_skipped=result["tasks_skipped"],
+                              changes_undone=result["changes_undone"])
+        self._push("memory_changed", action="undone")
+        return {"ok": True, **result}
+
     def self_check(self) -> dict:
         """One answer to "is anything broken?", for the user and for Aura.
 
