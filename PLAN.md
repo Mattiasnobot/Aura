@@ -1248,3 +1248,46 @@ situation where the router has already failed.
 understood *least*. Mutations stay recoverable and dangerous actions still ask first, so it is
 defensible — but it is a safety-shaped decision rather than a performance one, and it belongs
 to the user.
+
+**Decided 2026-08-17: the fallback stays read-only.** An unrouted request gets the six looking
+tools and nothing else. The rule holds as written — guessing is acceptable for reading and
+never for writing — and the measurement above does not override it, because what it showed was
+that the wider catalogue is *no better*, not that it is safer. No code changed: this records a
+decision so it is not reopened as though it were still open.
+
+
+## Aura 0.2.0 — released 2026-08-17
+
+Phase 49 was the release gate and it closed today, so the version was cut. `dist/aura-0.2.0.zip`,
+47 files, 244 KB.
+
+**0.2.0 rather than 1.0**, deliberately. This is a feature release on a product that still has
+two named gaps: the empty-response failure is instrumented but undiagnosed, and there is no
+Estonian voice — a decision taken with the costs on the table, not an oversight.
+
+**What is in it**, all of it built and verified today:
+
+- Web search through a SearXNG the user runs, snippets only, with a per-turn budget — and Aura
+  managing the container's lifecycle so starting her starts search.
+- Estonian understood by the tool router, the mutation check, and the completion contracts.
+  Before: sixteen of twenty ordinary Estonian requests produced no tools at all.
+- The reply language pinned in the prompt, after Aura answered a whole turn in Finnish.
+- Two voices with automatic switching, and an honest notice when the language has no voice.
+- Aura reading her own journals and speaking when a pattern forms.
+- A self-check answering "is anything broken?" in one place.
+- Undoing a whole conversation, on a new schema version.
+- Project memory: three projects in play no longer means one recalled fact in five belonging to
+  a different one.
+- Aura Mind gained the one relationship a user can honestly edit, and the file plan stays on
+  screen and ticks off as files really appear.
+
+**463 tests, all green.** Schema at version 4; an existing database migrates in place, verified
+first on a copy of the real one.
+
+**Verified as a release, not just as a build.** The packager reports that no personal file is
+included, so that claim was checked independently against the archive rather than taken on
+trust — nothing matching workspace, conversation, memory, permission, log, database or voice
+data is in it. Then the zip was extracted into a clean folder and run there: version 0.2.0, 53
+tools, 6 checks, `self_check` answering, and a fresh database migrating straight to schema 4.
+Copying the files is the risk with a hand-written include list, and only running the result
+catches it.
