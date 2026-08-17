@@ -116,8 +116,11 @@ def select(message: str, autonomy: str = "balanced",
                 "latest news", "news about", "veebist", "internetist", "netist",
                 "guugelda"):
         names.add("search_web")
+    # "meelde" was hardcoded here before the hint layer existed, and it now does
+    # real damage: it sits inside "jäta meelde" (keep this in mind) and routed a
+    # fact about the user to the scheduler. The language belongs in one place.
     if includes("remind", "reminder", "later", "in an hour", "tomorrow",
-                "don't let me forget", "meelde"):
+                "don't let me forget"):
         names.add("set_reminder")
     if includes("keep an eye", "watch for", "check regularly", "every day",
                 "notice when", "let me know if"):

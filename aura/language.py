@@ -112,8 +112,17 @@ ESTONIAN_HINTS: tuple[tuple[str, str], ...] = (
     # arithmetic
     ("arvuta", "calculate"),
     ("protsent", "percentage"),
-    # memory
+    # memory. These exist so the *router* offers the memory tools; what is worth
+    # keeping, and in what words, is then the model's judgement rather than a
+    # regex's. It speaks Estonian; it was simply never given the chance.
     ("mäleta", "remember"),
+    ("jäta meelde", "remember"),
+    ("pea meeles", "remember"),
+    ("eelista", "preference"),
+    ("eesmärk", "remember my goal"),
+    ("mulle meeldib", "remember i like"),
+    ("ma kasutan", "remember i use"),
+    ("ma tahan, et aura", "i want aura to"),
     ("meelespe", "remember"),
     ("unusta", "forget"),
     ("eelistus", "preference"),
@@ -221,14 +230,28 @@ def with_english_hints(message: str) -> str:
 
     def annotate(clause: re.Match[str]) -> str:
         body = clause.group(0)
-        hints: list[str] = []
+        found: list[tuple[int, int, str]] = []
         for pattern, hint in _PATTERNS:
-            for found in pattern.finditer(body):
-                if _token_at(body, found.start()).casefold() in ENGLISH_LOOKALIKES:
+            for match in pattern.finditer(body):
+                if _token_at(body, match.start()).casefold() in ENGLISH_LOOKALIKES:
                     continue
-                if hint not in hints:
-                    hints.append(hint)
+                found.append((match.start(), match.end(), hint))
                 break
+        # A shorter stem sitting inside a longer one is not a second meaning, it
+        # is the same words read less carefully. `meelde` -> remind lives inside
+        # `jäta meelde` -> remember, and letting both through turned "remember
+        # this about me" into "schedule me a notification".
+        found.sort(key=lambda span: span[1] - span[0], reverse=True)
+        kept: list[tuple[int, int, str]] = []
+        for start, end, hint in found:
+            if any(other_start <= start and end <= other_end
+                   for other_start, other_end, _ in kept):
+                continue
+            kept.append((start, end, hint))
+        hints: list[str] = []
+        for _start, _end, hint in sorted(kept):
+            if hint not in hints:
+                hints.append(hint)
         return f"{body} {' '.join(hints)}" if hints else body
 
     return _CLAUSE.sub(annotate, text)

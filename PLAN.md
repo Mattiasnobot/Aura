@@ -1468,3 +1468,144 @@ it to find out would be wasting the day.
 bugs in one day, all in the predictive checks — and the inference from that to "so stop
 predicting" was wrong. The bugs were not caused by prediction. They were caused by prediction
 in a language the predicates had never been taught, which was fixed by teaching them, once.
+
+
+## 53. Memory, recall, and what the map shows — Planned (P1)
+
+Written 2026-08-17. Three measurements, taken before proposing anything.
+
+### 53.1 — Aura learns nothing from Estonian
+
+| the same six statements | learned |
+|---|---|
+| *"I prefer dark backgrounds"*, *"I use VS Code"*, … | **6 / 6** |
+| *"Ma eelistan tumedaid taustu"*, *"Ma kasutan VS Code-i"*, … | **0 / 6** |
+
+`LEARNING_PATTERNS` is eight English regexes. This fails **silently**: he tells her something
+about himself, she answers warmly, and nothing is kept — no error, no notice, and no way to
+find out except to ask later and discover she does not know.
+
+**The first version of this step proposed writing Estonian regexes to match. That was aimed at
+the wrong layer, and the user said so: the model already speaks Estonian.** Checking that
+objection changed the step entirely.
+
+**What the evidence actually shows.** Of the five memories in the real store, **four were typed
+in by hand** through *What Aura knows*. The regex path has produced exactly one in all of use —
+and it is the only unconfirmed one, at 0.84, scraped out of a half-sentence. As a mechanism for
+learning it has already been outvoted four to one by the user doing it himself.
+
+And Aura has a better mechanism already: `remember_preference`, `remember_personal_fact` and
+`remember_name` are **tools the model can call**, and the model understands Estonian perfectly
+well. Asked in Estonian, though, it called none of them — because **the router never offered
+them**. Measured on four plain Estonian statements: memory tools offered, **zero times out of
+four**.
+
+The reason is three missing stems and one wrong one:
+
+| statement | what the annotation produces |
+|---|---|
+| "Ma **eelistan** tumedaid taustu" | nothing — the stem is `eelistus`, a noun, and this is the verb |
+| "**Jäta meelde**, et …" | `remind` — a **reminder**, not a memory |
+| "Minu **eesmärk** on …" | nothing |
+| "**Mulle meeldib** …" | `build`, and nothing about memory |
+
+**"Jäta meelde" is the one worth naming.** It means *keep this in mind*, and Aura hears
+*remind me later* — so a fact about the user would have been turned into a scheduled
+notification. That is a wrong answer, not a missing one.
+
+**So the step is now: teach the router these are statements about the user, and let the model do
+the understanding.** Stems in `ESTONIAN_HINTS`, in the one file that already holds them, and the
+memory tools reach the table; from there the model decides what is worth keeping and in what
+words — which is exactly the thing it is better at than a regex.
+
+`LEARNING_PATTERNS` stays English-only and is not extended. It is the path used when the
+provider cannot call tools at all, and the evidence says it should not be trusted with more than
+that.
+
+**One collision to fix while there.** `meelde` → `remind` and `jäta meelde` → `remember` would
+both fire, since the shorter stem sits inside the longer. The annotation layer has no notion of
+a longest match, which was noted earlier the same day with `teha oskad` and left alone. Here it
+produces a genuinely wrong route, so the longer stem needs to win.
+
+### 53.2 — Estonian words are mangled before recall ever runs
+
+`relevant_memories` scores by word overlap, and its word regex is `[a-z0-9]{3,}`:
+
+| word | what the scorer sees |
+|---|---|
+| tööruum | `ruum` |
+| ülesanne | `lesanne` |
+| võrdlus | `rdlus` |
+| **kõik** | **nothing at all** |
+
+So the most distinctively Estonian words — the ones carrying `õäöüšž` — are exactly the ones
+recall cannot match on. A memory that exists and is relevant will not be found.
+
+**Two sites, and only one is safe to change without thought.** `_comparable_fact` is computed
+on read, for conflict reporting, so widening it changes only which pairs are offered as possible
+contradictions. `_fact_key` is **stored** on every memory (`re.sub(r"[^a-z0-9]+", " ", …)`), and
+changing it silently changes the identity of every existing fact — so deduplication and the
+legacy-preference adoption would stop recognising what they already hold. If that one is
+touched at all it needs the same treatment as a schema migration, rehearsed on a copy of the
+real `memory.json` first.
+
+### 53.3 — Aura Mind does not show what Aura does on her own
+
+`graph_model.py` contains **zero** references to scheduled checks, reminders, or proposals.
+Everything phase 48 built — what she watches, what she will do unprompted, what she is waiting
+to ask about — is missing from the map that claims to show what she knows and does. The layer
+mechanism is already there and derives itself from the graph, so this is new nodes and edges
+rather than new machinery.
+
+### Order, and why
+
+**53.1 first**, because it is the only one of the three where information is being lost **right
+now, every day**. 53.2 second — same family, smaller, and it makes the memories that do exist
+findable. 53.3 last: nothing is at risk there, only invisible.
+
+### The risk that matters, stated before starting
+
+**Over-eager learning is worse than not learning.** A pattern that fires too readily fills the
+store with half-understood sentences, and every one of them then has to be deleted by hand —
+and worse, they are recalled into the model's context in the meantime, so a bad memory actively
+degrades answers rather than merely sitting there.
+
+So 53.1 is measured on **both** sides: coverage against the six statements, and **false
+positives against the 97 real requests in the journal**, which are mostly *instructions* rather
+than statements about the user. A pattern that learns something from "Create folder called Mat"
+has failed, however good its recall.
+
+
+## The empty response, diagnosed — 2026-08-17
+
+Instrumented in the morning, caught the same evening. Two occurrences, identical:
+
+    finish_reason = stop    prompt_tokens = 3653    completion_tokens = 1
+    finish_reason = stop    prompt_tokens = 3775    completion_tokens = 1
+
+**That settles it, and it rules out everything that had been suspected.** Not the token budget:
+`max_tokens` is 32768 and the model produced **one** token. Not truncation, not a crash, not an
+unloaded model — `finish_reason` is `stop`, which is the model reporting that it finished on
+purpose.
+
+**The model emits a single token and stops. It is not failing; it is declining.** Both captures
+were requests that carry their own answer inside them — the Aura Mind "tell me about this node"
+prompt, which supplies the fact and then asks about it — so the model evidently judged there was
+nothing to add.
+
+**Which makes Aura's message wrong.** *"Check that a model is loaded in LM Studio, or try a
+shorter request"* sends the user to inspect something that is working perfectly: a model is
+loaded, it answers in milliseconds, and the prompt is 3.7k tokens against a 32k budget. Every
+part of that advice points at a cause the measurement has now excluded.
+
+**So the fix is the wording, not the mechanism.** When the finish reason is `stop` with a
+one-token completion and a healthy prompt, Aura should say what actually happened — the model
+had nothing to add to that request — rather than sending the user to check the server. The retry
+ladder itself is sound: asking again is a reasonable answer to silence, and it sometimes works.
+
+**A hole in the instrument, found the same evening.** The first capture read
+`finish_reason=(not given)` with two zeros, because the finish reason and token counts had been
+added to the *non-streaming* parser while the live app **streams**. The measurement had the same
+shape as the bug it was measuring. Fixed by reading the finish reason from the final chunk and
+requesting `stream_options: {include_usage: true}`, without which a streamed reply carries no
+totals at all.

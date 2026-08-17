@@ -341,6 +341,9 @@ class LMStudioProvider(Provider):
                              int(usage.get("completion_tokens") or 0))
 
     def _stream_completion(self, payload: dict, on_token: Callable[[str], None]) -> ProviderReply:
+        # Without this a streamed reply carries no totals at all, so an empty one
+        # cannot be told apart from one that ran out of budget.
+        payload = {**payload, "stream_options": {"include_usage": True}}
         request = Request(
             f"{self.base_url}/chat/completions", data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json", "Authorization": "Bearer lm-studio"},
@@ -348,6 +351,8 @@ class LMStudioProvider(Provider):
         )
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
+        finish_reason = ""
+        prompt_tokens = completion_tokens = 0
         tool_parts: dict[int, dict[str, str]] = {}
         try:
             with urlopen(request, timeout=self.timeout) as response:
@@ -360,9 +365,17 @@ class LMStudioProvider(Provider):
                         break
                     try:
                         event = json.loads(data)
+                        usage = event.get("usage")
+                        if isinstance(usage, dict):
+                            prompt_tokens = int(usage.get("prompt_tokens") or 0)
+                            completion_tokens = int(usage.get("completion_tokens") or 0)
                         choices = event.get("choices") or []
                         if not choices:
+                            # The usage-only chunk arrives with no choices, which
+                            # is why it has to be read before this line.
                             continue
+                        if choices[0].get("finish_reason"):
+                            finish_reason = str(choices[0]["finish_reason"])
                         delta = choices[0].get("delta") or {}
                     except (json.JSONDecodeError, AttributeError, IndexError) as exc:
                         raise ProviderError(f"LM Studio sent an invalid stream event: {exc}") from exc
@@ -425,7 +438,8 @@ class LMStudioProvider(Provider):
             # A reasoning model can finish a turn having emitted only its private
             # thinking. Using that is better than reporting that nothing came back.
             streamed = "".join(reasoning_parts).strip()
-        return ProviderReply(streamed, calls)
+        return ProviderReply(streamed, calls, finish_reason,
+                             prompt_tokens, completion_tokens)
 
     def reply(self, message: str, context: ProviderContext) -> str:
         response = self.complete(self.start_messages(message, context))

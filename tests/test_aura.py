@@ -4811,6 +4811,50 @@ class EstonianRoutingTests(unittest.TestCase):
                     collisions.append((stem, hint, word))
         self.assertEqual(collisions, [], f"Estonian stems firing on English: {collisions}")
 
+    # ------------------------------------------- telling Aura about yourself
+
+    MEMORY_TOOLS = {"remember_name", "remember_preference", "remember_personal_fact"}
+
+    def test_an_estonian_statement_about_yourself_reaches_the_memory_tools(self):
+        """Measured before this: memory tools offered zero times out of four.
+
+        The model speaks Estonian perfectly well — it was never given the
+        chance, because routing never put the tools on the table. What is worth
+        keeping, and in what words, stays the model's judgement.
+        """
+        for request in ("Ma eelistan tumedaid taustu.",
+                        "Jäta meelde, et ma kasutan VS Code-i.",
+                        "Minu eesmärk on Aura valmis saada.",
+                        "Mulle meeldib veebilehti ehitada."):
+            offered = self.names(request)
+            self.assertTrue(offered & self.MEMORY_TOOLS, request)
+
+    def test_keeping_something_in_mind_is_not_a_reminder(self):
+        """"Jäta meelde" means *keep this in mind*; Aura heard *remind me later*
+        and would have turned a fact about the user into a notification."""
+        keep = self.names("Jäta meelde, et ma kasutan VS Code-i.")
+        self.assertTrue(keep & self.MEMORY_TOOLS)
+        self.assertNotIn("set_reminder", keep)
+
+        later = self.names("Tuleta mulle tunni pärast meelde")
+        self.assertIn("set_reminder", later)
+        self.assertFalse(later & self.MEMORY_TOOLS)
+
+    def test_the_longer_stem_wins_over_one_inside_it(self):
+        """`meelde` sits inside `jäta meelde`. Letting both through is not two
+        meanings, it is the same words read less carefully."""
+        annotated = language.with_english_hints("jäta meelde, et ma kasutan seda")
+        self.assertIn("remember", annotated)
+        self.assertNotIn("remind", annotated)
+
+    def test_ordinary_work_is_not_treated_as_a_confession(self):
+        """The risk this step was warned against: a memory store filling up with
+        half-understood sentences, which are then recalled into context."""
+        for request in ("Tee kausta promo uus leht", "Loe fail notes.txt ette",
+                        "Kustuta fail vana.txt", "Käivita testid",
+                        "Create folder called Mat", "list files"):
+            self.assertFalse(self.names(request) & self.MEMORY_TOOLS, request)
+
     # ------------------------------------------- what the turn is held to
 
     #: These decide what Aura promised to produce and whether the turn counts as
