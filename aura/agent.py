@@ -103,6 +103,8 @@ class AuraAgent:
         # Every external URL actually fetched in the current turn, so a reply
         # that used the network can name what it read.
         self.fetched_sources: list[str] = []
+        #: Sticky for the conversation; cleared when a new one starts.
+        self.current_project: str | None = None
         #: Told after every tool, so a caller can follow the work while it
         #: happens. Set per turn, in the same way approve/state/token are.
         self.on_tool: Callable[[str, dict, bool], None] | None = None
@@ -137,6 +139,8 @@ class AuraAgent:
     def new_session(self) -> str:
         """Begin a fresh conversation, leaving the previous one intact on disk."""
         self.session_id = uuid4().hex[:12]
+        # A new conversation is not a continuation of the last project.
+        self.current_project = None
         self.config.update(current_session=self.session_id)
         self.memory.data["conversation"] = []
         self.memory.save()
@@ -364,8 +368,48 @@ class AuraAgent:
             "content": f"data:{media_type};base64,{encoded}",
         }
 
+    def workspace_projects(self) -> list[str]:
+        """Top-level folders. A project here is a folder, not a guess at a noun."""
+        root = Path(self.sandbox.root)
+        if not root.is_dir():
+            return []
+        return sorted(item.name for item in root.iterdir()
+                      if item.is_dir() and not item.name.startswith("."))
+
+    def detect_project(self, message: str) -> str | None:
+        """Which project this request is about.
+
+        Matched against folders that actually exist, so an ordinary word can
+        never invent a project. Measured before this existed: "Add a contact
+        page to the promo site" detected nothing, because the only shape
+        recognised was "in the promo folder".
+        """
+        text = str(message or "").casefold()
+        for name in self.workspace_projects():
+            lowered = name.casefold()
+            if re.search(rf"(?<![\w-]){re.escape(lowered)}(?![\w-])", text):
+                return name
+        # An explicit "the X project" or "in the X folder" is the user saying
+        # which project this is, and it holds whether or not the folder exists
+        # yet — a project usually gets named before it gets created. The
+        # existence rule above is only there to stop a bare noun like "shopping
+        # list" inventing one.
+        return self._extract_artifact_contract(message)[0]
+
+    def project_for(self, message: str) -> str | None:
+        """The project in play, remembered across the conversation.
+
+        A follow-up rarely names it again — "now add a footer to it" is the
+        normal second message — and forgetting it there is what made Aura recall
+        another project's rules for the work in hand.
+        """
+        found = self.detect_project(message)
+        if found:
+            self.current_project = found
+        return self.current_project
+
     def _context(self, query: str = "") -> ProviderContext:
-        project = self._extract_artifact_contract(query)[0] if query else None
+        project = self.project_for(query) if query else self.current_project
         recalled = self.memory.relevant_memories(query, 12, project=project)
         # Remember what was recalled so the interface can explain the choice.
         self.last_recalled = recalled
@@ -381,11 +425,15 @@ class AuraAgent:
         self.current_task_id = task_id
         self.sandbox.active_task_id = task_id
         self._remember("user", message)
+        # Before learning, not after: the project decides how a fact learned in
+        # this message is filed, and the first message of a conversation is
+        # exactly the one that names the project.
+        self.project_for(message)
         self.last_recalled = []
         self.fetched_sources = []
         self.searches_this_turn = {}
         self.last_learned = (
-            self.memory.learn_from_message(message, project=self._extract_artifact_contract(message)[0])
+            self.memory.learn_from_message(message, project=self.current_project)
             if bool(self.config.data.get("learn_from_conversations", True)) else [])
         for item in self.last_learned:
             self.log.record("learn_profile", "ok", memory_id=item["id"],
@@ -605,6 +653,13 @@ class AuraAgent:
             ("list", "read", "show", "find", "search", "open", "inspect", "check",
              "validate", "compare", "look at", "screenshot", "capture", "undo",
              "run ", "test"))
+        # Caught in live use: "ja mitu rida on seal esimeses failis?" names a
+        # file, asks a question, and contains no verb from the list above — so
+        # nothing insisted on a tool, and Aura answered "137 rida" about a file
+        # of 46 without opening it. A question about something in the workspace
+        # expects a look, whether or not it happens to use a reading verb.
+        asks_for_work = asks_for_work or (
+            "?" in routing_request and self._question_needs_looking(routing_request))
         action_expected = (bool(selected_tools) and asks_for_work
                            and not (auto_learning_only or memory_read_question))
         state_of_turn = TurnState(
@@ -1076,6 +1131,32 @@ class AuraAgent:
             # answer: "tere" is not a request to go and look at anything.
             names.update(cls.FALLBACK_TOOLS)
         return [definition for definition in definitions if definition["function"]["name"] in names]
+
+    #: Questions that cannot be answered without looking. A count or a size is
+    #: a fact about a file, not an opinion about it.
+    MEASURING_WORDS = ("mitu", "kui suur", "kui pikk", "kui palju", "how many",
+                       "how large", "how big", "how long", "what size", "line count")
+
+    def _question_needs_looking(self, message: str) -> bool:
+        """Does this question ask for something only the workspace can answer?
+
+        The first attempt at this counted the words *file*, *folder* and
+        *project*, and that was too loose: "How does my project look these
+        days?" is conversation, and demanding a tool for it burns the retry
+        budget proving something nobody asked about — the exact failure an
+        existing test was written to prevent.
+
+        What actually separates the two is whether the question asks for a
+        **fact**: a named file, a real project folder, or a count or size.
+        """
+        lowered = str(message).casefold()
+        if re.search(r"[\w.-]+\.(?:py|json|toml|md|txt|html|htm|css|js|ts|tsx|jsx|yaml|yml)\b",
+                     lowered):
+            return True
+        if any(word in lowered for word in self.MEASURING_WORDS):
+            return True
+        return any(re.search(rf"(?<![\w-]){re.escape(name.casefold())}(?![\w-])", lowered)
+                   for name in self.workspace_projects())
 
     def _routing_request(self, message: str) -> str:
         """Add recent user intent only when the message explicitly refers back."""

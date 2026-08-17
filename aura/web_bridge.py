@@ -567,7 +567,11 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
                          "recall_reason": item.get("recall_reason")}
                         for item in self.agent.last_recalled if item.get("recall_reason")]
             self._push("reply", text=response, streamed=bool(streamed),
-                       task=recent[0] if recent else None, recalled=recalled)
+                       task=recent[0] if recent else None, recalled=recalled,
+                       # Sticky state that silently changes which memories are
+                       # recalled has to be visible, or "why did she use the
+                       # promo rule here?" has no answer on screen.
+                       project=self.agent.current_project)
             if language.looks_finnish(response) and language.detect(text) == "et":
                 # The model drifts to Finnish when it is asked in Estonian, and a
                 # reply in the wrong language reads as Aura being confused rather

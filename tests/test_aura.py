@@ -3987,6 +3987,108 @@ class RecurringCheckTests(unittest.TestCase):
         self.assertEqual(self.bridge.list_scheduled()["scheduled"], [])
 
 
+class ProjectMemoryTests(unittest.TestCase):
+    """Improvement 3: project memory, not only user memory.
+
+    The user works on about three projects at a time. Measured with three in
+    play before this existed: the project was **never** detected from an
+    ordinary request, and one recalled fact in five belonged to a different
+    project — matched on a shared word like "footer", which makes it misleading
+    rather than merely useless.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        for name in ("promo", "aura_craft", "shop"):
+            (Path(self.temp.name) / "workspace" / name).mkdir(parents=True, exist_ok=True)
+        self.addCleanup(self.temp.cleanup)
+
+    def remember(self, value, project=None, category="project", pinned=False):
+        item = self.agent.memory.learn_fact(category, value, source="test")
+        if project or pinned:
+            self.agent.memory.update_profile_memory(item["id"], project=project or "",
+                                                    pinned=pinned)
+        return item
+
+    def recalled(self, request):
+        project = self.agent.project_for(request)
+        return project, [item["value"] for item
+                         in self.agent.memory.relevant_memories(request, 12, project=project)]
+
+    # -------------------------------------------------------------- detection
+
+    def test_a_project_is_recognised_from_ordinary_wording(self):
+        """"in the promo folder" was the only shape understood, and nobody
+        writes that."""
+        for request, expected in (("Add a contact page to the promo site", "promo"),
+                                  ("Update the aura_craft landing page", "aura_craft"),
+                                  ("fix shop/style.css", "shop"),
+                                  ("Tee promo kausta uus leht", "promo")):
+            self.assertEqual(self.agent.detect_project(request), expected, request)
+
+    def test_only_folders_that_exist_can_be_projects(self):
+        """Otherwise an ordinary noun invents one."""
+        self.assertIsNone(self.agent.detect_project("write a shopping list"))
+        self.assertIsNone(self.agent.detect_project("promotional wording"))
+
+    def test_the_project_is_remembered_across_the_conversation(self):
+        """"Now add a footer to it" is the normal second message."""
+        self.assertEqual(self.agent.project_for("Update the aura_craft landing page"),
+                         "aura_craft")
+        self.assertEqual(self.agent.project_for("Now add a footer to it"), "aura_craft")
+
+    def test_naming_another_project_moves_the_conversation(self):
+        self.agent.project_for("Update the aura_craft landing page")
+        self.assertEqual(self.agent.project_for("now fix the promo site"), "promo")
+
+    def test_a_new_conversation_does_not_inherit_the_project(self):
+        self.agent.project_for("Update the aura_craft landing page")
+        self.agent.new_session()
+        self.assertIsNone(self.agent.current_project)
+
+    # ---------------------------------------------------------------- scoping
+
+    def test_another_projects_rule_is_kept_out(self):
+        self.remember("promo pages must keep the footer contact block", "promo")
+        self.remember("aura_craft is built from one shared style.css", "aura_craft")
+        project, values = self.recalled("Add a footer to the aura_craft page")
+        self.assertEqual(project, "aura_craft")
+        self.assertTrue(any("shared style.css" in value for value in values))
+        self.assertFalse(any("promo" in value for value in values))
+
+    def test_general_facts_are_always_available(self):
+        """A preference is about the user, not about one piece of work."""
+        self.remember("prefers HTML interfaces", category="preference")
+        self.remember("promo uses a dark palette", "promo")
+        _project, values = self.recalled("Update the aura_craft landing page")
+        self.assertTrue(any("HTML interfaces" in value for value in values))
+
+    def test_a_pinned_fact_crosses_projects(self):
+        """Pinning is the user saying "always", and always outranks scope."""
+        self.remember("never use inline styles anywhere", "promo", pinned=True)
+        _project, values = self.recalled("Update the aura_craft landing page")
+        self.assertTrue(any("inline styles" in value for value in values))
+
+    def test_with_no_project_in_play_nothing_is_hidden(self):
+        """Hiding every tagged fact when the project is unknown would recall
+        less than before, not more carefully."""
+        self.remember("promo uses a dark palette", "promo")
+        # No project named and none remembered, so the new rule must not fire.
+        self.assertIsNone(self.agent.current_project)
+        _project, values = self.recalled("tell me about the palette")
+        self.assertTrue(any("dark palette" in value for value in values))
+
+    # --------------------------------------------------------------- learning
+
+    def test_a_fact_learned_while_on_a_project_is_tagged_with_it(self):
+        self.agent.project_for("Update the aura_craft landing page")
+        learned = self.agent.memory.learn_from_message(
+            "I prefer rounded cards on every page", project=self.agent.current_project)
+        self.assertTrue(learned)
+        self.assertTrue(all(item.get("project") == "aura_craft" for item in learned))
+
+
 class ConversationUndoTests(unittest.TestCase):
     """Improvement 5: undo everything one conversation changed.
 
@@ -4628,6 +4730,11 @@ class BilingualSpeechTests(unittest.TestCase):
 
 
 class EstonianRoutingTests(unittest.TestCase):
+
+    def setUp(self):
+        self._workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(self._workspace.cleanup)
+
     """Tools are routed by keyword, and the keywords were English only.
 
     Measured on twenty ordinary requests before this existed: sixteen Estonian
@@ -4726,13 +4833,18 @@ class EstonianRoutingTests(unittest.TestCase):
                   "run ", "test")
 
     def contract(self, message):
+        if not hasattr(self, "agent"):
+            self.agent = AuraAgent(Path(self._workspace.name) / "workspace",
+                                   provider=MockProvider())
         annotated = language.with_english_hints(message.casefold())
         base, _paths = AuraAgent._extract_artifact_contract(message)
         return {
             "staged": any(w in annotated for w in ("build", "project", "app", "website")),
             "validation_asked": "validate" in annotated,
             "asks_for_work": (AuraAgent._requires_mutation(message)
-                              or any(v in annotated for v in self.WORK_VERBS)),
+                              or any(v in annotated for v in self.WORK_VERBS)
+                              or ("?" in message
+                                  and self.agent._question_needs_looking(annotated))),
             "external": AuraAgent._targets_external_location(message),
             "base": base,
         }
@@ -4741,6 +4853,27 @@ class EstonianRoutingTests(unittest.TestCase):
         for estonian, english in self.CONTRACT_PAIRS:
             with self.subTest(request=estonian):
                 self.assertEqual(self.contract(estonian), self.contract(english))
+
+    def test_a_question_about_a_file_expects_a_look(self):
+        """Caught in live use, not by a test.
+
+        "Ja mitu rida on seal esimeses failis?" names a file, asks a question,
+        and uses no reading verb — so nothing insisted on a tool, and Aura
+        answered "137 rida" about a file of 46 without opening it. The turn was
+        recorded as completed.
+        """
+        for request in ("Ja mitu rida on seal esimeses failis?",
+                        "How many lines are in that file?",
+                        "Kui suur on style.css?"):
+            self.assertTrue(self.contract(request)["asks_for_work"], request)
+
+    def test_an_ordinary_question_is_still_just_a_question(self):
+        """The first attempt counted the words *file* and *project*, which made
+        "How does my project look these days?" an errand and burned the retry
+        budget proving something nobody asked about."""
+        for request in ("Kuidas sul läheb?", "Tere!", "Kas sa mäletad mu nime?",
+                        "How does my project look these days?"):
+            self.assertFalse(self.contract(request)["asks_for_work"], request)
 
     def test_an_estonian_read_request_still_has_to_actually_read(self):
         """The worst of the thirteen, and the quietest.

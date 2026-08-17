@@ -112,7 +112,7 @@ The approval card was reused rather than a new panel invented; it only changes
 its wording — "Before Aura builds this", *Build these* / *Stop* — and keeps the
 line breaks, because a plan is a list to read rather than a command to scan.
 
-## 3. Project memory, not only user memory
+## 3. Project memory, not only user memory — **done 2026-08-17**
 
 **Opinion, with less evidence.** Aura remembers things about *the user*. But she
 works inside projects, and "aura_craft uses this structure" is a different kind
@@ -124,6 +124,60 @@ from nothing.
 
 **Open question for the user:** how often several projects are actually in play.
 That decision is theirs more than mine.
+
+**Answered: about three at a time**, depending on what ideas come up and what people ask for.
+Three is the number at which this stops being tidiness — with one project nothing can be
+confused; with three, facts cross.
+
+**Measured with three projects in play, before anything was built:**
+
+- The project was **never detected** from ordinary wording. "Add a contact page to the promo
+  site" produced nothing, because the only shapes understood were "in the promo folder" and
+  "the promo project" — and nobody writes those.
+- **One recalled fact in five belonged to a different project**, matched on a shared word like
+  *footer*. Not merely unhelpful: applying promo's footer rule to aura_craft work is worse than
+  recalling nothing.
+- The follow-up was the worst case. *"Now add a footer to it"* named no project, so the whole
+  scope was lost mid-conversation.
+
+Three changes, and the scoring in `relevant_memories` was already there waiting for a project
+to be passed in:
+
+- **A project is a folder that exists**, matched anywhere in the wording, so an ordinary noun
+  cannot invent one — *"write a shopping list"* is not the `shop` project. An explicit "the X
+  project" is still honoured even when the folder does not exist yet, because a project is
+  usually named before it is created.
+- **It is remembered across the conversation** and cleared when a new one starts.
+- **Another project's fact is held back**, unless it is pinned — pinning is the user saying
+  *always*, and always outranks scope. General facts about the user are never scoped away.
+
+Facts are now filed under the project **before** learning rather than after, since the first
+message of a conversation is exactly the one that names it.
+
+**The sticky project is shown**, in the status line as *"Local · private · on promo"*. State
+that silently decides which memories are recalled must be visible, or "why did she use the
+promo rule here?" has no answer on screen.
+
+**Verified live**: after 0 of 5 requests before, all three probe requests detect the right
+project with zero cross-project recall, and in the running app *"Mis on promo kaustas?"* set the
+status line to **on promo**, which then survived a follow-up that never named it.
+
+### A real bug this turned up, in live use rather than in a test
+
+Asked *"Ja mitu rida on seal esimeses failis?"*, Aura answered **"137 rida"** about a file of
+47 — **without opening it**. The task journal shows no tool at all for that turn, and the turn
+was recorded as *completed*.
+
+It is the same family as the morning's `asks_for_work` fix, in a shape the measurement set did
+not contain: a question that needs reading but uses no reading verb. The first fix for it was
+too loose — counting the words *file* and *project* made *"How does my project look these
+days?"* an errand and burned the retry budget, which an existing test caught immediately. What
+actually separates them is whether the question asks for a **fact**: a named file, a real
+project folder, or a count or size.
+
+Live afterwards, the same question called `file_info` and answered **47**, with *"Confirmed
+evidence: Final file state inspected"*. That 47 is correct: the file has no trailing newline,
+so `wc -l` reports 46 while an editor shows 47.
 
 ## 4. A self-check — **done 2026-08-17**
 
@@ -213,7 +267,7 @@ success.
 
 ## Order
 
-**2 → 1 → 4 → 5 → 3.** Items 2, 1, 4 and 5 are done. **Only item 3 remains**, and it still carries its open question for the user: how often several projects are actually in play.
+**2 → 1 → 4 → 5 → 3.** **All five are done**, finished 2026-08-17.
 
 Item 2 first because it repairs what is measurably broken. Item 1 next because it
 is the one that makes her feel independent, and it rides on the phase 48

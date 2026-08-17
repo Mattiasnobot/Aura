@@ -75,6 +75,9 @@ let diffFirstFile = null;
 let previewServerState = { running: false };
 let selectedMindNode = null;
 let planSteps = [];
+// Which project Aura believes the conversation is about. It decides which
+// remembered facts she brings, so it is shown rather than kept to herself.
+let currentProject = null;
 let dragDepth = 0;
 let personalMemories = [];
 let memoryCategories = [];
@@ -450,7 +453,8 @@ function updatePowerStatus(values = {}) {
   elements.statusLine.innerHTML = "";
   const dot = document.createElement("span");
   dot.className = "dot";
-  elements.statusLine.append(dot, document.createTextNode("Local • private • calm"));
+  elements.statusLine.append(dot, document.createTextNode(
+    currentProject ? `Local • private • on ${currentProject}` : "Local • private • calm"));
   elements.statusLine.title =
     `${depth[0].toUpperCase()}${depth.slice(1)} thinking • ${capabilityState.tools || "many"} tools • `
     + `${capabilityState.autonomy_mode || "balanced"} • ${memories} ${memories === 1 ? "memory" : "memories"}`;
@@ -617,6 +621,10 @@ async function handleEvent(event) {
       elements.conversation.scrollTop = elements.conversation.scrollHeight;
       break;
     case "reply":
+      if (event.project !== undefined && event.project !== currentProject) {
+        currentProject = event.project || null;
+        updatePowerStatus();
+      }
       let completedMessage;
       if (event.streamed && streamMessage) {
         completedMessage = streamMessage;

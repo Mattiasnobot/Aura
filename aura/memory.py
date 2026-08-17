@@ -316,7 +316,16 @@ class MemoryStore:
                 haystack = f"{item.get('category', '')} {item.get('topic', '')} {item.get('value', '')}".casefold()
                 overlap = sum(1 for word in words if word in haystack)
                 general = item.get("category") in {"preference", "work_style"}
-                same_project = bool(project) and item.get("project") == project
+                belongs_to = item.get("project")
+                same_project = bool(project) and belongs_to == project
+                if (project and belongs_to and not same_project
+                        and not item.get("pinned")):
+                    # Another project's rule is not merely unhelpful here, it is
+                    # misleading: measured with three projects in play, one in
+                    # five recalled facts belonged to a different one, matched
+                    # purely on a shared word like "footer". Pinned facts are
+                    # the user saying "always", so they still pass.
+                    continue
                 score = overlap * 5 + (8 if item.get("pinned") else 0) + (2 if general else 0)
                 score += (6 if same_project else 0)
                 score += float(item.get("confidence", 0))

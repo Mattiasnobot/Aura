@@ -164,6 +164,21 @@ This checks Python, the local HTML service and assets, the LM Studio server, and
 - The local interface answers on `127.0.0.1` and `localhost` only, and every API call additionally needs the session cookie and Aura's own client header.
 - Recovery is kept for 30 days or 500 changes, whichever ends first. Expiring a change removes its backups in the same transaction, and Aura never deletes a backup another record still needs.
 
+## Project memory
+
+Aura remembers things about you, and separately about each project. A project is a top-level
+workspace folder; she works out which one a request is about from its wording, remembers it for
+the rest of the conversation, and shows it in the status line as *on promo*.
+
+Facts learned while working on a project are filed under it, and **another project's facts are
+held back** while you are somewhere else — with three projects in play, one recalled fact in
+five used to belong to a different one, matched on a shared word. General facts about you are
+never scoped away, and a pinned fact crosses every project, since pinning means *always*.
+
+You can correct which project a memory belongs to in **Aura Mind**: select it and set or clear
+the project. That is the only relationship on the map you can edit, because every other one is
+derived from the data.
+
 ## Undoing a whole conversation
 
 **Conversations → Undo its changes** puts back every file that conversation changed, newest
