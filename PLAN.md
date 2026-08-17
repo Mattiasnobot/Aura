@@ -1291,3 +1291,180 @@ data is in it. Then the zip was extracted into a clean folder and run there: ver
 tools, 6 checks, `self_check` answering, and a fresh database migrating straight to schema 4.
 Copying the files is the risk with a hand-written include list, and only running the result
 catches it.
+
+
+## 52. Stop predicting intent — **52.1 done; 52.2 and 52.3 withdrawn on the evidence** (P1)
+
+Written 2026-08-17, the day 0.2.0 shipped, from what that day's work actually revealed.
+
+**The honest summary of 2026-08-17: Aura got much better and the code got a little worse.**
+Five separate bugs were fixed, each measured and each real — Estonian routing, mutation
+detection, greeting detection, the workspace-question rule, the completion contracts. Every fix
+was correct. Every fix also **added another keyword rule**, which is the pattern phase 50 set
+out to reduce.
+
+| | before phase 50 | after phase 50 | now |
+|---|---|---|---|
+| `agent.py` | 1861 lines | ~1900 | **2332** |
+| `_tool_conversation` | 344 lines | 156 | **193** |
+| keyword tests in `agent.py` | — | — | **62** |
+
+### The actual defect
+
+`TurnState` already holds two kinds of field, side by side:
+
+- **Predicted from the words, before anything ran:** `expected_paths`, `expected_base`,
+  `requires_mutation`, `action_expected`, `validation_asked`, `build_words`.
+- **Observed, from what the turn did:** `successful_tools`, `mutation_performed`,
+  `workspace_mutation`, `external_activity`, `verified_final_paths`, `validation_succeeded`,
+  `empty_response`.
+
+**Every bug fixed today was in the first group.** The gates that read the second group have not
+produced a bug since phase 50.3 introduced them. The structure is already right; there is
+simply too much prediction in it.
+
+And the predictions are made **five separate times from the same words**: `_requires_mutation`,
+`validation_asked`, `build_words`, `asks_for_work`, `memory_read_question` each run their own
+substring pass over the request. So a phrasing that one of them understands, another misses —
+which is exactly how "ja mitu rida on failis?" got tools but no obligation to use them.
+
+### The change: one language-aware decision, everything else derived
+
+Routing already decides which tools fit, and since today it is **the one place that understands
+Estonian**, through `language.with_english_hints`. Everything else should read *its* answer
+rather than re-deriving intent from the raw words:
+
+- `build_words` → was a file-creating tool offered?
+- `validation_asked` → was `validate_project` offered *and* named?
+- `requires_mutation` → was a mutating tool offered? (still a prediction, but one that speaks
+  every language the router does)
+- `asks_for_work` → were tools offered beyond the read-only fallback?
+
+**Why this is worth doing rather than tidiness:** the "137 rida" bug — Aura inventing a line
+count without opening the file — needed a new rule in two languages to catch. Derived from
+routing it would have been caught with **no new keywords at all, in every language**, including
+ones nobody has thought about. That is the difference between a fix and an architecture.
+
+### Steps
+
+**The rule from phase 50 holds: no existing test may change.** If a test has to be edited,
+behaviour drifted; that is a failure of the step.
+
+- **52.1 — Measure what is replaceable.** For each of the five predicates, compare the
+  keyword answer against the derived-from-routing answer across a corpus of real requests
+  (the journal has 139 tasks with their exact wording). Any predicate where they disagree needs
+  its disagreement understood before it is replaced, not after. **This step may conclude that
+  some predicate must stay predictive** — that is a legitimate outcome, and better recorded
+  than forced.
+- **52.2 — Derive the four listed above from the routing result.** One at a time, suite green
+  between each.
+- **52.3 — `action_expected` last, and most carefully.** It is the one that decides whether
+  Aura is *made to retry*, so a wrong answer here either nags or lets an invented answer
+  through. It gets its own live verification against the real model, in both languages.
+- **52.4 — Move routing and language out of `agent.py`** into `aura/routing.py`. Choosing tools
+  is not running a turn, and `select_tool_definitions` is 131 lines of a 2332-line file that is
+  supposed to be about conducting a conversation.
+
+### What success looks like
+
+`agent.py` back under 2000 lines, the five keyword predicates down to one language-aware
+decision, and — the real test — **a new language could be added by extending
+`ESTONIAN_HINTS`-style data alone**, with no change to any gate.
+
+### The risk, stated plainly
+
+Routing is *tuned for recall*: it offers a tool when in doubt, because withholding one makes
+Aura claim she cannot work. Judgements derived from it inherit that bias, so
+"a mutating tool was offered" is a **weaker** claim than "the words asked for a change". Where
+that difference matters — the artifact contract especially — the derived version may demand
+files a request never wanted, which is the phase 42 failure in a new costume. 52.1 exists to
+find that before 52.2 causes it.
+
+---
+
+### 52.1 — Done 2026-08-17. **It disproved 52.2.**
+
+Measured on **97 distinct real requests** from the task journal, plus 16 Estonian ones written
+today and kept separate, since the history is almost entirely English.
+
+| predicate | agree | keyword says yes only | **derived says yes only** |
+|---|---|---|---|
+| `requires_mutation` | 90 | 0 | **7** |
+| `validation_asked` | 75 | 0 | **22** |
+| `build_words` | 74 | 3 | **20** |
+| `asks_for_work` | 80 | 2 | **15** |
+
+**The disagreements are almost entirely in one direction: the derived version says yes when the
+keyword one says no.** That is the recall bias, exactly as the risk section predicted, and it is
+not a tuning problem — it is what routing is *for*.
+
+What that would mean in use:
+
+- *"Create folder called Mat"* → derived `validation_asked` is true, so Aura would demand a
+  validation nobody asked for and spend retries on it.
+- *"Hi my name is Mattias"* → routing offers the memory tools, so derived `asks_for_work` is
+  true, and a message that merely states a name would be held to having run something.
+- *"Which folders outside the workspace am I allowing you to read?"* → a question, but
+  `write_external_file` is offered, so derived `requires_mutation` is true.
+
+Every one of those is the nagging failure this project has fixed twice already, reintroduced by
+a change meant to be an improvement.
+
+**So 52.2 should not be built as written.** The keyword predicates are the *conservative* side —
+they are wrong 0–3 times in 97, against 7–22 for the derived version. Being conservative is what
+they are for: they decide when Aura is **made to keep working**, and a false yes there costs the
+user a retry budget and their patience.
+
+### What this changes about the phase
+
+**The language argument was already answered this morning, in the right place.** On the Estonian
+corpus `requires_mutation` agrees **16 / 16**, because `with_english_hints` annotates once and
+every predicate reads the annotated text. The five passes are not five language problems; they
+are one language decision, already centralised, read five times. That is far less wrong than it
+looked at 2332 lines.
+
+**What survives:**
+
+- **52.4 stands on its own merits** — routing and language move out of `agent.py` into
+  `aura/routing.py`. That is structure, not behaviour: `select_tool_definitions` is 131 lines
+  about *choosing* tools inside a 2332-line file about *conducting a turn*, and no measurement
+  is needed to see it does not belong there.
+- **The predicates stay predictive**, and stay where a reader can find them together.
+
+### 52.4 — Done 2026-08-17.
+
+`aura/routing.py`, 204 lines, holding `select`, `FALLBACK_TOOLS`,
+`strip_negative_clauses` and `question_needs_looking`. `is_greeting` went to
+`language.py` instead, which is where recognising wording in a language belongs — and it
+already carried Estonian, which was the clue.
+
+| | before | after |
+|---|---|---|
+| `agent.py` | 2332 lines | **2163** |
+| keyword tests in `agent.py` | 62 | **21** |
+| `routing.py` | — | 204, and `self.` appears nowhere in it |
+
+**No test file was touched** — the rule for this phase and for phase 50. `git status` shows
+`agent.py`, `language.py` and the new `routing.py`, and nothing under `tests/`. The facade is
+what makes that possible: `AuraAgent.select_tool_definitions` keeps its exact signature and
+delegates, because twelve tests call it directly.
+
+**Moved by script, and the first attempt was wrong.** Walking backwards over decorators to find
+each member's start wandered into the *previous* member, producing a 33-line `routing.py` and
+an agent.py that had grown rather than shrunk. Restored from a copy and redone with explicit
+anchors and an assertion on each block's size before anything was written — the check is the
+point, since a silent partial move would have been a very hard bug to find later.
+
+**Two things came along that were not planned for.** `question_needs_looking` sat between the
+moved members and travelled with them; it belongs there, but needed the workspace folders
+passed in rather than reached for. And `select` called the greeting check, which had no home
+until `language.py` took it.
+
+**What is withdrawn:** 52.2 and 52.3. Deriving intent from what routing offered is a worse
+answer than the one already in place, and the measurement says so plainly enough that building
+it to find out would be wasting the day.
+
+**Worth recording about the proposal itself.** It was mine, argued from a real pattern — five
+bugs in one day, all in the predictive checks — and the inference from that to "so stop
+predicting" was wrong. The bugs were not caused by prediction. They were caused by prediction
+in a language the predicates had never been taught, which was fixed by teaching them, once.

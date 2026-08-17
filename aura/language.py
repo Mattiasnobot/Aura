@@ -340,3 +340,21 @@ def detect(text: str, default: str = "en") -> str:
     if SHARED_LETTERS & set(lowered) and default == "et":
         return "et"
     return default if default in {"et", "en"} else "en"
+
+
+# ----------------------------------------------------------------- greetings
+
+def is_greeting(message: str) -> bool:
+    cleaned = re.sub(r"[^\wõäöüšž]+", " ", message.casefold(), flags=re.UNICODE).strip()
+    # Estonian greetings inflect and pair up the way English ones do, and
+    # "tere hommikust" was landing in the routing chain as an ordinary
+    # request. It is the same English-only assumption as everywhere else.
+    return bool(re.fullmatch(
+        r"(?:hei|tere|tsau|nami|hello|hi|hey|yo)"
+        r"(?: (?:there|hommikust|päevast|õhtust|aura))?"
+        r"|(?:good (?:morning|afternoon|evening))(?: aura)?"
+        r"|(?:tere (?:hommikust|päevast|õhtust))(?: aura)?"
+        r"|(?:hommik|hommikust|päevast|õhtust)(?: aura)?",
+        cleaned,
+    ))
+
