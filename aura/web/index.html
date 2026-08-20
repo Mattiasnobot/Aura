@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07101c">
+  <title>Aura</title>
+  <!-- Inline so the browser never asks for /favicon.ico the local server has no answer for. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2307101c'/%3E%3Ccircle cx='16' cy='16' r='7' fill='none' stroke='%235be0c8' stroke-width='2.5'/%3E%3Ccircle cx='16' cy='16' r='2.5' fill='%235be0c8'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <aside id="sidebar" class="sidebar">
+      <div class="brand-row">
+        <div class="brand-mark">A</div>
+        <div><strong>Aura</strong><span>local companion</span></div>
+      </div>
+
+      <div id="faceWrap" class="face-wrap" data-state="idle" aria-label="Aura is idle" role="button" tabindex="0" title="Aura is here — click for quick actions">
+        <div class="orbit orbit-one"></div>
+        <div class="orbit orbit-two"></div>
+        <div class="avatar-stage model-3d">
+          <canvas id="avatarCanvas" class="avatar-canvas" width="260" height="300" role="img" aria-label="Aura's locally rendered depth-projected digital face"></canvas>
+          <div class="holo-scan" aria-hidden="true"></div>
+          <div class="holo-index" aria-hidden="true"><span>AU</span><i></i><span>01</span></div>
+        </div>
+        <div id="stateLabel" class="state-label">IDLE</div>
+      </div>
+
+      <!-- One quiet status block instead of four competing lines. What Aura is
+           doing belongs next to her face; what she is allowed to do belongs in
+           the menu with the rest of the settings. -->
+      <div id="statusLine" class="status-line" role="status">Local • private • calm</div>
+      <div id="providerLabel" class="provider-label">Checking the model…</div>
+
+      <nav class="side-actions" aria-label="Aura controls">
+        <button id="voiceButton" class="side-button" aria-pressed="false" aria-describedby="voiceHint" title="Click to talk, or hold while speaking"><span class="button-icon">◉</span> <span id="voiceButtonLabel">Voice</span> <span class="voice-wave" aria-hidden="true"><i></i><i></i><i></i></span></button>
+        <div id="voiceTray" class="voice-tray hidden" aria-live="polite">
+          <div class="voice-tray-head"><strong id="voiceStatus">Ready to listen</strong><button id="voiceCancel" type="button" title="Cancel voice input" aria-label="Cancel voice input">×</button></div>
+          <div class="voice-meter" role="meter" aria-label="Microphone level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="voiceMeterFill"></i></div>
+          <p id="voicePartial">Click once for automatic listening, or hold the Voice button while speaking.</p>
+          <div class="voice-tray-actions"><button id="voiceRetry" type="button" class="hidden">Retry</button><span id="voiceHint">Local • click or hold to talk</span></div>
+        </div>
+        <button id="mindButton" class="side-button accent"><span class="button-icon">✦</span> Aura Mind <kbd>Ctrl M</kbd></button>
+        <button id="filesButton" class="side-button"><span class="button-icon">≡</span> Workspace</button>
+        <button id="menuButton" class="side-button" aria-haspopup="true" aria-expanded="false"><span class="button-icon">⋯</span> More</button>
+      </nav>
+
+      <!-- Everything that is used occasionally rather than constantly. -->
+      <div id="sideMenu" class="side-menu hidden" role="menu" aria-labelledby="menuButton">
+        <button id="memoryButton" class="menu-item" role="menuitem"><span class="button-icon">◇</span> What Aura knows</button>
+        <button id="tasksButton" class="menu-item" role="menuitem"><span class="button-icon">✓</span> Recent tasks</button>
+        <button id="healthButton" class="menu-item" role="menuitem"><span class="button-icon">◍</span> Is anything broken?</button>
+        <button id="permissionsButton" class="menu-item" role="menuitem"><span class="button-icon">⚿</span> Permissions</button>
+        <button id="settingsButton" class="menu-item" role="menuitem"><span class="button-icon">⚙</span> Settings</button>
+        <button id="workspaceButton" class="menu-item" role="menuitem"><span class="button-icon">↗</span> Open workspace folder</button>
+        <button id="watchButton" class="menu-item" role="menuitem"><span class="button-icon">◷</span> What Aura watches</button>
+        <button id="openProgress" type="button" title="Open a window that shows whether Aura is still working">Progress window</button>
+        <button id="toggleLogButton" class="menu-item" role="menuitem"><span class="button-icon">▤</span> <span id="toggleLogLabel">Show action log</span></button>
+        <div class="menu-separator" role="separator"></div>
+        <div class="menu-status">
+          <span id="networkLabel" class="network-label">Offline • local only</span>
+          <button id="pauseAutonomy" class="autonomy-toggle" aria-pressed="false" title="Pause anything Aura would do on her own">Background: on</button>
+        </div>
+        <button id="emergencyStop" class="menu-item danger" role="menuitem" title="Stop everything now: pause background work and cancel what is running"><span class="button-icon">■</span> Stop everything</button>
+        <button id="quitButton" class="menu-item danger" role="menuitem"><span class="button-icon">○</span> Quit Aura</button>
+      </div>
+
+      <div class="sidebar-footer">
+        <span id="workspacePath">aura-workspace</span>
+        <button id="collapseSidebar" title="Collapse sidebar" aria-label="Collapse sidebar" aria-expanded="true">‹</button>
+      </div>
+    </aside>
+
+    <div id="sidebarResizer" class="vertical-resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" title="Drag to resize sidebar"></div>
+
+    <main class="main-panel">
+      <header class="topbar">
+        <div>
+          <h1>Conversation</h1>
+          <p id="activityText" role="status" aria-live="polite">Aura is ready.</p>
+        </div>
+        <div class="top-actions">
+          <button id="newSessionButton" class="ghost-button" title="Start a new conversation. The current one is kept.">New</button>
+          <button id="sessionsButton" class="ghost-button" title="Open, search, export or archive earlier conversations">Conversations</button>
+          <button id="clearButton" class="ghost-button subtle" title="Clear the view only. Nothing is deleted.">Clear</button>
+        </div>
+      </header>
+
+      <!-- Deliberately not a live region: streaming rewrites this element on
+           every token, which a screen reader would read out over and over.
+           Finished replies are announced once through #announcer instead. -->
+      <section id="conversation" class="conversation"></section>
+      <div id="announcer" class="sr-only" role="status" aria-live="polite"></div>
+
+      <div id="logResizer" class="horizontal-resizer" role="separator" aria-orientation="horizontal" aria-label="Resize action log" title="Drag to resize action log"></div>
+      <section id="actionPanel" class="action-panel">
+        <div class="panel-heading">
+          <div class="log-tabs" role="tablist" aria-label="Activity log view">
+            <button id="activityLogTab" class="active" role="tab" aria-selected="true">Activity</button>
+            <button id="diagnosticsLogTab" role="tab" aria-selected="false">Diagnostics</button>
+          </div>
+          <div class="panel-heading-end">
+            <button id="exportDiagnostics" class="log-action" title="Write a shareable report of settings, storage, permissions, and recent failures into the workspace">Export report</button>
+            <span id="logCount">0 events this session</span>
+          </div>
+        </div>
+        <div id="actionLog" class="action-log"></div>
+      </section>
+
+      <section id="planStrip" class="plan-strip hidden" aria-label="Task plan" role="status"><div class="plan-head"><strong>Building</strong><span id="planCount"></span></div><ol id="planSteps"></ol></section>
+      <section id="suggestionBar" class="suggestion-bar" aria-label="Suggested actions"></section>
+
+      <section class="composer-shell">
+        <textarea id="composer" rows="2" maxlength="12000" placeholder="Talk to Aura or ask her to build something…" aria-label="Message Aura"></textarea>
+        <div class="composer-actions">
+          <button id="attachButton" class="attach-button" title="Import files into Aura's workspace" aria-label="Import files">＋</button>
+          <input id="filePicker" class="hidden" type="file" multiple>
+          <button id="stopButton" class="stop-button" disabled>Stop</button>
+          <button id="sendButton" class="send-button">Send <span>↗</span></button>
+        </div>
+        <div class="composer-hint">Enter to send • Shift+Enter for a new line • Esc to stop</div>
+      </section>
+    </main>
+
+    <section id="mindView" class="mind-view hidden" aria-label="Aura Mind">
+      <header class="mind-toolbar">
+        <div><strong>Aura Mind</strong><span id="mindSummary">living local map</span></div>
+        <div class="mind-tools">
+          <label>Find <input id="mindSearch" type="search" placeholder="Search the map"></label>
+          <button id="mindFit">Fit</button><button id="mindReset" title="Put every node back where Aura would draw it, forgetting the ones you moved">Reset</button><button id="mindRefresh">Refresh</button>
+          <button id="mindClose" class="mind-close" aria-label="Close Aura Mind">×</button>
+        </div>
+      </header>
+      <canvas id="mindCanvas" tabindex="0" aria-label="Interactive Aura Mind knowledge map">Aura Mind requires a browser with Canvas support.</canvas>
+      <div id="mindCard" class="mind-card hidden" role="dialog" aria-labelledby="mindCardTitle" aria-modal="false">
+        <header class="mind-card-head">
+          <div><h3 id="mindCardTitle"></h3><span id="mindCardKind" class="mind-card-kind"></span></div>
+          <button id="mindCardClose" class="mind-card-close" aria-label="Close this card">×</button>
+        </header>
+        <div id="mindCardBody" class="mind-card-body"></div>
+        <div id="mindCardEdit" class="mind-card-edit hidden">
+          <label>What Aura remembers<textarea id="mindCardText" rows="4" maxlength="600"></textarea></label>
+          <label>Project<input id="mindCardProject" type="text" maxlength="80" placeholder="none — type a name to link it"></label>
+        </div>
+        <footer id="mindCardActions" class="mind-card-actions"></footer>
+      </div>
+      <footer class="mind-footer">
+        <div id="mindLegend" class="mind-legend" role="group" aria-label="Map layers — select one to show or hide it"></div>
+        <div class="mind-detail-row"><div id="mindDetail">Select a node to see what Aura knows about it.</div><div id="mindActions" class="mind-actions hidden"><label id="mindProjectField" class="mind-project hidden">Project<input id="mindProject" type="text" maxlength="80" placeholder="none — type a name to link it"></label><button id="mindProjectSave" class="hidden">Link</button><button id="mindAsk">Ask Aura</button><button id="mindOpen">Open</button></div></div>
+        <small>Drag nodes • drag empty space to pan • mouse wheel to zoom • Esc to close</small>
+      </footer>
+    </section>
+
+    <section id="workspaceView" class="workspace-view hidden" aria-label="Workspace explorer">
+      <header class="workspace-toolbar">
+        <div><strong>Workspace</strong><span id="workspaceSummary">Loading local files…</span></div>
+        <div class="workspace-tools">
+          <label><span>Find</span><input id="workspaceSearch" type="search" placeholder="Filter files"></label>
+          <button id="workspaceTrashToggle">Trash</button>
+          <button id="workspaceHistory">History</button>
+          <button id="workspacePreviewServer">Preview</button>
+          <button id="workspaceRefresh">Refresh</button>
+          <button id="workspaceOpenFolder">Open folder</button>
+          <button id="workspaceClose" class="workspace-close" aria-label="Close workspace explorer">×</button>
+        </div>
+      </header>
+      <div class="workspace-content">
+        <aside class="workspace-tree-panel">
+          <div class="workspace-tree-heading">
+            <span id="workspaceTreeLabel">Files</span>
+            <div class="workspace-tree-heading-actions">
+              <button id="workspaceNewFile">New file</button>
+              <button id="workspaceNewFolder">New folder</button>
+              <button id="workspaceImport">Import</button>
+            </div>
+          </div>
+          <div id="workspaceTree" class="workspace-tree" role="tree"></div>
+        </aside>
+        <section class="workspace-preview-panel">
+          <header class="preview-toolbar">
+            <div><strong id="previewPath">Choose a file</strong><span id="previewMeta">Safe read-only preview</span></div>
+            <div><button id="previewCompare" disabled>Compare</button><button id="previewAsk" disabled>Ask Aura</button><button id="previewOpen" disabled>Open</button></div>
+          </header>
+          <div id="workspacePreview" class="workspace-preview"><div class="preview-empty"><span>◇</span><strong>Select a workspace file</strong><p>Text, code, images, HTML, and SVG can be previewed locally.</p></div></div>
+        </section>
+      </div>
+      <footer>Drop files anywhere in Aura to import them safely • previews never execute scripts</footer>
+    </section>
+  </div>
+
+  <div id="memoryModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="memoryTitle">
+    <div class="modal-card memory-card">
+      <header><div><h2 id="memoryTitle">What Aura knows about you</h2><p id="memoryPrivacy">Local, transparent, and always under your control.</p></div><button class="modal-x" aria-label="Close" data-close="memoryModal">×</button></header>
+      <div class="memory-overview">
+        <div><span>Name</span><strong id="memoryName">Not set</strong></div>
+        <div><span>Personal memories</span><strong id="memoryCount">0</strong></div>
+        <label><span>Find</span><input id="memorySearch" type="search" placeholder="Filter memories"></label>
+      </div>
+      <form id="memoryTeach" class="memory-teach">
+        <select id="memoryCategory" aria-label="Memory category"></select>
+        <input id="memoryValue" maxlength="240" placeholder="Teach Aura something non-sensitive about you" aria-label="Personal memory">
+        <button class="primary-button" type="submit">Teach Aura</button>
+      </form>
+      <div id="memoryList" class="memory-list"></div>
+      <footer><span>Credentials and sensitive personal details are never learned automatically.</span><button id="memoryExport" type="button">Export</button><button class="primary-button" data-close="memoryModal">Done</button></footer>
+    </div>
+  </div>
+
+
+  <div id="welcomeModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="welcomeTitle">
+    <div class="modal-card welcome-card">
+      <header><div><h2 id="welcomeTitle">Welcome to Aura</h2><p id="welcomeStepCount">Step 1 of 3</p></div></header>
+
+      <section class="welcome-step" data-step="1">
+        <p>Aura is a companion that runs entirely on this computer. She answers using a model you run yourself in LM Studio, and she works inside one protected folder.</p>
+        <p class="welcome-note">Her workspace is <code id="welcomeWorkspace">…</code>. Everything she writes goes there, and everything she remembers stays on this machine. There is no account and no API key — unless you deliberately choose a cloud model in Settings, and the status line says so for as long as you do.</p>
+      </section>
+
+      <section class="welcome-step hidden" data-step="2">
+        <p>Aura needs LM Studio running with a model loaded. Start LM Studio, load a model, and turn on its local server — then check the connection here.</p>
+        <label class="welcome-field">LM Studio address
+          <input id="welcomeUrl" type="text" spellcheck="false" value="http://127.0.0.1:1234/v1">
+        </label>
+        <label class="welcome-field">Model
+          <select id="welcomeModel"><option value="">Automatic selection</option></select>
+        </label>
+        <div class="welcome-actions"><button id="welcomeCheck" type="button">Check connection</button></div>
+        <p id="welcomeStatus" class="modal-status"></p>
+      </section>
+
+      <section class="welcome-step hidden" data-step="3">
+        <p>You are ready. A few things worth knowing:</p>
+        <ul class="welcome-list">
+          <li><strong>Ask her to build something.</strong> She creates and edits files in her workspace, and every change can be undone.</li>
+          <li><strong>She cannot reach the rest of your computer</strong> until you grant a folder under <strong>Permissions</strong>. She can never grant it to herself.</li>
+          <li><strong>Anything risky asks first</strong> — running a project, installing packages, or reaching the network.</li>
+          <li><strong>If something misbehaves</strong>, use <strong>Export report</strong> under the action log; it describes the problem without including anything you said.</li>
+        </ul>
+      </section>
+
+      <footer>
+        <button id="welcomeSkip" type="button">Skip for now</button>
+        <button id="welcomeBack" type="button" class="hidden">Back</button>
+        <button id="welcomeNext" class="primary-button" type="button">Next</button>
+      </footer>
+    </div>
+  </div>
+
+  <div id="healthModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="healthTitle">
+    <div class="modal-card memory-card">
+      <header><div><h2 id="healthTitle">Is anything broken?</h2><p id="healthSummary">Checking…</p></div><button class="modal-x" aria-label="Close" data-close="healthModal">×</button></header>
+      <div id="healthList" class="memory-list"></div>
+      <footer><span>Nothing here changes anything, apart from writing and deleting one probe file in the workspace.</span><button id="healthAgain" class="primary-button">Check again</button></footer>
+    </div>
+  </div>
+
+  <div id="watchModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="watchTitle">
+    <div class="modal-card memory-card">
+      <header><div><h2 id="watchTitle">What Aura watches</h2><p>Read-only checks that run on their own and speak only when something is wrong. Nothing here changes a file without asking.</p></div><button class="modal-x" aria-label="Close" data-close="watchModal">×</button></header>
+      <div id="watchList" class="memory-list"></div>
+      <footer><span id="watchNote">Quiet hours and the daily limit still apply.</span><button class="primary-button" data-close="watchModal">Done</button></footer>
+    </div>
+  </div>
+
+  <div id="sessionsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="sessionsTitle">
+    <div class="modal-card memory-card">
+      <header><div><h2 id="sessionsTitle">Conversations</h2><p>Every conversation is kept locally. Open one to continue it.</p></div><button class="modal-x" aria-label="Close" data-close="sessionsModal">×</button></header>
+      <div class="session-search"><input type="search" id="sessionSearch" placeholder="Search everything said in every conversation…" aria-label="Search conversations"></div>
+      <div id="sessionList" class="memory-list"></div>
+      <footer><label class="inline-check"><input type="checkbox" id="showArchivedSessions"> Show archived</label><span>Starting a new conversation never deletes an old one.</span><button class="primary-button" data-close="sessionsModal">Done</button></footer>
+    </div>
+  </div>
+
+  <div id="permissionsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="permissionsTitle">
+    <div class="modal-card memory-card">
+      <header><div><h2 id="permissionsTitle">Permissions</h2><p id="permissionsNote">Folders outside the workspace that Aura may read. Web pages need no permission — she reads any public address, but never one that resolves onto this machine or your network.</p></div><button class="modal-x" aria-label="Close" data-close="permissionsModal">×</button></header>
+      <form id="permissionGrant" class="memory-teach">
+        <select id="permissionAccess" aria-label="Access level">
+          <option value="read">Read only</option>
+          <option value="write">Read and write</option>
+        </select>
+        <select id="permissionMode" aria-label="Grant duration">
+          <option value="session">This session</option>
+          <option value="once">Once</option>
+          <option value="persistent">Until revoked</option>
+        </select>
+        <input id="permissionPath" placeholder="Full path to a folder Aura may use" aria-label="Folder path">
+        <button class="primary-button" type="submit">Grant</button>
+      </form>
+      <div id="permissionList" class="memory-list"></div>
+      <footer><span>Aura cannot grant itself access. Nothing outside the workspace is readable by default.</span><button id="permissionRevokeAll" type="button" class="danger">Revoke all</button><button class="primary-button" data-close="permissionsModal">Done</button></footer>
+    </div>
+  </div>
+
+  <div id="settingsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="modal-card settings-card">
+      <header><div><h2 id="settingsTitle">Aura settings</h2><p>Stored locally on this computer.</p></div><button class="modal-x" aria-label="Close" data-close="settingsModal">×</button></header>
+      <div class="settings-grid">
+        <div class="settings-section wide"><strong>Project rules</strong><span>Corrections that apply inside one project, every turn, whatever else is going on.</span></div>
+        <div class="wide role-block">
+          <label class="model-field">Rules for a project<select id="lessonProject"></select></label>
+          <label class="wide">
+            <div class="lesson-row">
+              <input id="lessonText" type="text" maxlength="300"
+                     placeholder="e.g. asset paths must be relative, never start with a slash">
+              <button id="addLesson" type="button">Add rule</button>
+            </div>
+          </label>
+          <ul id="lessonList" class="lesson-list"></ul>
+          <p class="cloud-note">Rules reach every turn in that project. Aura can add them
+            herself when you correct her — but she often does not notice, so this is where
+            you make one stick.</p>
+          <p class="cloud-note">Applies only inside that project, and only while it is the
+            one in play. It changes what she prioritises and how she writes — never what
+            needs your approval.</p>
+        </div>
+        <div class="settings-section wide"><strong>Model</strong><span>Which model answers, and where it runs. Everything stays on this computer unless you choose otherwise here.</span></div>
+        <label class="wide">Where the model runs<select id="settingProvider">
+          <option value="local">On this computer (LM Studio)</option>
+          <option value="claude">Claude, through Anthropic's API</option>
+          <option value="openai">GPT, through OpenAI's API</option>
+        </select></label>
+        <div id="openaiFields" class="wide cloud-fields hidden">
+          <label>Address<input id="settingOpenaiUrl" type="url"
+                              placeholder="leave empty for https://api.openai.com/v1"></label>
+          <label class="model-field">GPT model<input id="settingOpenaiModel" type="text"
+                              list="openaiModels" placeholder="leave empty to pick automatically">
+            <button id="refreshOpenaiModels" type="button">Refresh models</button></label>
+          <datalist id="openaiModels"></datalist>
+          <label class="model-field">API key<input id="settingOpenaiKey" type="password"
+                              autocomplete="off" placeholder="sk-…">
+            <button id="forgetCloudKeyB" type="button">Forget stored key</button></label>
+          <p class="cloud-note">Same trade as Claude: your conversation, any memories Aura
+            may send, and the contents of files her tools read are sent to whoever is at that
+            address. This one needs no extra package — Aura already speaks OpenAI's protocol,
+            and so do a good many other services, which is why the address is a field. Point
+            it at a model server on this computer and the status line goes back to saying
+            local, because it will be.</p>
+        </div>
+        <div id="cloudFields" class="wide cloud-fields hidden">
+          <label>Claude model<select id="settingCloudModel">
+            <option value="claude-opus-5">Claude Opus 5</option>
+            <option value="claude-sonnet-5">Claude Sonnet 5</option>
+            <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
+          </select></label>
+          <label class="model-field">API key<input id="settingCloudKey" type="password"
+                              autocomplete="off" placeholder="sk-ant-…">
+            <button id="forgetCloudKey" type="button">Forget stored key</button></label>
+          <p class="cloud-note">Your conversation, any memories Aura may send, and the
+            contents of files her tools read are sent to Anthropic. Nothing leaves this
+            computer while the model runs locally. Needs
+            <code>pip install -r requirements-cloud.txt</code>.</p>
+        </div>
+        <label class="wide">LM Studio URL<input id="settingUrl" type="url"></label>
+        <label class="wide model-field">Model<select id="settingModel"></select><button id="refreshModels" type="button">Refresh models</button></label>
+        <label>Timeout (seconds)<input id="settingTimeout" type="number" min="5" max="1800"></label>
+        <div class="settings-section wide"><strong>Sampling</strong><span>Chatting, thinking, and writing code want different settings. Measured on this machine: the difference is in wording and variety, not in reliability — tool calls came back correct at every setting tried.</span></div>
+        <div class="sampling-profiles" id="samplingProfiles">
+          <p class="field-note">gpt-oss's own documentation asks for 1.0 throughout. If tool calls start arriving malformed or the thinking begins to loop, raise these rather than lower them.</p>
+          <label>Chatting — temperature<input id="settingTempChat" type="number" min="0" max="2" step="0.1"></label>
+          <label>Chatting — tokens<input id="settingTokensChat" type="number" min="256" max="65536"></label>
+          <label>Working — temperature<input id="settingTempWork" type="number" min="0" max="2" step="0.1"></label>
+          <label>Working — tokens<input id="settingTokensWork" type="number" min="256" max="65536"></label>
+          <label>Coding — temperature<input id="settingTempCode" type="number" min="0" max="2" step="0.1"></label>
+          <label>Coding — tokens<input id="settingTokensCode" type="number" min="256" max="65536"></label>
+          <label class="always-on" title="Leave blank to keep whatever the model was loaded with in LM Studio.">top_p<input id="settingTopP" type="number" min="0" max="1" step="0.05" placeholder="LM Studio decides"></label>
+          <label class="always-on" title="Leave blank to keep whatever the model was loaded with in LM Studio.">top_k<input id="settingTopK" type="number" min="0" max="500" step="1" placeholder="LM Studio decides"></label>
+        </div>
+        <div class="settings-section wide"><strong>How she works</strong><span>How long she may take, how hard she thinks, and how much she may do without asking.</span></div>
+        <label title="How long one answer may take before Aura stops and tells you where it got to. 0 means no limit.">Time limit per answer (seconds)<input id="settingTurnBudget" type="number" min="0" max="3600" step="30"></label>
+        <label>Thinking depth<select id="settingReasoning"><option value="fast">Fast</option><option value="balanced">Balanced</option><option value="deep">Deep</option></select></label>
+        <label>Autonomy<select id="settingAutonomy"><option value="careful">Careful</option><option value="balanced">Balanced</option><option value="powerful">Powerful</option></select></label>
+        <label>Images<select id="settingVision"><option value="auto">Automatic (guess from model name)</option><option value="on">Always send images</option><option value="off">Never send images</option></select></label>
+        <div class="power-note wide"><strong>Powerful mode</strong><span>Gives Aura the broad tool catalog and longer multi-step runs. File changes remain recoverable; executable code, external network requests, and desktop launches still ask first.</span></div>
+        <label class="toggle-row wide"><input id="settingLearning" type="checkbox"><span>Learn clear, non-sensitive things I state in conversation</span></label>
+        <div class="settings-section wide"><strong>Search</strong><span>Aura holds no search keys and never reaches an engine directly. Point her at a SearXNG you run yourself and she reads its results — titles and snippets only, never opening the pages behind them. Leave empty to keep search off.</span></div>
+        <label class="wide">SearXNG folder<input id="settingSearchInstallPath" type="text" maxlength="500" placeholder="C:\Users\you\searxng — the folder you installed it into"></label>
+        <label>Search engine<select id="settingSearchMode"><option value="off">Off</option><option value="docker">Docker — Aura runs it (works on Windows)</option><option value="folder">Folder — Aura runs it from the folder above</option></select></label>
+        <label class="wide">SearXNG address<input id="settingSearchEndpoint" type="text" maxlength="200" placeholder="http://localhost:8888 — empty means search is off"></label>
+        <div class="power-note wide"><strong>Search status</strong><span id="searchServiceStatus">Checking…</span></div>
+        <div class="settings-section wide"><strong>Presence</strong><span>Shape how Aura moves and how much detail the face renders.</span></div>
+        <label>Avatar motion<select id="settingAvatarMotion"><option value="calm">Calm</option><option value="natural">Natural</option><option value="expressive">Expressive</option></select></label>
+        <label>Avatar quality<select id="settingAvatarQuality"><option value="auto">Automatic</option><option value="high">High detail</option><option value="low">Lower detail</option></select></label>
+        <label class="wide">Motion intensity<input id="settingAvatarIntensity" type="range" min="0" max="100" step="5"><output id="avatarIntensityOutput"></output></label>
+        <div class="settings-section wide"><strong>Voice input</strong><span>Microphone capture and recognition remain on this computer.</span></div>
+        <label>Offline recognizer<select id="settingVoiceEngine"><option value="auto">Automatic</option><option value="pocketsphinx">PocketSphinx streaming</option><option value="whisper_cpp">Whisper.cpp</option></select></label>
+        <label>Language code<input id="settingVoiceLanguage" type="text" maxlength="12" placeholder="en"></label>
+        <label class="wide model-field">Microphone<select id="settingMicrophone"></select><button id="refreshMicrophones" type="button">Refresh microphones</button></label>
+        <label>Room calibration<input id="settingCalibration" type="range" min="200" max="2000" step="100"><output id="calibrationOutput"></output></label>
+        <label>End-of-speech pause<input id="settingSilence" type="range" min="500" max="3000" step="100"><output id="silenceOutput"></output></label>
+        <label>Maximum listening time<input id="settingVoiceMax" type="number" min="5" max="60"></label>
+        <div class="voice-setting-actions wide"><button id="calibrateMicrophone" type="button">Calibrate microphone</button><span id="microphoneStatus">Not checked yet.</span></div>
+        <details class="voice-advanced wide"><summary>Optional Whisper.cpp paths</summary><label>Whisper executable<input id="settingWhisperPath" type="text" placeholder="whisper-cli.exe"></label><label>Whisper model<input id="settingWhisperModel" type="text" placeholder="model.ggml"></label></details>
+        <div class="settings-section wide"><strong>Voice output</strong><span>Piper stays local and drives Aura’s mouth from generated audio.</span></div>
+        <label>Speech engine<select id="settingSpeechEngine"><option value="piper">Piper neural</option><option value="sapi">Windows SAPI</option></select></label>
+        <label>Neural voice<select id="settingSpeechModel"></select></label>
+        <label class="wide model-field">SAPI fallback voice<select id="settingVoice"></select><button id="refreshVoices" type="button">Refresh voices</button></label>
+        <label class="wide">Estonian voice<select id="settingVoiceEt"></select></label>
+        <div class="power-note wide"><strong>Two languages</strong><span id="speechLanguageNote">Aura answers in whichever language you write in and picks the matching voice for each reply. Leave the Estonian voice empty and Estonian is read by the English voice, which sounds wrong — that is a missing voice, not a fault.</span></div>
+        <label>Speech rate<input id="settingRate" type="range" min="-10" max="10"><output id="rateOutput"></output></label>
+        <label>Speech volume<input id="settingVolume" type="range" min="0" max="100"><output id="volumeOutput"></output></label>
+        <label class="toggle-row wide"><input id="settingSpeak" type="checkbox"><span>Speak Aura’s replies locally</span></label>
+        <div class="voice-setting-actions wide"><button id="previewVoice" type="button">Preview Aura’s voice</button><span>Use this to check the selected output before saving.</span></div>
+      </div>
+      <div id="settingsStatus" class="modal-status">Ready.</div>
+      <footer><button id="showWelcome" type="button" class="ghost-button">Show first-run guide</button><button class="ghost-button" data-close="settingsModal">Cancel</button><button id="saveSettings" class="primary-button">Save settings</button></footer>
+    </div>
+  </div>
+
+  <div id="tasksModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="tasksTitle">
+    <div class="modal-card tasks-card">
+      <header><div><h2 id="tasksTitle">Recent tasks</h2><p>Outcomes and recoverable workspace changes.</p></div><button class="modal-x" aria-label="Close" data-close="tasksModal">×</button></header>
+      <div id="taskList" class="task-list"></div>
+      <footer><button class="primary-button" data-close="tasksModal">Done</button></footer>
+    </div>
+  </div>
+
+  <div id="approvalModal" class="modal-backdrop hidden priority-modal" role="alertdialog" aria-modal="true" aria-labelledby="approvalTitle">
+    <div class="modal-card approval-card">
+      <div class="approval-icon">!</div>
+      <h2 id="approvalTitle">Command approval</h2>
+      <p id="approvalLead">Aura wants to use a capability that needs your permission:</p>
+      <pre id="approvalCommand"></pre>
+      <small id="approvalNote">“Allow identical for task” covers only this exact command or URL until the current task ends.</small>
+      <footer><button id="denyApproval" class="ghost-button">Deny</button><button id="allowTaskApproval" class="ghost-button">Allow identical for task</button><button id="allowApproval" class="danger-button">Allow once</button></footer>
+    </div>
+  </div>
+
+  <div id="promptModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="promptTitle">
+    <div class="modal-card prompt-card">
+      <header><div><h2 id="promptTitle">Name it</h2><p id="promptHint">Workspace-relative path</p></div><button class="modal-x" aria-label="Close" data-close="promptModal">×</button></header>
+      <form id="promptForm">
+        <input id="promptInput" type="text" maxlength="255" required autocomplete="off">
+        <div id="promptStatus" class="modal-status"></div>
+        <footer><button type="button" class="ghost-button" data-close="promptModal">Cancel</button><button type="submit" class="primary-button" id="promptConfirm">Confirm</button></footer>
+      </form>
+    </div>
+  </div>
+
+  <div id="historyModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="historyTitle">
+    <div class="modal-card history-card">
+      <header><div><h2 id="historyTitle">Workspace history</h2><p>Only the most recent change can be undone directly.</p></div><button class="modal-x" aria-label="Close" data-close="historyModal">×</button></header>
+      <div id="historyList" class="task-list"></div>
+      <footer><button class="primary-button" data-close="historyModal">Done</button></footer>
+    </div>
+  </div>
+
+  <div id="previewServerModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="previewServerTitle">
+    <div class="modal-card">
+      <header><div><h2 id="previewServerTitle">Live preview server</h2><p>Serves a workspace folder with real HTML/CSS/JS execution, separate from Aura's protected app. Starts only when you ask.</p></div><button class="modal-x" aria-label="Close" data-close="previewServerModal">×</button></header>
+      <form id="previewServerForm" class="prompt-card-form">
+        <input id="previewServerFolder" type="text" maxlength="255" placeholder="Workspace-relative folder to serve (blank = whole workspace)" autocomplete="off">
+        <button type="submit" class="primary-button" id="previewServerStart">Start preview</button>
+      </form>
+      <div id="previewServerStatus" class="modal-status">Not running.</div>
+      <div id="previewServerActions" class="preview-server-actions hidden">
+        <button id="previewServerOpen" type="button">Open in browser</button>
+        <button id="previewServerCheckAssets" type="button">Check assets</button>
+        <button id="previewServerStop" type="button" class="danger-button">Stop</button>
+      </div>
+      <pre id="previewServerLog" class="preview-server-log"></pre>
+      <footer><button class="primary-button" data-close="previewServerModal">Done</button></footer>
+    </div>
+  </div>
+
+  <div id="toastRegion" class="toast-region" aria-live="assertive"></div>
+  <div id="dropOverlay" class="drop-overlay hidden" aria-hidden="true"><div><span>＋</span><strong>Drop files into Aura</strong><small>They will be copied into the protected workspace.</small></div></div>
+  <script src="avatar-face.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

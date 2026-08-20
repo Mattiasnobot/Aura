@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Runtime / local state (personal memory, action logs, config, generated projects)
+aura-workspace/
+outputs/
+work/
+
+# Downloaded neural voice model (large binary, not source)
+aura-voices/
+
+# Logs
+aura-runtime.log
+aura-startup-error.log
+
+# Local machine-specific settings
+.claude/settings.local.json
+
+# Built distribution packages
+dist/

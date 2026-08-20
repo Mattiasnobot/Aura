@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aura — progress</title>
+<style>
+  /* The same vocabulary the main window uses. This window was built quickly and
+     invented its own eight colours; a progress view that does not look like Aura
+     reads as a different program. Values copied rather than imported, because the
+     popup deliberately loads no external stylesheet — it must open even when the
+     main page is wedged. */
+  :root {
+    --surface-0: #07101c; --surface-1: #0b1626; --surface-2: #0f1d30;
+    --border: #1d3048; --border-strong: #2c4a68;
+    --text: #e6edf7; --text-muted: #93a7bc; --text-dim: #74879e;
+    --accent: #7fe0d1; --ok: #5ad68a; --warn: #ffb454; --danger: #f98383;
+    --r-sm: 8px; --r-md: 12px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 14px; background: var(--surface-0); color: var(--text);
+         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .card { background: var(--surface-1); border: 1px solid var(--border);
+          border-radius: var(--r-md); padding: 12px 14px; margin-bottom: 10px; }
+  .state { font-size: 26px; font-weight: 650; letter-spacing: .04em; }
+  .where { color: var(--text-muted); margin-top: 2px; }
+  .role { color: var(--warn); }
+  .numbers { display: flex; gap: 22px; margin-top: 10px; }
+  .n-label { color: var(--text-muted); font-size: 12px; text-transform: uppercase;
+             letter-spacing: .06em; }
+  .n-value { font-size: 20px; font-variant-numeric: tabular-nums; }
+  .fresh { color: var(--ok); } .stale { color: var(--warn); } .stuck { color: var(--danger); }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--text-muted); margin: 0 0 8px; font-weight: 600; }
+  ol, ul { margin: 0; padding-left: 18px; }
+  li { margin-bottom: 4px; }
+  .done { color: var(--text-muted); text-decoration: line-through; }
+  .now { color: var(--ok); font-weight: 600; }
+  #activity { list-style: none; padding: 0; font-variant-numeric: tabular-nums; }
+  #activity li { display: flex; gap: 10px; border-bottom: 1px solid var(--border);
+                 padding: 4px 0; }
+  #activity time { color: var(--text-muted); flex: none; }
+  .verdict { color: var(--text-muted); font-size: 13px; margin-top: 8px; }
+  .offline { color: var(--danger); }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="state" id="state">…</div>
+  <div class="where" id="where">Waiting for Aura</div>
+  <div class="numbers">
+    <div><div class="n-label">This turn</div><div class="n-value" id="elapsed">—</div></div>
+    <div><div class="n-label">Last sign of life</div>
+         <div class="n-value" id="quiet">—</div></div>
+  </div>
+  <div class="verdict" id="verdict"></div>
+</div>
+
+<div class="card" id="planCard" hidden><h2>Plan</h2><ol id="plan"></ol></div>
+
+<div class="card"><h2>What has happened</h2><ul id="activity"></ul></div>
+
+<script src="/progress.js"></script>
+</body>
+</html>

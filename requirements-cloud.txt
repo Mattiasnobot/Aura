@@ -1,0 +1,13 @@
+# Optional: reach Claude over the API instead of a local model.
+#
+# Aura is local-first and does not need this. Install it only if this machine
+# cannot run a capable model locally, and understand what changes: with a local
+# model nothing leaves the computer, and with this one the conversation, any
+# memories Aura is allowed to send, and the contents of files her tools read are
+# all sent to Anthropic.
+#
+#   pip install -r requirements-cloud.txt
+#
+# The API key is yours to place: set ANTHROPIC_API_KEY in the environment, or
+# paste it in Settings. Aura asks for it nowhere else.
+anthropic>=0.116.0
