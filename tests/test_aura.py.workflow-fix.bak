@@ -1738,9 +1738,8 @@ class VisionTests(unittest.TestCase):
 
     def test_every_extra_round_clears_the_previous_partial_reply(self):
         # The verification nudge used to stream only blank lines and then repeat
-        # the whole answer, so the reply appeared two or three times. Keep the
-        # reset for a real completion-gate retry, but ordinary continuation after
-        # a successful tool is not itself a retry.
+        # the whole answer, so the reply appeared two or three times. The reset
+        # is emitted once per extra round, so no retry path can miss it.
         provider = LMStudioProvider(model="local-model")
         agent = AuraAgent(Path(self.temp.name) / "rounds", provider=provider)
         states: list[str] = []
@@ -1754,9 +1753,8 @@ class VisionTests(unittest.TestCase):
         provider.complete = unittest.mock.Mock(side_effect=replies)
         agent.handle("Create loop.txt in the workspace and validate it",
                      state=states.append)
-        # Only the validation nudge is a retry. The two post-tool continuations
-        # should move forward without flashing/resetting as failed attempts.
-        self.assertEqual(states.count("retry"), 1)
+        # One reset for each round after the first.
+        self.assertEqual(states.count("retry"), provider.complete.call_count - 1)
 
     def test_a_retry_tells_the_interface_to_discard_the_abandoned_reply(self):
         # The user saw the same answer two or three times whenever Aura retried,

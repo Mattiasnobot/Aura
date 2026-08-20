@@ -1,0 +1,32 @@
+aura/web_bridge.py — exact replacement blocks
+==============================================
+
+1) Replace _on_agent_state() with:
+
+    def _on_agent_state(self, name: str) -> None:
+        """Forward agent states, translating stream-discard signals for the UI.
+
+        A real gate retry and narrated text that precedes a tool call both
+        abandon the visible partial answer. Ordinary post-tool continuation does
+        neither, so it must not flash as a retry or reset an already-clean stream.
+        """
+        if name in {"retry", "stream_reset"}:
+            self._push("stream_reset")
+            self._push("state", value="working")
+            return
+        self._push("state", value=name)
+
+2) Inside _work(), immediately after on_token(), add:
+
+        def on_state(name: str) -> None:
+            if name in {"retry", "stream_reset"}:
+                streamed.clear()
+            self._on_agent_state(name)
+
+3) In the call to self.agent.handle(), change:
+
+                    state=self._on_agent_state,
+
+to:
+
+                    state=on_state,

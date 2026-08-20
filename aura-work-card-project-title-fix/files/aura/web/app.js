@@ -77,7 +77,6 @@ let previewServerState = { running: false };
 let selectedMindNode = null;
 let planSteps = [];
 let planFinished = false;
-let lastWorkActivity = null;
 // The live work card is only a view over events Aura already emits. It never
 // decides what the agent should do; it just keeps the current work legible.
 // Which project Aura believes the conversation is about. It decides which
@@ -288,117 +287,19 @@ function projectFromTaskEvidence(task, evidence) {
     const [root, count] = ranked[0];
     if (count >= Math.max(1, Math.ceil(nestedPaths * 0.6))) return root;
   }
-  // A read-only verification has no changed paths. In that case the path Aura
-  // actually validated is the strongest project evidence available.
-  const validated = String(evidence.validationPath || "").replaceAll("\\", "/")
-    .replace(/^\.\//, "").replace(/\/$/, "");
-  if (validated && validated !== ".") return validated.split("/")[0];
   return String(task.project || currentProject || "").trim();
 }
 
-function replyEvidencePresentation(text, task) {
-  // The backend's evidence footer is useful, but once the same facts have a
-  // dedicated result card it becomes visual duplication. Move only the exact
-  // "Confirmed evidence:" sections into the card. Warnings (Not confirmed)
-  // and network-source sections stay in the conversation where they matter.
-  const original = String(text || "");
-  if (!task || !original) return { text: original, evidence: [] };
-  const lines = original.replace(/\r\n?/g, "\n").split("\n");
-  const kept = [];
-  const evidence = [];
-  const seen = new Set();
-  let capturing = false;
-
-  const headingName = line => line.trim()
-    .replace(/^#{1,4}\s+/, "")
-    .replace(/^\*\*(.+)\*\*$/, "$1")
-    .trim().toLowerCase();
-  const finishEvidence = new Set(["not confirmed:", "read from the network:", "read from network:"]);
-  const addEvidence = value => {
-    const cleaned = String(value || "").trim();
-    if (!cleaned) return;
-    const key = cleaned.replace(/[`*_]/g, "").replace(/\s+/g, " ").toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    evidence.push(cleaned);
-  };
-
-  for (const line of lines) {
-    const heading = headingName(line);
-    if (heading === "confirmed evidence:") {
-      capturing = true;
-      continue;
-    }
-    if (capturing && finishEvidence.has(heading)) {
-      capturing = false;
-      kept.push(line);
-      continue;
-    }
-    if (!capturing) {
-      kept.push(line);
-      continue;
-    }
-    if (!line.trim()) continue;
-    const bullet = line.match(/^\s*[-*•]\s+(.+)$/);
-    if (bullet) {
-      addEvidence(bullet[1]);
-      continue;
-    }
-    // A new Markdown heading that is not another evidence heading ends the
-    // captured section. This avoids swallowing an unrelated section a model
-    // placed after the footer.
-    if (/^\s*#{1,4}\s+/.test(line)) {
-      capturing = false;
-      kept.push(line);
-      continue;
-    }
-    addEvidence(line);
-  }
-
-  let compact = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-  if (!compact) compact = String(task.summary || original).trim();
-  return { text: compact || original, evidence };
-}
-
-function taskResultPresentation(task, evidence) {
-  const statusName = String(task.status || "running").toLowerCase();
-  const mutated = evidence.files.length > 0 || (task.tools || []).some(name => MUTATION_TOOLS.has(name));
-  const project = projectFromTaskEvidence(task, evidence);
-  if (statusName === "error" || statusName === "failed") {
-    return { eyebrow: "Needs attention", title: project ? `${project} needs attention` : "Task needs attention",
-             statusLabel: "ERROR", kind: "error", mark: "!", project, mutated };
-  }
-  if (["cancelled", "interrupted", "stopped"].includes(statusName)) {
-    return { eyebrow: "Stopped", title: project ? `${project} stopped` : "Task stopped",
-             statusLabel: "STOPPED", kind: "stopped", mark: "■", project, mutated };
-  }
-  if (statusName === "completed" && !mutated && evidence.validated) {
-    return { eyebrow: "Verified result", title: project ? `${project} verified` : "Checks passed",
-             statusLabel: "VERIFIED", kind: "verified", mark: "✓", project, mutated };
-  }
-  if (statusName === "completed" && mutated && evidence.validated) {
-    return { eyebrow: "Finished work", title: project ? `${project} completed` : "Work completed",
-             statusLabel: "COMPLETED", kind: "completed", mark: "✓", project, mutated };
-  }
-  if (statusName === "completed" && mutated) {
-    return { eyebrow: "Changes made", title: project ? `${project} updated` : "Changes completed",
-             statusLabel: "COMPLETED", kind: "completed", mark: "✓", project, mutated };
-  }
-  return { eyebrow: statusName === "completed" ? "Task complete" : "Task result",
-           title: project ? project : (statusName === "completed" ? "Task completed" : "Task details"),
-           statusLabel: statusName.toUpperCase(), kind: statusName, mark: statusName === "completed" ? "✓" : "•",
-           project, mutated };
-}
-
-function attachTaskCard(article, task, replyEvidence = []) {
+function attachTaskCard(article, task) {
   if (!article || !task || (!(task.tools || []).length && task.status === "completed")) return;
 
   const evidence = taskEvidence(task);
-  const presentation = taskResultPresentation(task, evidence);
   const statusName = String(task.status || "running").toLowerCase();
+  const completed = statusName === "completed";
+  const project = projectFromTaskEvidence(task, evidence);
 
   const card = document.createElement("div");
-  card.className = `message-task-card result-card ${presentation.kind}`;
+  card.className = `message-task-card result-card ${completed ? "completed" : statusName}`;
 
   const head = document.createElement("div");
   head.className = "message-task-head result-card-head";
@@ -406,20 +307,22 @@ function attachTaskCard(article, task, replyEvidence = []) {
   identity.className = "result-card-identity";
   const mark = document.createElement("span");
   mark.className = "result-card-mark";
-  mark.textContent = presentation.mark;
+  mark.textContent = completed ? "✓" : (statusName === "error" ? "!" : "•");
   mark.setAttribute("aria-hidden", "true");
   const heading = document.createElement("div");
   const eyebrow = document.createElement("span");
   eyebrow.className = "result-card-eyebrow";
-  eyebrow.textContent = presentation.eyebrow;
+  eyebrow.textContent = completed ? "Finished work" : "Task result";
   const title = document.createElement("strong");
-  title.textContent = presentation.title;
+  title.textContent = project
+    ? `${project}${completed ? " completed" : ""}`
+    : (completed ? "Task completed" : "Task details");
   heading.append(eyebrow, title);
   identity.append(mark, heading);
 
   const status = document.createElement("span");
-  status.className = `result-card-status ${presentation.kind}`;
-  status.textContent = presentation.statusLabel;
+  status.className = `result-card-status ${statusName}`;
+  status.textContent = statusName;
   head.append(identity, status);
 
   const evidenceRow = document.createElement("div");
@@ -431,15 +334,10 @@ function attachTaskCard(article, task, replyEvidence = []) {
     evidenceRow.append(item);
   };
   if (evidence.duration !== null) evidenceItem(`Took ${formatDuration(evidence.duration)}`);
-  if (presentation.mutated && evidence.files.length) {
+  if (evidence.files.length) {
     evidenceItem(`${evidence.files.length} workspace item${evidence.files.length === 1 ? "" : "s"} changed`);
   }
-  if (!presentation.mutated && evidence.validated) {
-    if (evidence.filesSeen !== null) evidenceItem(`${evidence.filesSeen} file${evidence.filesSeen === 1 ? "" : "s"} checked`);
-    if (evidence.issueCount !== null) evidenceItem(`${evidence.issueCount} issue${evidence.issueCount === 1 ? "" : "s"}`);
-    evidenceItem("No files modified");
-  }
-  if (evidence.validated) evidenceItem("✓ Validated", true);
+  if (evidence.validated) evidenceItem("Validated", true);
   if (!evidenceRow.children.length && (task.tools || []).length) {
     evidenceItem(`${[...new Set(task.tools || [])].length} tool${[...new Set(task.tools || [])].length === 1 ? "" : "s"} used`);
   }
@@ -461,19 +359,6 @@ function attachTaskCard(article, task, replyEvidence = []) {
     more.textContent = `+${evidence.files.length - 8} more`;
     files.append(more);
   }
-
-  const proof = document.createElement("details");
-  proof.className = "result-card-details result-card-proof";
-  const proofSummary = document.createElement("summary");
-  proofSummary.textContent = `Evidence • ${replyEvidence.length}`;
-  const proofList = document.createElement("ul");
-  proofList.className = "result-card-proof-list";
-  for (const line of replyEvidence.slice(0, 12)) {
-    const item = document.createElement("li");
-    appendInlineMarkdown(item, line);
-    proofList.append(item);
-  }
-  proof.append(proofSummary, proofList);
 
   const details = document.createElement("details");
   details.className = "result-card-details";
@@ -503,12 +388,13 @@ function attachTaskCard(article, task, replyEvidence = []) {
   action("Open workspace", () => openWorkspaceExplorer(evidence.files[0] || null), "primary");
   action("Details", () => openTasks(task.task_id));
   if (String(task.request || "").trim()) action("Repeat", () => sendMessage(task.request));
-  if (presentation.mutated) action("Undo", () => rollbackTask(task), "danger");
+  if ((task.tools || []).some(name => MUTATION_TOOLS.has(name))) {
+    action("Undo", () => rollbackTask(task), "danger");
+  }
 
   card.append(head);
   if (evidenceRow.children.length) card.append(evidenceRow);
   if (files.children.length) card.append(files);
-  if (replyEvidence.length) card.append(proof);
   if (uniqueTools.length) card.append(details);
   card.append(actions);
   article.append(card);
@@ -875,17 +761,16 @@ async function handleEvent(event) {
       break;
     case "reply":
       applyProject(event.project);
-      const presentedReply = replyEvidencePresentation(event.text, event.task);
       let completedMessage;
       if (event.streamed && streamMessage) {
         completedMessage = streamMessage;
         streamMessage.article.classList.remove("streaming");
-        renderMessage(streamMessage.body, presentedReply.text);
+        renderMessage(streamMessage.body, event.text);
         streamMessage = null;
       } else {
-        completedMessage = addMessage("assistant", presentedReply.text);
+        completedMessage = addMessage("assistant", event.text);
       }
-      attachTaskCard(completedMessage?.article, event.task, presentedReply.evidence);
+      attachTaskCard(completedMessage?.article, event.task);
       attachProposal(completedMessage?.article, event.proposal);
       attachRecallNote(completedMessage?.article, event.recalled);
       // The live card has now become the durable result card attached to this
@@ -954,15 +839,10 @@ async function handleEvent(event) {
     case "plan_started":
       planSteps = event.steps || [];
       planFinished = false;
-      lastWorkActivity = null;
       renderPlan(planSteps);
       break;
     case "plan_progress":
       planSteps = event.steps || [];
-      renderPlan(planSteps, planFinished);
-      break;
-    case "work_activity":
-      lastWorkActivity = event;
       renderPlan(planSteps, planFinished);
       break;
     case "plan_finished":
@@ -1860,16 +1740,6 @@ async function openSessions(focus = true) {
   }
 }
 
-function workActivityLabel(activity) {
-  if (!activity || !activity.tool) return "";
-  const friendly = FRIENDLY_ACTIONS[activity.tool]
-    || String(activity.tool).replaceAll("_", " ").replace(/^./, letter => letter.toUpperCase());
-  const paths = (activity.paths || []).filter(Boolean);
-  if (!paths.length) return friendly;
-  if (paths.length === 1) return `${friendly}: ${paths[0]}`;
-  return `${friendly}: ${paths[0]} +${paths.length - 1} more`;
-}
-
 function workCardPhase(state, finished = false, done = 0, total = 0) {
   if (finished) {
     return done === total ? "Planned files are ready • preparing the final report"
@@ -1890,10 +1760,7 @@ function updateWorkCardState(state) {
   const phase = elements.planStrip.querySelector(".work-card-phase");
   if (!phase || elements.planStrip.classList.contains("hidden")) return;
   const done = planSteps.filter(step => step.done).length;
-  const activity = workActivityLabel(lastWorkActivity);
-  phase.textContent = (!planFinished && activity)
-    ? `${activity} • ${workCardPhase(state, false, done, planSteps.length)}`
-    : workCardPhase(state, planFinished, done, planSteps.length);
+  phase.textContent = workCardPhase(state, planFinished, done, planSteps.length);
   elements.planStrip.dataset.state = state || "working";
 }
 
@@ -1939,15 +1806,12 @@ function renderPlan(steps, finished = false) {
 
   const phase = document.createElement("div");
   phase.className = "work-card-phase";
-  const activity = workActivityLabel(lastWorkActivity);
-  phase.textContent = (!finished && activity)
-    ? `${activity} • ${workCardPhase(strip.dataset.state, false, done, total)}`
-    : workCardPhase(strip.dataset.state, finished, done, total);
+  phase.textContent = workCardPhase(strip.dataset.state, finished, done, total);
 
   const progress = document.createElement("div");
   progress.className = "work-card-progress";
   progress.setAttribute("role", "progressbar");
-  progress.setAttribute("aria-label", "Approved plan steps completed");
+  progress.setAttribute("aria-label", "Planned files completed");
   progress.setAttribute("aria-valuemin", "0");
   progress.setAttribute("aria-valuemax", String(total));
   progress.setAttribute("aria-valuenow", String(done));
@@ -1959,9 +1823,9 @@ function renderPlan(steps, finished = false) {
   progressMeta.className = "work-card-progress-meta";
   const copy = document.createElement("span");
   copy.textContent = finished
-    ? (done === total ? `All ${total} approved steps complete`
-                      : `${done} of ${total} approved steps complete`)
-    : `${percent}% of the approved plan`;
+    ? (done === total ? `All ${total} planned files written`
+                      : `${done} of ${total} planned files written`)
+    : `${percent}% of the approved file plan`;
   const percentage = document.createElement("strong");
   percentage.textContent = `${percent}%`;
   progressMeta.append(copy, percentage);
@@ -1983,7 +1847,7 @@ function renderPlan(steps, finished = false) {
     const label = document.createElement("span");
     label.textContent = step.text;
     const state = document.createElement("em");
-    state.textContent = step.done ? "Done" : (active ? "Working" : "Pending");
+    state.textContent = step.done ? "Ready" : (active ? "Working" : "Pending");
     row.append(mark, label, state);
     list.append(row);
   }
@@ -2714,19 +2578,9 @@ function taskEvidence(task) {
   }
 
   let validated = false;
-  let validationPath = "";
-  let filesSeen = null;
-  let issueCount = null;
   for (const detail of details) {
     if (!VERIFICATION_TOOLS.has(detail.tool)) continue;
-    const args = detail.arguments || {};
     const result = detail.result || {};
-    if (detail.tool === "validate_project") {
-      validationPath = String(args.path || result.path || validationPath || "").trim();
-      const seen = Number(result.files_seen);
-      if (Number.isFinite(seen) && seen >= 0) filesSeen = seen;
-      if (Array.isArray(result.issues)) issueCount = result.issues.length;
-    }
     if (result.ok === true || result.valid === true) validated = true;
     else if (result.ok === false || result.valid === false) validated = false;
   }
@@ -2736,7 +2590,7 @@ function taskEvidence(task) {
     const ms = new Date(task.finished) - new Date(task.started);
     if (Number.isFinite(ms) && ms >= 0) duration = ms;
   }
-  return { files, validated, validationPath, filesSeen, issueCount, duration };
+  return { files, validated, duration };
 }
 
 function formatDuration(ms) {

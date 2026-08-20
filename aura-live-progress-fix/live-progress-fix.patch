@@ -1,0 +1,296 @@
+--- a/aura/web/app.js
++++ b/aura/web/app.js
+@@ -77,6 +77,7 @@
+ let selectedMindNode = null;
+ let planSteps = [];
+ let planFinished = false;
++let lastWorkActivity = null;
+ // The live work card is only a view over events Aura already emits. It never
+ // decides what the agent should do; it just keeps the current work legible.
+ // Which project Aura believes the conversation is about. It decides which
+@@ -953,10 +954,15 @@
+     case "plan_started":
+       planSteps = event.steps || [];
+       planFinished = false;
++      lastWorkActivity = null;
+       renderPlan(planSteps);
+       break;
+     case "plan_progress":
+       planSteps = event.steps || [];
++      renderPlan(planSteps, planFinished);
++      break;
++    case "work_activity":
++      lastWorkActivity = event;
+       renderPlan(planSteps, planFinished);
+       break;
+     case "plan_finished":
+@@ -1854,6 +1860,16 @@
+   }
+ }
+ 
++function workActivityLabel(activity) {
++  if (!activity || !activity.tool) return "";
++  const friendly = FRIENDLY_ACTIONS[activity.tool]
++    || String(activity.tool).replaceAll("_", " ").replace(/^./, letter => letter.toUpperCase());
++  const paths = (activity.paths || []).filter(Boolean);
++  if (!paths.length) return friendly;
++  if (paths.length === 1) return `${friendly}: ${paths[0]}`;
++  return `${friendly}: ${paths[0]} +${paths.length - 1} more`;
++}
++
+ function workCardPhase(state, finished = false, done = 0, total = 0) {
+   if (finished) {
+     return done === total ? "Planned files are ready • preparing the final report"
+@@ -1874,7 +1890,10 @@
+   const phase = elements.planStrip.querySelector(".work-card-phase");
+   if (!phase || elements.planStrip.classList.contains("hidden")) return;
+   const done = planSteps.filter(step => step.done).length;
+-  phase.textContent = workCardPhase(state, planFinished, done, planSteps.length);
++  const activity = workActivityLabel(lastWorkActivity);
++  phase.textContent = (!planFinished && activity)
++    ? `${activity} • ${workCardPhase(state, false, done, planSteps.length)}`
++    : workCardPhase(state, planFinished, done, planSteps.length);
+   elements.planStrip.dataset.state = state || "working";
+ }
+ 
+@@ -1920,12 +1939,15 @@
+ 
+   const phase = document.createElement("div");
+   phase.className = "work-card-phase";
+-  phase.textContent = workCardPhase(strip.dataset.state, finished, done, total);
++  const activity = workActivityLabel(lastWorkActivity);
++  phase.textContent = (!finished && activity)
++    ? `${activity} • ${workCardPhase(strip.dataset.state, false, done, total)}`
++    : workCardPhase(strip.dataset.state, finished, done, total);
+ 
+   const progress = document.createElement("div");
+   progress.className = "work-card-progress";
+   progress.setAttribute("role", "progressbar");
+-  progress.setAttribute("aria-label", "Planned files completed");
++  progress.setAttribute("aria-label", "Approved plan steps completed");
+   progress.setAttribute("aria-valuemin", "0");
+   progress.setAttribute("aria-valuemax", String(total));
+   progress.setAttribute("aria-valuenow", String(done));
+@@ -1937,9 +1959,9 @@
+   progressMeta.className = "work-card-progress-meta";
+   const copy = document.createElement("span");
+   copy.textContent = finished
+-    ? (done === total ? `All ${total} planned files written`
+-                      : `${done} of ${total} planned files written`)
+-    : `${percent}% of the approved file plan`;
++    ? (done === total ? `All ${total} approved steps complete`
++                      : `${done} of ${total} approved steps complete`)
++    : `${percent}% of the approved plan`;
+   const percentage = document.createElement("strong");
+   percentage.textContent = `${percent}%`;
+   progressMeta.append(copy, percentage);
+@@ -1961,7 +1983,7 @@
+     const label = document.createElement("span");
+     label.textContent = step.text;
+     const state = document.createElement("em");
+-    state.textContent = step.done ? "Ready" : (active ? "Working" : "Pending");
++    state.textContent = step.done ? "Done" : (active ? "Working" : "Pending");
+     row.append(mark, label, state);
+     list.append(row);
+   }
+--- a/aura/web_bridge.py
++++ b/aura/web_bridge.py
+@@ -5,6 +5,7 @@
+ import sqlite3
+ from collections import deque
+ import queue
++import re
+ from pathlib import Path
+ import threading
+ from dataclasses import asdict
+@@ -78,8 +79,8 @@
+         self._busy = False
+         self._voice_active = False
+         self._approvals: dict[str, queue.Queue[str]] = {}
+-        #: The approved file plan for the running turn, ticked off as the
+-        #: files are actually written rather than as they are intended.
++        #: The approved plan for the running turn, ticked off only when a
++        #: successful tool proves the corresponding read/write/check happened.
+         self._plan_steps: list[dict] = []
+         self._task_approved_exact: dict[str, set[str]] = {}
+         self._approval_lock = threading.Lock()
+@@ -658,46 +659,154 @@
+         self._push("state", value="working")
+         return {"ok": True}
+ 
+-    #: Tools whose success means a planned file now exists. Anything else can
+-    #: mention a path without producing it, and a plan that ticks on intention
+-    #: rather than on result is worse than no plan at all.
+-    PLAN_TOOLS = frozenset({"create_file", "write_file", "write_files", "append_file"})
++    #: Plan progress is evidence from successful tools, not a timer. The first
++    #: version only counted writes, which left a perfectly real `read_file`
++    #: step at 0% for an entire seven-minute task. These groups describe what
++    #: kind of tool can actually prove each kind of approved step happened.
++    PLAN_READ_TOOLS = frozenset({
++        "read_file", "read_many_files", "file_info", "inspect_code", "list_files",
++        "search_files", "search_text", "find_relevant_files", "workspace_summary",
++    })
++    PLAN_WRITE_TOOLS = frozenset({
++        "create_folder", "create_file", "write_file", "write_files", "append_file",
++        "replace_in_file", "apply_edits", "copy_file", "move_file",
++        "safe_delete_file", "create_archive", "extract_archive",
++    })
++    PLAN_VALIDATE_TOOLS = frozenset({"validate_project", "check_accessibility"})
++    PLAN_RESEARCH_TOOLS = frozenset({"search_web"})
++
++    @staticmethod
++    def _clean_plan_step(line: str) -> dict | None:
++        """Turn one approved-plan line into a human step the UI can track.
++
++        Small local models occasionally put a textual tool call inside the plan:
++        a useful sentence followed by ```tool_call, JSON arguments, and ```.
++        Treating each of those lines as work produced the 0/4 card Mat saw.
++        Syntax is discarded here; only a real human-readable action survives.
++        """
++        raw = str(line or "").strip()
++        if not raw:
++            return None
++        lowered = raw.casefold()
++        if (raw.startswith("```") or raw in {"{", "}", "[", "]"} or
++                lowered.startswith(("<tool_call", "</tool_call", "tool_call")) or
++                re.match(r'^\s*\{.*"(?:name|arguments)"\s*:', raw) or
++                re.match(r'^\s*"(?:name|arguments)"\s*:', raw)):
++            return None
++
++        # Bullets and ordered-list numbers are presentation, not part of the step.
++        text = re.sub(r"^\s*(?:[-*•]\s+|\d+[.)]\s+)", "", raw).strip()
++        if not text or text.startswith(("{", "}", "[", "]")):
++            return None
++
++        lower = text.casefold()
++        if re.search(r"\b(validate|validation|test|check accessibility|lint)\b", lower):
++            kind = "validate"
++        elif re.search(r"\b(read|inspect|review|look at|open|list|check)\b", lower):
++            kind = "read"
++        elif re.search(r"\b(research|search|look up|find online)\b", lower):
++            kind = "research"
++        elif re.search(r"\b(create|write|edit|update|change|modify|replace|add|build|remove|delete|move|copy)\b", lower):
++            kind = "write"
++        else:
++            # The approval dialog is primarily a file plan. A bare path such as
++            # `shop/index.html - main page` therefore means "produce this file".
++            kind = "write"
++
++        # Prefer a path in backticks, then a filename/folder-looking token.
++        quoted = re.search(r"`([^`\r\n]+)`", text)
++        candidate = quoted.group(1) if quoted else ""
++        if not candidate:
++            token = re.search(
++                r"(?<![\w.-])((?:[\w.-]+[/\\])+[\w.-]+(?:\.[A-Za-z0-9_-]+)?|"
++                r"[\w.-]+\.(?:py|json|toml|md|txt|html|css|js|ts|tsx|jsx|yaml|yml|svg|xml))"
++                r"(?![\w.-])",
++                text,
++            )
++            candidate = token.group(1) if token else ""
++        path = str(candidate).replace("\\", "/").strip(" ./`'\"(),:;")
++        return {"path": path, "text": text, "kind": kind, "done": False}
++
++    @staticmethod
++    def _plan_tool_paths(arguments: dict) -> list[str]:
++        """Workspace-like paths named by one tool call, normalized for matching."""
++        found: list[str] = []
++        values: list[object] = []
++        if isinstance(arguments.get("files"), list):
++            values.extend(item.get("path") for item in arguments["files"]
++                          if isinstance(item, dict))
++        if isinstance(arguments.get("paths"), list):
++            values.extend(arguments["paths"])
++        for key in ("path", "source", "destination", "archive"):
++            if arguments.get(key):
++                values.append(arguments[key])
++        for value in values:
++            normalized = str(value or "").replace("\\", "/").strip(" ./`'\"(),:;")
++            if normalized and normalized not in found:
++                found.append(normalized)
++        return found
++
++    @classmethod
++    def _plan_step_matches(cls, step: dict, name: str, arguments: dict) -> bool:
++        kind = str(step.get("kind") or "write")
++        if kind == "read" and name not in cls.PLAN_READ_TOOLS:
++            return False
++        if kind == "write" and name not in cls.PLAN_WRITE_TOOLS:
++            return False
++        if kind == "validate" and name not in cls.PLAN_VALIDATE_TOOLS:
++            return False
++        if kind == "research" and name not in cls.PLAN_RESEARCH_TOOLS:
++            return False
++
++        wanted = str(step.get("path") or "").replace("\\", "/").strip("/")
++        if not wanted:
++            return True
++        actual = cls._plan_tool_paths(arguments)
++        if name in cls.PLAN_VALIDATE_TOOLS and not actual:
++            actual = ["."]
++        return any(
++            path == wanted or path.endswith("/" + wanted) or wanted.endswith("/" + path)
++            or (name in cls.PLAN_VALIDATE_TOOLS
++                and (wanted.startswith(path.rstrip("/") + "/")
++                     or path.startswith(wanted.rstrip("/") + "/")))
++            for path in actual if path
++        )
+ 
+     def _start_plan(self, plan: str) -> None:
+-        """Remember an approved plan so the interface can follow it.
+-
+-        The plan used to be shown once, in the dialog that asked for it, and
+-        then vanish — leaving a spinner and a log to answer "how far along is
+-        this?".
+-        """
+-        steps = []
++        """Remember only trackable, human-readable steps from an approved plan."""
++        steps: list[dict] = []
++        seen: set[tuple[str, str, str]] = set()
+         for line in str(plan or "").splitlines():
+-            text = line.strip(" -*\t")
+-            if not text:
++            step = self._clean_plan_step(line)
++            if not step:
+                 continue
+-            path = text.split(" - ")[0].strip()
+-            steps.append({"path": path, "text": text, "done": False})
++            key = (step["kind"], step["path"], step["text"].casefold())
++            if key in seen:
++                continue
++            seen.add(key)
++            steps.append(step)
+         self._plan_steps = steps[:20]
+         if self._plan_steps:
+             self._push("plan_started", steps=self._plan_steps)
+ 
+     def _on_tool(self, name: str, arguments: dict, succeeded: bool) -> None:
+-        if not succeeded or not getattr(self, "_plan_steps", None):
++        if not succeeded:
+             return
+-        if name not in self.PLAN_TOOLS:
++
++        # The live card should say what has actually happened even when the
++        # approved plan is short or imperfect. This is past-tense evidence:
++        # on_tool runs only after the tool returns successfully.
++        paths = self._plan_tool_paths(arguments)
++        if getattr(self, "_plan_steps", None):
++            self._push("work_activity", tool=name, paths=paths[:8])
++
++        if not getattr(self, "_plan_steps", None):
+             return
+-        written = []
+-        if isinstance(arguments.get("files"), list):
+-            written = [str(item.get("path", "")) for item in arguments["files"]
+-                       if isinstance(item, dict)]
+-        elif arguments.get("path"):
+-            written = [str(arguments["path"])]
+         changed = False
+         for step in self._plan_steps:
+             if step["done"]:
+                 continue
+-            if any(path and (path == step["path"] or path.endswith(step["path"])
+-                             or step["path"].endswith(path)) for path in written):
++            if self._plan_step_matches(step, name, arguments):
+                 step["done"] = True
+                 changed = True
+         if changed:

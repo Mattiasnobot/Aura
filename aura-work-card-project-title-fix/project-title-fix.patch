@@ -1,0 +1,40 @@
+--- a/aura/web/app.js
++++ b/aura/web/app.js
+@@ -267,13 +267,36 @@
+   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+ }
+ 
++function projectFromTaskEvidence(task, evidence) {
++  // A finished task's own changed paths are stronger evidence than the sticky
++  // conversation label. This matters when project detection briefly drifts:
++  // a build that changed shop/index.html, shop/styles.css, ... is work on shop
++  // even if the conversation state still says "new". Require a clear majority
++  // so one unrelated path cannot rename an otherwise coherent task.
++  const roots = new Map();
++  let nestedPaths = 0;
++  for (const raw of evidence.files || []) {
++    const normalized = String(raw || "").replaceAll("\\", "/").replace(/^\.\//, "");
++    const parts = normalized.split("/").filter(Boolean);
++    if (parts.length < 2) continue;
++    nestedPaths += 1;
++    roots.set(parts[0], (roots.get(parts[0]) || 0) + 1);
++  }
++  const ranked = [...roots.entries()].sort((a, b) => b[1] - a[1]);
++  if (ranked.length) {
++    const [root, count] = ranked[0];
++    if (count >= Math.max(1, Math.ceil(nestedPaths * 0.6))) return root;
++  }
++  return String(task.project || currentProject || "").trim();
++}
++
+ function attachTaskCard(article, task) {
+   if (!article || !task || (!(task.tools || []).length && task.status === "completed")) return;
+ 
+   const evidence = taskEvidence(task);
+   const statusName = String(task.status || "running").toLowerCase();
+   const completed = statusName === "completed";
+-  const project = String(currentProject || task.project || "").trim();
++  const project = projectFromTaskEvidence(task, evidence);
+ 
+   const card = document.createElement("div");
+   card.className = `message-task-card result-card ${completed ? "completed" : statusName}`;

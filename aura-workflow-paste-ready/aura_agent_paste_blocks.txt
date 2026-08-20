@@ -1,0 +1,90 @@
+aura/agent.py — exact replacement blocks
+=========================================
+
+These are already automated by apply_workflow_fix.py. Use this file only if you
+want to paste manually.
+
+1) In open_session(), replace:
+
+        self.config.update(current_session=self.session_id)
+        self.memory.data["conversation"] = [dict(item) for item in messages]
+        self.memory.save()
+        self.log.record("open_session", "ok", session_id=self.session_id,
+                        messages=len(messages))
+        return messages
+
+with:
+
+        self.config.update(current_session=self.session_id)
+        self.memory.data["conversation"] = [dict(item) for item in messages]
+        self.memory.save()
+        # `current_project` is conversation state. Leaving the project from the
+        # previously open conversation here means a short follow-up such as
+        # "continue" can pick up the wrong project's plan and memories. Rebuild
+        # it from the most recent user turn in this conversation that actually
+        # names a project.
+        self.current_project = None
+        for item in reversed(messages):
+            if item.get("role") != "user":
+                continue
+            project = self.detect_project(str(item.get("text") or ""))
+            if project:
+                self.current_project = project
+                break
+        self.log.record("open_session", "ok", session_id=self.session_id,
+                        messages=len(messages))
+        return messages
+
+2) Immediately after the PLAN approval succeeds, insert:
+
+        # Once the user approves a first project plan, Python owns the workflow
+        # state. Do not depend on the model remembering to call
+        # `record_plan_steps` in a later round just to make the agreed plan
+        # resumable. Existing durable steps win: a later file-plan approval for
+        # an established project must not replace work already in progress.
+        if project and not self.plan_text(project):
+            try:
+                if not self.db.plan_steps(project):
+                    self.db.set_plan_steps(project, listed[:20])
+                    self.log.record("plan_steps", "ok", project=project,
+                                    steps=len(listed[:20]), agreed=True)
+            except Exception as exc:
+                self._note_bookkeeping_failure("plan_steps", project, exc)
+
+3) In _tool_conversation(), DELETE the unconditional block:
+
+            if round_index:
+                # Any second or later round replaces whatever was streamed
+                # before it. Clearing here — rather than at each individual
+                # retry — means no future retry path can reintroduce the
+                # duplicated-answer bug by forgetting to signal.
+                state("retry")
+
+4) Replace the response.tool_calls opening with:
+
+            if response.tool_calls:
+                if response.content and token:
+                    # Some models narrate before emitting a tool call. That text
+                    # is intermediate, not the final answer, so discard only
+                    # that visible stream. A normal tool continuation with no
+                    # visible text is not a retry and should not look like one.
+                    state("stream_reset")
+                state("working")
+
+5) At the start of `if retry is not None:`, insert:
+
+                # This is the actual retry boundary. The old loop emitted
+                # `retry` for every second-or-later model round, including
+                # healthy continuation after a successful tool call.
+                state("retry")
+
+6) In _gate_plan_progress(), replace:
+
+            if step["status"] == "done" or step["id"] in turn.plan_steps_recorded:
+                continue
+
+with:
+
+            if (step["status"] in {"done", "blocked"}
+                    or step["id"] in turn.plan_steps_recorded):
+                continue

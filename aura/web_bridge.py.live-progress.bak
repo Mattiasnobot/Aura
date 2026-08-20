@@ -5,7 +5,6 @@ import platform
 import sqlite3
 from collections import deque
 import queue
-import re
 from pathlib import Path
 import threading
 from dataclasses import asdict
@@ -79,8 +78,8 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         self._busy = False
         self._voice_active = False
         self._approvals: dict[str, queue.Queue[str]] = {}
-        #: The approved plan for the running turn, ticked off only when a
-        #: successful tool proves the corresponding read/write/check happened.
+        #: The approved file plan for the running turn, ticked off as the
+        #: files are actually written rather than as they are intended.
         self._plan_steps: list[dict] = []
         self._task_approved_exact: dict[str, set[str]] = {}
         self._approval_lock = threading.Lock()
@@ -659,154 +658,46 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
         self._push("state", value="working")
         return {"ok": True}
 
-    #: Plan progress is evidence from successful tools, not a timer. The first
-    #: version only counted writes, which left a perfectly real `read_file`
-    #: step at 0% for an entire seven-minute task. These groups describe what
-    #: kind of tool can actually prove each kind of approved step happened.
-    PLAN_READ_TOOLS = frozenset({
-        "read_file", "read_many_files", "file_info", "inspect_code", "list_files",
-        "search_files", "search_text", "find_relevant_files", "workspace_summary",
-    })
-    PLAN_WRITE_TOOLS = frozenset({
-        "create_folder", "create_file", "write_file", "write_files", "append_file",
-        "replace_in_file", "apply_edits", "copy_file", "move_file",
-        "safe_delete_file", "create_archive", "extract_archive",
-    })
-    PLAN_VALIDATE_TOOLS = frozenset({"validate_project", "check_accessibility"})
-    PLAN_RESEARCH_TOOLS = frozenset({"search_web"})
-
-    @staticmethod
-    def _clean_plan_step(line: str) -> dict | None:
-        """Turn one approved-plan line into a human step the UI can track.
-
-        Small local models occasionally put a textual tool call inside the plan:
-        a useful sentence followed by ```tool_call, JSON arguments, and ```.
-        Treating each of those lines as work produced the 0/4 card Mat saw.
-        Syntax is discarded here; only a real human-readable action survives.
-        """
-        raw = str(line or "").strip()
-        if not raw:
-            return None
-        lowered = raw.casefold()
-        if (raw.startswith("```") or raw in {"{", "}", "[", "]"} or
-                lowered.startswith(("<tool_call", "</tool_call", "tool_call")) or
-                re.match(r'^\s*\{.*"(?:name|arguments)"\s*:', raw) or
-                re.match(r'^\s*"(?:name|arguments)"\s*:', raw)):
-            return None
-
-        # Bullets and ordered-list numbers are presentation, not part of the step.
-        text = re.sub(r"^\s*(?:[-*•]\s+|\d+[.)]\s+)", "", raw).strip()
-        if not text or text.startswith(("{", "}", "[", "]")):
-            return None
-
-        lower = text.casefold()
-        if re.search(r"\b(validate|validation|test|check accessibility|lint)\b", lower):
-            kind = "validate"
-        elif re.search(r"\b(read|inspect|review|look at|open|list|check)\b", lower):
-            kind = "read"
-        elif re.search(r"\b(research|search|look up|find online)\b", lower):
-            kind = "research"
-        elif re.search(r"\b(create|write|edit|update|change|modify|replace|add|build|remove|delete|move|copy)\b", lower):
-            kind = "write"
-        else:
-            # The approval dialog is primarily a file plan. A bare path such as
-            # `shop/index.html - main page` therefore means "produce this file".
-            kind = "write"
-
-        # Prefer a path in backticks, then a filename/folder-looking token.
-        quoted = re.search(r"`([^`\r\n]+)`", text)
-        candidate = quoted.group(1) if quoted else ""
-        if not candidate:
-            token = re.search(
-                r"(?<![\w.-])((?:[\w.-]+[/\\])+[\w.-]+(?:\.[A-Za-z0-9_-]+)?|"
-                r"[\w.-]+\.(?:py|json|toml|md|txt|html|css|js|ts|tsx|jsx|yaml|yml|svg|xml))"
-                r"(?![\w.-])",
-                text,
-            )
-            candidate = token.group(1) if token else ""
-        path = str(candidate).replace("\\", "/").strip(" ./`'\"(),:;")
-        return {"path": path, "text": text, "kind": kind, "done": False}
-
-    @staticmethod
-    def _plan_tool_paths(arguments: dict) -> list[str]:
-        """Workspace-like paths named by one tool call, normalized for matching."""
-        found: list[str] = []
-        values: list[object] = []
-        if isinstance(arguments.get("files"), list):
-            values.extend(item.get("path") for item in arguments["files"]
-                          if isinstance(item, dict))
-        if isinstance(arguments.get("paths"), list):
-            values.extend(arguments["paths"])
-        for key in ("path", "source", "destination", "archive"):
-            if arguments.get(key):
-                values.append(arguments[key])
-        for value in values:
-            normalized = str(value or "").replace("\\", "/").strip(" ./`'\"(),:;")
-            if normalized and normalized not in found:
-                found.append(normalized)
-        return found
-
-    @classmethod
-    def _plan_step_matches(cls, step: dict, name: str, arguments: dict) -> bool:
-        kind = str(step.get("kind") or "write")
-        if kind == "read" and name not in cls.PLAN_READ_TOOLS:
-            return False
-        if kind == "write" and name not in cls.PLAN_WRITE_TOOLS:
-            return False
-        if kind == "validate" and name not in cls.PLAN_VALIDATE_TOOLS:
-            return False
-        if kind == "research" and name not in cls.PLAN_RESEARCH_TOOLS:
-            return False
-
-        wanted = str(step.get("path") or "").replace("\\", "/").strip("/")
-        if not wanted:
-            return True
-        actual = cls._plan_tool_paths(arguments)
-        if name in cls.PLAN_VALIDATE_TOOLS and not actual:
-            actual = ["."]
-        return any(
-            path == wanted or path.endswith("/" + wanted) or wanted.endswith("/" + path)
-            or (name in cls.PLAN_VALIDATE_TOOLS
-                and (wanted.startswith(path.rstrip("/") + "/")
-                     or path.startswith(wanted.rstrip("/") + "/")))
-            for path in actual if path
-        )
+    #: Tools whose success means a planned file now exists. Anything else can
+    #: mention a path without producing it, and a plan that ticks on intention
+    #: rather than on result is worse than no plan at all.
+    PLAN_TOOLS = frozenset({"create_file", "write_file", "write_files", "append_file"})
 
     def _start_plan(self, plan: str) -> None:
-        """Remember only trackable, human-readable steps from an approved plan."""
-        steps: list[dict] = []
-        seen: set[tuple[str, str, str]] = set()
+        """Remember an approved plan so the interface can follow it.
+
+        The plan used to be shown once, in the dialog that asked for it, and
+        then vanish — leaving a spinner and a log to answer "how far along is
+        this?".
+        """
+        steps = []
         for line in str(plan or "").splitlines():
-            step = self._clean_plan_step(line)
-            if not step:
+            text = line.strip(" -*\t")
+            if not text:
                 continue
-            key = (step["kind"], step["path"], step["text"].casefold())
-            if key in seen:
-                continue
-            seen.add(key)
-            steps.append(step)
+            path = text.split(" - ")[0].strip()
+            steps.append({"path": path, "text": text, "done": False})
         self._plan_steps = steps[:20]
         if self._plan_steps:
             self._push("plan_started", steps=self._plan_steps)
 
     def _on_tool(self, name: str, arguments: dict, succeeded: bool) -> None:
-        if not succeeded:
+        if not succeeded or not getattr(self, "_plan_steps", None):
             return
-
-        # The live card should say what has actually happened even when the
-        # approved plan is short or imperfect. This is past-tense evidence:
-        # on_tool runs only after the tool returns successfully.
-        paths = self._plan_tool_paths(arguments)
-        if getattr(self, "_plan_steps", None):
-            self._push("work_activity", tool=name, paths=paths[:8])
-
-        if not getattr(self, "_plan_steps", None):
+        if name not in self.PLAN_TOOLS:
             return
+        written = []
+        if isinstance(arguments.get("files"), list):
+            written = [str(item.get("path", "")) for item in arguments["files"]
+                       if isinstance(item, dict)]
+        elif arguments.get("path"):
+            written = [str(arguments["path"])]
         changed = False
         for step in self._plan_steps:
             if step["done"]:
                 continue
-            if self._plan_step_matches(step, name, arguments):
+            if any(path and (path == step["path"] or path.endswith(step["path"])
+                             or step["path"].endswith(path)) for path in written):
                 step["done"] = True
                 changed = True
         if changed:

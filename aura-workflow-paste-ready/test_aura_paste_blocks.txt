@@ -1,0 +1,21 @@
+tests/test_aura.py — exact replacement block
+=============================================
+
+In test_every_extra_round_clears_the_previous_partial_reply(), change the opening
+comment to:
+
+        # The verification nudge used to stream only blank lines and then repeat
+        # the whole answer, so the reply appeared two or three times. Keep the
+        # reset for a real completion-gate retry, but ordinary continuation after
+        # a successful tool is not itself a retry.
+
+Then replace:
+
+        # One reset for each round after the first.
+        self.assertEqual(states.count("retry"), provider.complete.call_count - 1)
+
+with:
+
+        # Only the validation nudge is a retry. The two post-tool continuations
+        # should move forward without flashing/resetting as failed attempts.
+        self.assertEqual(states.count("retry"), 1)

@@ -1,0 +1,182 @@
+BLOCK 1: Replace AuraAgent.detect_project with this block
+================================================================================
+    def detect_project(self, message: str) -> str | None:
+        """Which project this request is about.
+
+        An explicit project/folder name wins before loose mentions of existing
+        workspace folders. That ordering matters when a stale folder has a name
+        that is also ordinary prose: after one bad run created `new/`, the words
+        "create a new project called shop" used to select `new` simply because
+        that folder already existed.
+        """
+        explicit = self._extract_artifact_contract(message)[0]
+        if explicit:
+            return explicit
+        text = str(message or "").casefold()
+        for name in self.workspace_projects():
+            lowered = name.casefold()
+            if re.search(rf"(?<![\w-]){re.escape(lowered)}(?![\w-])", text):
+                return name
+        return None
+
+
+BLOCK 2: Inside _prepare_turn, replace the expected_paths transition with this block
+================================================================================
+        _, expected_paths = self._extract_artifact_contract(message)
+        if expected_base:
+            # Make the model see the same scope Python will enforce. This is not
+            # the guard itself — `_project_scope_error` is — but giving the rule
+            # up front avoids wasting a tool round discovering it by rejection.
+            messages.insert(1, {"role": "system", "content":
+                f"Project scope for this turn is `{expected_base}`. Keep project writes inside "
+                f"`{expected_base}/` (or the project folder itself), and validate exactly "
+                f"`{expected_base}`. Do not create or validate a second top-level project."})
+        if not self._requires_mutation(routing_request):
+
+
+BLOCK 3: Inside _finish_turn, replace the completion-evidence block with this block
+================================================================================
+        missing = set(turn.missing_artifacts)
+        present = [path for path in turn.expected_paths if path not in missing]
+        # Evidence is a report about the target project, not a transcript of every
+        # file the model happened to inspect. A live shop build read `new/PLAN.md`
+        # and promoted that unrelated read into the final proof. Keep the full
+        # turn state for gates, but scope the user-facing evidence when a project
+        # was explicitly identified.
+        report_scope = self._normalize_path(turn.expected_base or "")
+        in_report_scope = lambda path: (
+            not report_scope or self._scope_covers(report_scope, path))
+        verified_for_report = sorted(
+            path for path in turn.verified_final_paths if in_report_scope(path))
+        measured_for_report = sorted(
+            path for path in (turn.measured_paths - turn.verified_final_paths)
+            if in_report_scope(path))
+        created_instead = sorted(
+            path for path in turn.missing_at_start
+            if turn.edit_request and self._file_exists(path) and in_report_scope(path))
+        return self._format_completion_evidence(
+            response.content, turn.validation_scope,
+            turn.validation_evidence,
+            verified_for_report, present,
+            turn.unconfirmed, list(self.fetched_sources),
+            measured_for_report,
+            # Named to be changed, and not there to change.
+            created_instead,
+        )
+
+
+BLOCK 4: Inside _extract_artifact_contract, replace the target/pattern parsing block with this block
+================================================================================
+        target = None
+        # Strong naming forms come first. The old generic `([word]) project`
+        # pattern saw "new project" before it ever had a chance to understand
+        # "called shop", which is how a project literally named `new` appeared.
+        # The boolean says the user explicitly *named* the project, so even an
+        # unusual but deliberate name such as "new" is allowed in that form.
+        patterns = (
+            (r"(?i)\b(?:project|folder|directory)\s+(?:called|named)\s+[`'"]?([\w.-]+)[`'"]?", True),
+            (r"(?i)\b(?:called|named)\s+[`'"]?([\w.-]+)[`'"]?\s+(?:project|folder|directory)\b", True),
+            (r"(?i)\b(?:project|folder|directory)\s*:\s*[`'"]?([\w.-]+)[`'"]?", True),
+            (r"(?i)\b(?:in|inside|under)\s+(?:a\s+|the\s+)?([\w.-]+)\s+(?:folder|directory)\b", False),
+            (r"(?i)\b(?:in|inside|under)\s+([\w.-]+)\s+with\b", False),
+            (r"(?i)\b([\w.-]+)\s+project\b", False),
+            # Estonian puts the folder on either side of the word for it, and
+            # marks the relation with a case ending rather than a preposition.
+            # "kausta promo" puts the name after it; "promo kaustas" and
+            # "aura_craft projektis" put it before. Matching both directions
+            # with one word list made "projektis uus leht" report the folder
+            # as "uus": the case ending is what says which side to read.
+            (r"(?i)\b(?:kausta|kataloogi)\s+([\w.-]+)", False),
+            (r"(?i)\b([\w.-]+)\s+(?:kaustas|kataloogis|projektis)\b", False),
+        )
+        generic_words = {
+            "a", "an", "the", "this", "that", "entire", "current", "whole",
+            # Possessives and pronouns: "my project" names no folder.
+            "my", "your", "our", "his", "her", "their", "its", "some", "any",
+            # Descriptions of a project are not project names. Explicit
+            # `called new`/`named app` still work because named forms bypass this.
+            "new", "fresh", "blank", "empty", "simple", "small", "basic",
+            "website", "web", "site", "app", "application",
+        }
+        for pattern, explicitly_named in patterns:
+            match = re.search(pattern, message)
+            if match:
+                candidate = match.group(1).strip("./")
+                if explicitly_named or candidate.casefold() not in generic_words:
+                    target = candidate
+                    break
+
+
+BLOCK 5: Insert this _project_scope_error method before _normalize_path (the replacement below includes the surrounding return/staticmethod lines)
+================================================================================
+        return target, paths
+
+    @classmethod
+    def _project_scope_error(cls, call: ToolCall, turn: TurnState | None) -> str:
+        """Reject project-build writes or validation that escape the chosen project.
+
+        This is deliberately a pre-execution check. A completion gate can notice
+        a stray `new/index.html` afterwards, but by then the ghost project already
+        exists. The model gets a normal failed-tool result and can retry with the
+        correct `shop/...` path without Aura changing the wrong project first.
+        """
+        if turn is None or not turn.expected_base or not turn.build_words:
+            return ""
+        scope = cls._normalize_path(turn.expected_base)
+        if not scope:
+            return ""
+        name, args = call.name, call.arguments
+        if name == "validate_project":
+            requested = cls._normalize_path(str(args.get("path", ".")))
+            if requested != scope:
+                return (f"This turn is locked to project `{scope}`. Refusing to validate "
+                        f"`{requested or '.'}`; run validate_project with path `{scope}`.")
+            return ""
+
+        paths: list[str] = []
+        if name in {"create_folder", "create_file", "write_file", "append_file",
+                    "replace_in_file", "apply_edits", "safe_delete_file"}:
+            paths.append(str(args.get("path", "")))
+        elif name == "write_files":
+            paths.extend(str(item.get("path", "")) for item in (args.get("files") or [])
+                         if isinstance(item, dict))
+        elif name == "copy_file":
+            # Copying may legitimately read a source elsewhere; only the new copy
+            # changes state, so only its destination is constrained.
+            paths.append(str(args.get("destination", "")))
+        elif name == "move_file":
+            # A move mutates both ends: the source disappears and the destination
+            # appears, so a project-scoped build must keep both inside the project.
+            paths.extend([str(args.get("source", "")), str(args.get("destination", ""))])
+        elif name in {"create_archive", "extract_archive"}:
+            paths.append(str(args.get("destination", "")))
+        else:
+            return ""
+
+        for raw in paths:
+            path = cls._normalize_path(raw)
+            if path and not cls._scope_covers(scope, path):
+                return (f"This turn is locked to project `{scope}`. Refusing {name} for "
+                        f"`{path}` because it is outside `{scope}/`. Use a path inside "
+                        f"the target project instead.")
+        return ""
+
+    @staticmethod
+    def _normalize_path(value: str) -> str:
+
+
+BLOCK 6: Inside _execute_tool, replace the opening name/args/try block with this block
+================================================================================
+        name, args = call.name, call.arguments
+        try:
+            # `execute_code` dispatches nested tools through this same method, so
+            # the guard covers both ordinary model tool calls and scripted batch
+            # work. `current_task_id` prevents a stale turn object from affecting
+            # direct maintenance/test calls made outside an active user turn.
+            turn = getattr(self, "_turn_state", None)
+            if self.current_task_id and isinstance(turn, TurnState):
+                scope_error = self._project_scope_error(call, turn)
+                if scope_error:
+                    raise ValueError(scope_error)
+            service = services.get(name)
+

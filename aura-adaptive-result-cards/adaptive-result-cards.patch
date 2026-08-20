@@ -1,0 +1,316 @@
+--- a/aura/web/app.js
++++ b/aura/web/app.js
+@@ -287,19 +287,117 @@
+     const [root, count] = ranked[0];
+     if (count >= Math.max(1, Math.ceil(nestedPaths * 0.6))) return root;
+   }
++  // A read-only verification has no changed paths. In that case the path Aura
++  // actually validated is the strongest project evidence available.
++  const validated = String(evidence.validationPath || "").replaceAll("\\", "/")
++    .replace(/^\.\//, "").replace(/\/$/, "");
++  if (validated && validated !== ".") return validated.split("/")[0];
+   return String(task.project || currentProject || "").trim();
+ }
+ 
+-function attachTaskCard(article, task) {
++function replyEvidencePresentation(text, task) {
++  // The backend's evidence footer is useful, but once the same facts have a
++  // dedicated result card it becomes visual duplication. Move only the exact
++  // "Confirmed evidence:" sections into the card. Warnings (Not confirmed)
++  // and network-source sections stay in the conversation where they matter.
++  const original = String(text || "");
++  if (!task || !original) return { text: original, evidence: [] };
++  const lines = original.replace(/\r\n?/g, "\n").split("\n");
++  const kept = [];
++  const evidence = [];
++  const seen = new Set();
++  let capturing = false;
++
++  const headingName = line => line.trim()
++    .replace(/^#{1,4}\s+/, "")
++    .replace(/^\*\*(.+)\*\*$/, "$1")
++    .trim().toLowerCase();
++  const finishEvidence = new Set(["not confirmed:", "read from the network:", "read from network:"]);
++  const addEvidence = value => {
++    const cleaned = String(value || "").trim();
++    if (!cleaned) return;
++    const key = cleaned.replace(/[`*_]/g, "").replace(/\s+/g, " ").toLowerCase();
++    if (seen.has(key)) return;
++    seen.add(key);
++    evidence.push(cleaned);
++  };
++
++  for (const line of lines) {
++    const heading = headingName(line);
++    if (heading === "confirmed evidence:") {
++      capturing = true;
++      continue;
++    }
++    if (capturing && finishEvidence.has(heading)) {
++      capturing = false;
++      kept.push(line);
++      continue;
++    }
++    if (!capturing) {
++      kept.push(line);
++      continue;
++    }
++    if (!line.trim()) continue;
++    const bullet = line.match(/^\s*[-*•]\s+(.+)$/);
++    if (bullet) {
++      addEvidence(bullet[1]);
++      continue;
++    }
++    // A new Markdown heading that is not another evidence heading ends the
++    // captured section. This avoids swallowing an unrelated section a model
++    // placed after the footer.
++    if (/^\s*#{1,4}\s+/.test(line)) {
++      capturing = false;
++      kept.push(line);
++      continue;
++    }
++    addEvidence(line);
++  }
++
++  let compact = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
++  if (!compact) compact = String(task.summary || original).trim();
++  return { text: compact || original, evidence };
++}
++
++function taskResultPresentation(task, evidence) {
++  const statusName = String(task.status || "running").toLowerCase();
++  const mutated = evidence.files.length > 0 || (task.tools || []).some(name => MUTATION_TOOLS.has(name));
++  const project = projectFromTaskEvidence(task, evidence);
++  if (statusName === "error" || statusName === "failed") {
++    return { eyebrow: "Needs attention", title: project ? `${project} needs attention` : "Task needs attention",
++             statusLabel: "ERROR", kind: "error", mark: "!", project, mutated };
++  }
++  if (["cancelled", "interrupted", "stopped"].includes(statusName)) {
++    return { eyebrow: "Stopped", title: project ? `${project} stopped` : "Task stopped",
++             statusLabel: "STOPPED", kind: "stopped", mark: "■", project, mutated };
++  }
++  if (statusName === "completed" && !mutated && evidence.validated) {
++    return { eyebrow: "Verified result", title: project ? `${project} verified` : "Checks passed",
++             statusLabel: "VERIFIED", kind: "verified", mark: "✓", project, mutated };
++  }
++  if (statusName === "completed" && mutated && evidence.validated) {
++    return { eyebrow: "Finished work", title: project ? `${project} completed` : "Work completed",
++             statusLabel: "COMPLETED", kind: "completed", mark: "✓", project, mutated };
++  }
++  if (statusName === "completed" && mutated) {
++    return { eyebrow: "Changes made", title: project ? `${project} updated` : "Changes completed",
++             statusLabel: "COMPLETED", kind: "completed", mark: "✓", project, mutated };
++  }
++  return { eyebrow: statusName === "completed" ? "Task complete" : "Task result",
++           title: project ? project : (statusName === "completed" ? "Task completed" : "Task details"),
++           statusLabel: statusName.toUpperCase(), kind: statusName, mark: statusName === "completed" ? "✓" : "•",
++           project, mutated };
++}
++
++function attachTaskCard(article, task, replyEvidence = []) {
+   if (!article || !task || (!(task.tools || []).length && task.status === "completed")) return;
+ 
+   const evidence = taskEvidence(task);
++  const presentation = taskResultPresentation(task, evidence);
+   const statusName = String(task.status || "running").toLowerCase();
+-  const completed = statusName === "completed";
+-  const project = projectFromTaskEvidence(task, evidence);
+ 
+   const card = document.createElement("div");
+-  card.className = `message-task-card result-card ${completed ? "completed" : statusName}`;
++  card.className = `message-task-card result-card ${presentation.kind}`;
+ 
+   const head = document.createElement("div");
+   head.className = "message-task-head result-card-head";
+@@ -307,22 +405,20 @@
+   identity.className = "result-card-identity";
+   const mark = document.createElement("span");
+   mark.className = "result-card-mark";
+-  mark.textContent = completed ? "✓" : (statusName === "error" ? "!" : "•");
++  mark.textContent = presentation.mark;
+   mark.setAttribute("aria-hidden", "true");
+   const heading = document.createElement("div");
+   const eyebrow = document.createElement("span");
+   eyebrow.className = "result-card-eyebrow";
+-  eyebrow.textContent = completed ? "Finished work" : "Task result";
++  eyebrow.textContent = presentation.eyebrow;
+   const title = document.createElement("strong");
+-  title.textContent = project
+-    ? `${project}${completed ? " completed" : ""}`
+-    : (completed ? "Task completed" : "Task details");
++  title.textContent = presentation.title;
+   heading.append(eyebrow, title);
+   identity.append(mark, heading);
+ 
+   const status = document.createElement("span");
+-  status.className = `result-card-status ${statusName}`;
+-  status.textContent = statusName;
++  status.className = `result-card-status ${presentation.kind}`;
++  status.textContent = presentation.statusLabel;
+   head.append(identity, status);
+ 
+   const evidenceRow = document.createElement("div");
+@@ -334,10 +430,15 @@
+     evidenceRow.append(item);
+   };
+   if (evidence.duration !== null) evidenceItem(`Took ${formatDuration(evidence.duration)}`);
+-  if (evidence.files.length) {
++  if (presentation.mutated && evidence.files.length) {
+     evidenceItem(`${evidence.files.length} workspace item${evidence.files.length === 1 ? "" : "s"} changed`);
+   }
+-  if (evidence.validated) evidenceItem("Validated", true);
++  if (!presentation.mutated && evidence.validated) {
++    if (evidence.filesSeen !== null) evidenceItem(`${evidence.filesSeen} file${evidence.filesSeen === 1 ? "" : "s"} checked`);
++    if (evidence.issueCount !== null) evidenceItem(`${evidence.issueCount} issue${evidence.issueCount === 1 ? "" : "s"}`);
++    evidenceItem("No files modified");
++  }
++  if (evidence.validated) evidenceItem("✓ Validated", true);
+   if (!evidenceRow.children.length && (task.tools || []).length) {
+     evidenceItem(`${[...new Set(task.tools || [])].length} tool${[...new Set(task.tools || [])].length === 1 ? "" : "s"} used`);
+   }
+@@ -359,6 +460,19 @@
+     more.textContent = `+${evidence.files.length - 8} more`;
+     files.append(more);
+   }
++
++  const proof = document.createElement("details");
++  proof.className = "result-card-details result-card-proof";
++  const proofSummary = document.createElement("summary");
++  proofSummary.textContent = `Evidence • ${replyEvidence.length}`;
++  const proofList = document.createElement("ul");
++  proofList.className = "result-card-proof-list";
++  for (const line of replyEvidence.slice(0, 12)) {
++    const item = document.createElement("li");
++    appendInlineMarkdown(item, line);
++    proofList.append(item);
++  }
++  proof.append(proofSummary, proofList);
+ 
+   const details = document.createElement("details");
+   details.className = "result-card-details";
+@@ -388,13 +502,12 @@
+   action("Open workspace", () => openWorkspaceExplorer(evidence.files[0] || null), "primary");
+   action("Details", () => openTasks(task.task_id));
+   if (String(task.request || "").trim()) action("Repeat", () => sendMessage(task.request));
+-  if ((task.tools || []).some(name => MUTATION_TOOLS.has(name))) {
+-    action("Undo", () => rollbackTask(task), "danger");
+-  }
++  if (presentation.mutated) action("Undo", () => rollbackTask(task), "danger");
+ 
+   card.append(head);
+   if (evidenceRow.children.length) card.append(evidenceRow);
+   if (files.children.length) card.append(files);
++  if (replyEvidence.length) card.append(proof);
+   if (uniqueTools.length) card.append(details);
+   card.append(actions);
+   article.append(card);
+@@ -761,16 +874,17 @@
+       break;
+     case "reply":
+       applyProject(event.project);
++      const presentedReply = replyEvidencePresentation(event.text, event.task);
+       let completedMessage;
+       if (event.streamed && streamMessage) {
+         completedMessage = streamMessage;
+         streamMessage.article.classList.remove("streaming");
+-        renderMessage(streamMessage.body, event.text);
++        renderMessage(streamMessage.body, presentedReply.text);
+         streamMessage = null;
+       } else {
+-        completedMessage = addMessage("assistant", event.text);
++        completedMessage = addMessage("assistant", presentedReply.text);
+       }
+-      attachTaskCard(completedMessage?.article, event.task);
++      attachTaskCard(completedMessage?.article, event.task, presentedReply.evidence);
+       attachProposal(completedMessage?.article, event.proposal);
+       attachRecallNote(completedMessage?.article, event.recalled);
+       // The live card has now become the durable result card attached to this
+@@ -2578,9 +2692,19 @@
+   }
+ 
+   let validated = false;
++  let validationPath = "";
++  let filesSeen = null;
++  let issueCount = null;
+   for (const detail of details) {
+     if (!VERIFICATION_TOOLS.has(detail.tool)) continue;
++    const args = detail.arguments || {};
+     const result = detail.result || {};
++    if (detail.tool === "validate_project") {
++      validationPath = String(args.path || result.path || validationPath || "").trim();
++      const seen = Number(result.files_seen);
++      if (Number.isFinite(seen) && seen >= 0) filesSeen = seen;
++      if (Array.isArray(result.issues)) issueCount = result.issues.length;
++    }
+     if (result.ok === true || result.valid === true) validated = true;
+     else if (result.ok === false || result.valid === false) validated = false;
+   }
+@@ -2590,7 +2714,7 @@
+     const ms = new Date(task.finished) - new Date(task.started);
+     if (Number.isFinite(ms) && ms >= 0) duration = ms;
+   }
+-  return { files, validated, duration };
++  return { files, validated, validationPath, filesSeen, issueCount, duration };
+ }
+ 
+ function formatDuration(ms) {
+--- a/aura/web/styles.css
++++ b/aura/web/styles.css
+@@ -1147,3 +1147,57 @@
+     margin-left: 0;
+   }
+ }
++
++
++/* Adaptive result cards: the same task card now changes its language based on
++ * what actually happened. Verification-only work is not presented as a build,
++ * and the backend's detailed evidence footer lives behind one disclosure
++ * instead of being repeated in the main conversation. */
++.message-task-card.result-card.verified {
++  border-left-color: rgba(127, 224, 209, .72);
++}
++.result-card.verified .result-card-mark {
++  border-color: rgba(127, 224, 209, .4);
++  color: var(--accent);
++  background: rgba(var(--accent-rgb), .09);
++}
++.result-card-status.verified {
++  border-color: rgba(var(--accent-rgb), .34);
++  color: var(--accent);
++  background: rgba(var(--accent-rgb), .065);
++}
++.result-card.stopped .result-card-mark {
++  border-color: rgba(255, 180, 84, .38);
++  color: var(--warn);
++  background: rgba(255, 180, 84, .08);
++}
++.result-card-status.stopped {
++  border-color: rgba(255, 180, 84, .3);
++  color: var(--warn);
++  background: rgba(255, 180, 84, .06);
++}
++.result-card-proof {
++  margin-top: var(--s4);
++  padding-top: var(--s3);
++  border-top: 1px solid rgba(29, 48, 72, .72);
++}
++.result-card-proof summary {
++  color: var(--text-soft);
++}
++.result-card-proof-list {
++  display: grid;
++  gap: var(--s2);
++  margin: var(--s3) 0 0;
++  padding-left: 18px;
++  color: var(--text-muted);
++  font-size: var(--t-caption);
++  line-height: 1.5;
++}
++.result-card-proof-list code {
++  padding: 1px 4px;
++  border: 1px solid var(--border-strong);
++  border-radius: 4px;
++  color: #a9eadf;
++  background: var(--surface-0);
++  font: 10px/1.4 "Cascadia Mono", Consolas, monospace;
++}

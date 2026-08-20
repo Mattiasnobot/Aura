@@ -1,0 +1,284 @@
+diff --git a/aura/agent.py b/aura/agent.py
+--- a/aura/agent.py
++++ b/aura/agent.py
+@@ -174,6 +174,19 @@ class AuraAgent(FilesTools, RecoveryTools, MemoryTools, OutsideTools, MediaTools,
+         self.config.update(current_session=self.session_id)
+         self.memory.data["conversation"] = [dict(item) for item in messages]
+         self.memory.save()
++        # `current_project` is conversation state. Leaving the project from the
++        # previously open conversation here means a short follow-up such as
++        # "continue" can pick up the wrong project's plan and memories. Rebuild
++        # it from the most recent user turn in this conversation that actually
++        # names a project.
++        self.current_project = None
++        for item in reversed(messages):
++            if item.get("role") != "user":
++                continue
++            project = self.detect_project(str(item.get("text") or ""))
++            if project:
++                self.current_project = project
++                break
+         self.log.record("open_session", "ok", session_id=self.session_id,
+                         messages=len(messages))
+         return messages
+@@ -758,6 +769,19 @@ class AuraAgent(FilesTools, RecoveryTools, MemoryTools, OutsideTools, MediaTools,
+         if not approve(["PLAN", plan, kind]):
+             self.log.record("file_plan", "declined", files=len(listed))
+             return self.PLAN_DECLINED
++        # Once the user approves a first project plan, Python owns the workflow
++        # state. Do not depend on the model remembering to call
++        # `record_plan_steps` in a later round just to make the agreed plan
++        # resumable. Existing durable steps win: a later file-plan approval for
++        # an established project must not replace work already in progress.
++        if project and not self.plan_text(project):
++            try:
++                if not self.db.plan_steps(project):
++                    self.db.set_plan_steps(project, listed[:20])
++                    self.log.record("plan_steps", "ok", project=project,
++                                    steps=len(listed[:20]), agreed=True)
++            except Exception as exc:
++                self._note_bookkeeping_failure("plan_steps", project, exc)
+         # Keep what was agreed. A plan shown once and discarded leaves the next
+         # turn with nothing to work from and the user with nothing to correct,
+         # which is the whole difference between a card and a file.
+@@ -1074,12 +1096,6 @@ class AuraAgent(FilesTools, RecoveryTools, MemoryTools, OutsideTools, MediaTools,
+             self._check_cancelled()
+             if deadline is not None and round_index and time.monotonic() > deadline:
+                 return self._out_of_time(state_of_turn, budget, round_index)
+-            if round_index:
+-                # Any second or later round replaces whatever was streamed
+-                # before it. Clearing here — rather than at each individual
+-                # retry — means no future retry path can reintroduce the
+-                # duplicated-answer bug by forgetting to signal.
+-                state("retry")
+             # A conversation that ends with Aura's own reply is not a question, and
+             # asking it anyway is a guaranteed silence: the model answers with a
+             # single stop token, correctly, and the log records "empty response".
+@@ -1120,7 +1136,11 @@ class AuraAgent(FilesTools, RecoveryTools, MemoryTools, OutsideTools, MediaTools,
+ 
+             if response.tool_calls:
+                 if response.content and token:
+-                    token('\n\n')
++                    # Some models narrate before emitting a tool call. That text
++                    # is intermediate, not the final answer, so discard only
++                    # that visible stream. A normal tool continuation with no
++                    # visible text is not a retry and should not look like one.
++                    state("stream_reset")
+                 state("working")
+                 for call in response.tool_calls:
+                     self._check_cancelled()
+@@ -1147,6 +1166,10 @@ class AuraAgent(FilesTools, RecoveryTools, MemoryTools, OutsideTools, MediaTools,
+                     retry = verdict
+                     break
+             if retry is not None:
++                # This is the actual retry boundary. The old loop emitted
++                # `retry` for every second-or-later model round, including
++                # healthy continuation after a successful tool call.
++                state("retry")
+                 if retry.notice and token:
+                     token(retry.notice)
+                 # Make room before adding to the ask. Retrying a failed turn with
+@@ -1735,7 +1758,8 @@ class AuraAgent(FilesTools, RecoveryTools, MemoryTools, OutsideTools, MediaTools,
+         proof = self._step_evidence(turn)
+         first_open = True
+         for step in steps:
+-            if step["status"] == "done" or step["id"] in turn.plan_steps_recorded:
++            if (step["status"] in {"done", "blocked"}
++                    or step["id"] in turn.plan_steps_recorded):
+                 continue
+             # A step usually names its own artifact, and whether that file exists
+             # is a fact about the workspace rather than a guess about the turn.
+diff --git a/aura/web_bridge.py b/aura/web_bridge.py
+--- a/aura/web_bridge.py
++++ b/aura/web_bridge.py
+@@ -535,11 +535,11 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
+     def _on_agent_state(self, name: str) -> None:
+-        """Forward agent states, translating the retry signal for the interface.
++        """Forward agent states, translating stream-discard signals for the UI.
+ 
+-        "retry" is not a mood: it means the reply streamed so far is being
+-        thrown away, so the browser must clear it rather than append the next
+-        attempt underneath.
++        A real gate retry and narrated text that precedes a tool call both
++        abandon the visible partial answer. Ordinary post-tool continuation does
++        neither, so it must not flash as a retry or reset an already-clean stream.
+         """
+-        if name == "retry":
++        if name in {"retry", "stream_reset"}:
+             self._push("stream_reset")
+             self._push("state", value="working")
+             return
+@@ -553,5 +555,10 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
+             streamed.append(piece)
+             self._push("stream_token", text=piece)
+ 
++        def on_state(name: str) -> None:
++            if name in {"retry", "stream_reset"}:
++                streamed.clear()
++            self._on_agent_state(name)
++
+         try:
+             self._plan_steps = []
+@@ -570,7 +577,7 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
+                 response = self.agent.handle(
+                     text,
+                     approve=self._approve_command,
+-                    state=self._on_agent_state,
++                    state=on_state,
+                     token=on_token,
+                 )
+             finally:
+diff --git a/tests/test_aura.py b/tests/test_aura.py
+--- a/tests/test_aura.py
++++ b/tests/test_aura.py
+@@ -1737,7 +1737,8 @@
+     def test_every_extra_round_clears_the_previous_partial_reply(self):
+         # The verification nudge used to stream only blank lines and then repeat
+-        # the whole answer, so the reply appeared two or three times. The reset
+-        # is emitted once per extra round, so no retry path can miss it.
++        # the whole answer, so the reply appeared two or three times. Keep the
++        # reset for a real completion-gate retry, but ordinary continuation after
++        # a successful tool is not itself a retry.
+         provider = LMStudioProvider(model="local-model")
+         agent = AuraAgent(Path(self.temp.name) / "rounds", provider=provider)
+         states: list[str] = []
+@@ -1754,7 +1755,8 @@
+         provider.complete = unittest.mock.Mock(side_effect=replies)
+         agent.handle("Create loop.txt in the workspace and validate it",
+                      state=states.append)
+-        # One reset for each round after the first.
+-        self.assertEqual(states.count("retry"), provider.complete.call_count - 1)
++        # Only the validation nudge is a retry. The two post-tool continuations
++        # should move forward without flashing/resetting as failed attempts.
++        self.assertEqual(states.count("retry"), 1)
+ 
+     def test_a_retry_tells_the_interface_to_discard_the_abandoned_reply(self):
+diff --git a/tests/test_workflow_regressions.py b/tests/test_workflow_regressions.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_workflow_regressions.py
+@@ -0,0 +1,124 @@
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import Mock
++
++from aura.agent import AuraAgent
++from aura.provider import LMStudioProvider, MockProvider, ProviderReply, ToolCall
++from aura.turn import TurnState
++
++
++class WorkflowRoundTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++
++    def agent_with(self, replies):
++        provider = LMStudioProvider(model="local-model")
++        provider.complete = Mock(side_effect=replies)
++        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=provider)
++        self.addCleanup(agent.db.close)
++        return agent, provider
++
++    def test_normal_tool_continuation_is_not_reported_as_a_retry(self):
++        agent, provider = self.agent_with([
++            ProviderReply("", [ToolCall("c1", "list_files", {"path": "."})]),
++            ProviderReply("The workspace is empty.", []),
++        ])
++        states = []
++        answer = agent.handle("List the files in the workspace", state=states.append)
++        self.assertEqual(provider.complete.call_count, 2)
++        self.assertNotIn("retry", states)
++        self.assertIn("workspace", answer.casefold())
++
++    def test_a_real_completion_gate_retry_is_still_reported(self):
++        agent, provider = self.agent_with([
++            ProviderReply("The workspace is empty.", []),
++            ProviderReply("", [ToolCall("c1", "list_files", {"path": "."})]),
++            ProviderReply("The workspace is empty.", []),
++        ])
++        states = []
++        agent.handle("List the files in the workspace", state=states.append)
++        self.assertEqual(provider.complete.call_count, 3)
++        self.assertEqual(states.count("retry"), 1)
++
++    def test_narration_before_a_tool_call_discards_only_that_stream(self):
++        agent, provider = self.agent_with([
++            ProviderReply("I will check that now.",
++                          [ToolCall("c1", "list_files", {"path": "."})]),
++            ProviderReply("The workspace is empty.", []),
++        ])
++        states = []
++        agent.handle("List the files in the workspace", state=states.append,
++                     token=lambda _piece: None)
++        self.assertEqual(provider.complete.call_count, 2)
++        self.assertIn("stream_reset", states)
++        self.assertNotIn("retry", states)
++
++
++class WorkflowPersistenceTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++
++    def test_opening_a_conversation_restores_its_project(self):
++        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
++        self.addCleanup(agent.db.close)
++        agent.sandbox.create_folder("shop")
++        agent.sandbox.create_folder("promo")
++
++        first = agent.session_id
++        agent._remember("user", "Let's work on the shop project")
++        agent.project_for("Let's work on the shop project")
++        self.assertEqual(agent.current_project, "shop")
++
++        agent.new_session()
++        agent._remember("user", "Now work on the promo project")
++        agent.project_for("Now work on the promo project")
++        self.assertEqual(agent.current_project, "promo")
++
++        agent.open_session(first)
++        self.assertEqual(agent.current_project, "shop")
++
++    def test_approved_first_plan_is_durable_without_model_bookkeeping(self):
++        provider = LMStudioProvider(model="local-model")
++        provider.complete = Mock(return_value=ProviderReply(
++            "shop/index.html - landing page\nshop/style.css - styles", []))
++        agent = AuraAgent(Path(self.temp.name) / "planned", provider=provider)
++        self.addCleanup(agent.db.close)
++        agent.sandbox.create_folder("shop")
++        agent.current_project = "shop"
++        agent.current_request = "Build the shop pages"
++
++        plan = agent._plan_files(
++            "Build shop/index.html and shop/style.css",
++            ["shop/index.html", "shop/style.css"], True,
++            lambda _command: True, lambda _state: None)
++
++        self.assertIn("shop/index.html", plan)
++        steps = agent.db.plan_steps("shop")
++        self.assertEqual([step["text"] for step in steps], [
++            "shop/index.html - landing page",
++            "shop/style.css - styles",
++        ])
++
++    def test_blocked_step_stays_blocked_on_a_later_turn(self):
++        agent = AuraAgent(Path(self.temp.name) / "blocked", provider=MockProvider())
++        self.addCleanup(agent.db.close)
++        agent.sandbox.create_folder("shop")
++        agent.current_project = "shop"
++        step = agent.db.set_plan_steps("shop", ["Wait for the external API"])[0]
++        agent.db.set_step_status(step["id"], "blocked", "waiting for credentials")
++
++        turn = TurnState(successful_tools=1, workspace_mutation=True,
++                         validation_succeeded=True, validation_scope="shop",
++                         validation_evidence={"files_seen": 1})
++        agent._gate_plan_progress(turn, ProviderReply("done", []))
++
++        saved = agent.db.plan_steps("shop")[0]
++        self.assertEqual(saved["status"], "blocked")
++        self.assertEqual(saved["evidence"], "waiting for credentials")
++
++
++if __name__ == "__main__":
++    unittest.main()

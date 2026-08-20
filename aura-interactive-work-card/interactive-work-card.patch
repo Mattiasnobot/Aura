@@ -1,0 +1,702 @@
+--- a/aura/web/app.js
++++ b/aura/web/app.js
+@@ -76,6 +76,9 @@
+ let previewServerState = { running: false };
+ let selectedMindNode = null;
+ let planSteps = [];
++let planFinished = false;
++// The live work card is only a view over events Aura already emits. It never
++// decides what the agent should do; it just keeps the current work legible.
+ // Which project Aura believes the conversation is about. It decides which
+ // remembered facts she brings, so it is shown rather than kept to herself.
+ let currentProject = null;
+@@ -266,30 +269,111 @@
+ 
+ function attachTaskCard(article, task) {
+   if (!article || !task || (!(task.tools || []).length && task.status === "completed")) return;
++
++  const evidence = taskEvidence(task);
++  const statusName = String(task.status || "running").toLowerCase();
++  const completed = statusName === "completed";
++  const project = String(currentProject || task.project || "").trim();
++
+   const card = document.createElement("div");
+-  card.className = "message-task-card";
++  card.className = `message-task-card result-card ${completed ? "completed" : statusName}`;
++
+   const head = document.createElement("div");
+-  head.className = "message-task-head";
++  head.className = "message-task-head result-card-head";
++  const identity = document.createElement("div");
++  identity.className = "result-card-identity";
++  const mark = document.createElement("span");
++  mark.className = "result-card-mark";
++  mark.textContent = completed ? "✓" : (statusName === "error" ? "!" : "•");
++  mark.setAttribute("aria-hidden", "true");
++  const heading = document.createElement("div");
++  const eyebrow = document.createElement("span");
++  eyebrow.className = "result-card-eyebrow";
++  eyebrow.textContent = completed ? "Finished work" : "Task result";
+   const title = document.createElement("strong");
+-  title.textContent = "Task details";
++  title.textContent = project
++    ? `${project}${completed ? " completed" : ""}`
++    : (completed ? "Task completed" : "Task details");
++  heading.append(eyebrow, title);
++  identity.append(mark, heading);
++
+   const status = document.createElement("span");
+-  status.textContent = task.status || "running";
+-  head.append(title, status);
++  status.className = `result-card-status ${statusName}`;
++  status.textContent = statusName;
++  head.append(identity, status);
++
++  const evidenceRow = document.createElement("div");
++  evidenceRow.className = "result-card-evidence";
++  const evidenceItem = (label, strong = false) => {
++    const item = document.createElement("span");
++    item.className = strong ? "strong" : "";
++    item.textContent = label;
++    evidenceRow.append(item);
++  };
++  if (evidence.duration !== null) evidenceItem(`Took ${formatDuration(evidence.duration)}`);
++  if (evidence.files.length) {
++    evidenceItem(`${evidence.files.length} workspace item${evidence.files.length === 1 ? "" : "s"} changed`);
++  }
++  if (evidence.validated) evidenceItem("Validated", true);
++  if (!evidenceRow.children.length && (task.tools || []).length) {
++    evidenceItem(`${[...new Set(task.tools || [])].length} tool${[...new Set(task.tools || [])].length === 1 ? "" : "s"} used`);
++  }
++
++  const files = document.createElement("div");
++  files.className = "result-card-files";
++  for (const path of evidence.files.slice(0, 8)) {
++    const chip = document.createElement("button");
++    chip.type = "button";
++    chip.className = "result-file-chip";
++    chip.title = `Open ${path} in Workspace`;
++    chip.textContent = path.split(/[\\/]/).pop() || path;
++    chip.addEventListener("click", () => openWorkspaceExplorer(path));
++    files.append(chip);
++  }
++  if (evidence.files.length > 8) {
++    const more = document.createElement("span");
++    more.className = "result-file-more";
++    more.textContent = `+${evidence.files.length - 8} more`;
++    files.append(more);
++  }
++
++  const details = document.createElement("details");
++  details.className = "result-card-details";
++  const summary = document.createElement("summary");
++  const uniqueTools = [...new Set(task.tools || [])];
++  summary.textContent = `Activity${uniqueTools.length ? ` • ${uniqueTools.length} tool${uniqueTools.length === 1 ? "" : "s"}` : ""}`;
+   const tools = document.createElement("div");
+   tools.className = "message-task-tools";
+-  for (const name of [...new Set(task.tools || [])].slice(0, 8)) {
+-    const chip = document.createElement("span"); chip.className = "tool-chip"; chip.textContent = name; tools.append(chip);
+-  }
++  for (const name of uniqueTools.slice(0, 10)) {
++    const chip = document.createElement("span");
++    chip.className = "tool-chip";
++    chip.textContent = FRIENDLY_ACTIONS[name] || name.replaceAll("_", " ");
++    tools.append(chip);
++  }
++  details.append(summary, tools);
++
+   const actions = document.createElement("div");
+-  actions.className = "message-task-actions";
+-  const action = (label, handler) => {
+-    const button = document.createElement("button"); button.textContent = label; button.addEventListener("click", handler); actions.append(button);
++  actions.className = "message-task-actions result-card-actions";
++  const action = (label, handler, className = "") => {
++    const button = document.createElement("button");
++    button.type = "button";
++    button.textContent = label;
++    if (className) button.classList.add(className);
++    button.addEventListener("click", handler);
++    actions.append(button);
+   };
++  action("Open workspace", () => openWorkspaceExplorer(evidence.files[0] || null), "primary");
+   action("Details", () => openTasks(task.task_id));
+-  action("Workspace", openWorkspaceExplorer);
+   if (String(task.request || "").trim()) action("Repeat", () => sendMessage(task.request));
+-  if ((task.tools || []).some(name => MUTATION_TOOLS.has(name))) action("Undo", () => rollbackTask(task));
+-  card.append(head, tools, actions);
++  if ((task.tools || []).some(name => MUTATION_TOOLS.has(name))) {
++    action("Undo", () => rollbackTask(task), "danger");
++  }
++
++  card.append(head);
++  if (evidenceRow.children.length) card.append(evidenceRow);
++  if (files.children.length) card.append(files);
++  if (uniqueTools.length) card.append(details);
++  card.append(actions);
+   article.append(card);
+ }
+ 
+@@ -422,6 +506,7 @@
+     error: "Something needs attention.",
+   };
+   elements.activity.textContent = activity[name];
++  updateWorkCardState(name);
+ }
+ 
+ function setBusy(value) {
+@@ -665,6 +750,13 @@
+       attachTaskCard(completedMessage?.article, event.task);
+       attachProposal(completedMessage?.article, event.proposal);
+       attachRecallNote(completedMessage?.article, event.recalled);
++      // The live card has now become the durable result card attached to this
++      // reply. Hide the live copy so the same work is not shown twice.
++      if (planSteps.length) {
++        elements.planStrip.classList.add("hidden");
++        planSteps = [];
++        planFinished = false;
++      }
+       updateSuggestions(event.text, event.task);
+       announce(event.text);
+       break;
+@@ -721,11 +813,19 @@
+       toast(`Aura answered in ${event.looked_like} instead of ${event.expected}. `
+             + "The local model does this; it is logged in Diagnostics.", true);
+       break;
+-    case "plan_started": planSteps = event.steps || []; renderPlan(planSteps); break;
+-    case "plan_progress": planSteps = event.steps || []; renderPlan(planSteps); break;
++    case "plan_started":
++      planSteps = event.steps || [];
++      planFinished = false;
++      renderPlan(planSteps);
++      break;
++    case "plan_progress":
++      planSteps = event.steps || [];
++      renderPlan(planSteps, planFinished);
++      break;
+     case "plan_finished":
+-      // Left on screen rather than cleared, because what got built is worth
+-      // reading after the fact.
++      // This event arrives just before the final reply. Keep the live card long
++      // enough to show the outcome, then let the reply's result card replace it.
++      planFinished = true;
+       renderPlan(planSteps, true);
+       break;
+     case "search_service":
+@@ -1617,32 +1717,138 @@
+   }
+ }
+ 
++function workCardPhase(state, finished = false, done = 0, total = 0) {
++  if (finished) {
++    return done === total ? "Planned files are ready • preparing the final report"
++                          : `Stopped with ${done} of ${total} planned files ready`;
++  }
++  const labels = {
++    thinking: "Thinking through the next step",
++    working: "Working on the planned files",
++    success: "Finishing and checking the result",
++    error: "Something needs attention",
++    listening: "Waiting for input",
++    idle: "Preparing the next step",
++  };
++  return labels[state] || labels.working;
++}
++
++function updateWorkCardState(state) {
++  const phase = elements.planStrip.querySelector(".work-card-phase");
++  if (!phase || elements.planStrip.classList.contains("hidden")) return;
++  const done = planSteps.filter(step => step.done).length;
++  phase.textContent = workCardPhase(state, planFinished, done, planSteps.length);
++  elements.planStrip.dataset.state = state || "working";
++}
++
+ function renderPlan(steps, finished = false) {
+   const strip = elements.planStrip;
+-  if (!steps || !steps.length) { strip.classList.add("hidden"); return; }
++  if (!steps || !steps.length) {
++    strip.classList.add("hidden");
++    return;
++  }
++
+   const done = steps.filter(step => step.done).length;
+-  strip.classList.remove("hidden");
+-  $("#planCount").textContent = finished
+-    // Said plainly rather than hidden: a plan that ends part-done is exactly
+-    // what the user needs to see, and rounding it up to "finished" is the
+-    // dishonesty this project keeps having to remove.
+-    ? (done === steps.length ? `all ${steps.length} written`
+-                             : `${done} of ${steps.length} written`)
+-    : `${done} of ${steps.length}`;
+-  const list = $("#planSteps");
+-  list.replaceChildren();
++  const total = steps.length;
++  const percent = total ? Math.round(done / total * 100) : 0;
++  const project = String(currentProject || "").trim();
++
++  strip.replaceChildren();
++  strip.className = `plan-strip work-card${finished ? " finished" : ""}`;
++  strip.dataset.state = elements.face.dataset.state || "working";
++  strip.setAttribute("aria-label", project ? `Work on ${project}` : "Current work");
++
++  const head = document.createElement("div");
++  head.className = "work-card-head";
++
++  const identity = document.createElement("div");
++  identity.className = "work-card-identity";
++  const icon = document.createElement("span");
++  icon.className = "work-card-icon";
++  icon.textContent = finished && done === total ? "✓" : "✦";
++  icon.setAttribute("aria-hidden", "true");
++  const titleCopy = document.createElement("div");
++  const eyebrow = document.createElement("span");
++  eyebrow.className = "work-card-eyebrow";
++  eyebrow.textContent = finished ? "Work finished" : "Aura is working";
++  const title = document.createElement("strong");
++  title.textContent = project ? `Building ${project}` : "Current task";
++  titleCopy.append(eyebrow, title);
++  identity.append(icon, titleCopy);
++
++  const count = document.createElement("span");
++  count.className = "work-card-count";
++  count.textContent = `${done} / ${total}`;
++  head.append(identity, count);
++
++  const phase = document.createElement("div");
++  phase.className = "work-card-phase";
++  phase.textContent = workCardPhase(strip.dataset.state, finished, done, total);
++
++  const progress = document.createElement("div");
++  progress.className = "work-card-progress";
++  progress.setAttribute("role", "progressbar");
++  progress.setAttribute("aria-label", "Planned files completed");
++  progress.setAttribute("aria-valuemin", "0");
++  progress.setAttribute("aria-valuemax", String(total));
++  progress.setAttribute("aria-valuenow", String(done));
++  const fill = document.createElement("i");
++  fill.style.width = `${percent}%`;
++  progress.append(fill);
++
++  const progressMeta = document.createElement("div");
++  progressMeta.className = "work-card-progress-meta";
++  const copy = document.createElement("span");
++  copy.textContent = finished
++    ? (done === total ? `All ${total} planned files written`
++                      : `${done} of ${total} planned files written`)
++    : `${percent}% of the approved file plan`;
++  const percentage = document.createElement("strong");
++  percentage.textContent = `${percent}%`;
++  progressMeta.append(copy, percentage);
++
++  const list = document.createElement("ol");
++  list.id = "planSteps";
++  list.className = "work-card-steps";
++  let activeAssigned = false;
+   for (const step of steps) {
+     const row = document.createElement("li");
+-    row.className = step.done ? "done" : "";
++    const active = !finished && !step.done && !activeAssigned;
++    if (step.done) row.classList.add("done");
++    else if (active) { row.classList.add("active"); activeAssigned = true; }
++    else row.classList.add("pending");
++
+     const mark = document.createElement("i");
+-    mark.textContent = step.done ? "✓" : "•";
++    mark.textContent = step.done ? "✓" : (active ? "●" : "○");
+     mark.setAttribute("aria-hidden", "true");
+     const label = document.createElement("span");
+     label.textContent = step.text;
+-    row.append(mark, label);
++    const state = document.createElement("em");
++    state.textContent = step.done ? "Ready" : (active ? "Working" : "Pending");
++    row.append(mark, label, state);
+     list.append(row);
+   }
+-}
++
++  const actions = document.createElement("div");
++  actions.className = "work-card-actions";
++  const workspace = document.createElement("button");
++  workspace.type = "button";
++  workspace.textContent = "Open workspace";
++  workspace.addEventListener("click", () => openWorkspaceExplorer());
++  actions.append(workspace);
++  if (!finished) {
++    const stop = document.createElement("button");
++    stop.type = "button";
++    stop.className = "danger";
++    stop.textContent = "Stop";
++    stop.addEventListener("click", () => elements.stop.click());
++    actions.append(stop);
++  }
++
++  strip.append(head, phase, progress, progressMeta, list, actions);
++  strip.classList.remove("hidden");
++}
++
+ 
+ async function openHealthPanel(focus = true) {
+   if (focus) openModal(elements.healthModal);
+@@ -2330,11 +2536,24 @@
+ function taskEvidence(task) {
+   const details = task.tool_details || [];
+   const files = [];
++  const addPath = value => {
++    const path = String(value || "").trim();
++    if (path && !files.includes(path)) files.push(path);
++  };
++
+   for (const detail of details) {
+     if (!MUTATION_TOOLS.has(detail.tool)) continue;
+-    const path = detail.arguments?.path || detail.arguments?.destination;
+-    if (path && !files.includes(path)) files.push(path);
+-  }
++    const args = detail.arguments || {};
++    if (Array.isArray(args.files)) {
++      for (const item of args.files) {
++        if (item && typeof item === "object") addPath(item.path || item.destination);
++        else addPath(item);
++      }
++    } else {
++      addPath(args.path || args.destination);
++    }
++  }
++
+   let validated = false;
+   for (const detail of details) {
+     if (!VERIFICATION_TOOLS.has(detail.tool)) continue;
+@@ -2342,6 +2561,7 @@
+     if (result.ok === true || result.valid === true) validated = true;
+     else if (result.ok === false || result.valid === false) validated = false;
+   }
++
+   let duration = null;
+   if (task.started && task.finished) {
+     const ms = new Date(task.finished) - new Date(task.started);
+--- a/aura/web/styles.css
++++ b/aura/web/styles.css
+@@ -825,3 +825,325 @@
+ .sampling-profiles .field-note { grid-column: 1 / -1; margin: 0 0 var(--s2); color: var(--text-dim); font-size: var(--t-micro); line-height: 1.5; }
+ /* Nothing dims here any more: the switch that used to grey these out is gone,
+    and the profiles are now the only way sampling is set. */
++
++
++/* ─────────────────────────────────────────────────────────────────────────
++ * Interactive work card.
++ *
++ * This is deliberately a presentation layer over the existing plan/task
++ * events. It does not invent agent state or change what Aura is allowed to do.
++ * ───────────────────────────────────────────────────────────────────────── */
++
++.plan-strip.work-card {
++  margin: 0 max(var(--s2), calc((100% - 880px) / 2)) var(--s3);
++  padding: var(--s5);
++  border-color: rgba(var(--accent-rgb), .3);
++  border-radius: var(--r-lg);
++  background:
++    linear-gradient(145deg, rgba(var(--accent-rgb), .055), transparent 48%),
++    linear-gradient(var(--surface-2), var(--surface-1));
++  box-shadow: 0 12px 34px rgba(0, 0, 0, .24);
++}
++.plan-strip.work-card.finished {
++  border-color: rgba(90, 214, 138, .32);
++}
++.work-card-head,
++.result-card-head {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: var(--s4);
++}
++.work-card-identity,
++.result-card-identity {
++  display: flex;
++  align-items: center;
++  min-width: 0;
++  gap: var(--s4);
++}
++.work-card-icon,
++.result-card-mark {
++  display: grid;
++  flex: 0 0 auto;
++  place-items: center;
++  width: 32px;
++  height: 32px;
++  border: 1px solid rgba(var(--accent-rgb), .38);
++  border-radius: 50%;
++  color: var(--accent);
++  background: rgba(var(--accent-rgb), .1);
++  box-shadow: 0 0 18px rgba(var(--accent-rgb), .08);
++}
++.work-card.finished .work-card-icon,
++.result-card.completed .result-card-mark {
++  border-color: rgba(90, 214, 138, .4);
++  color: var(--ok);
++  background: rgba(90, 214, 138, .09);
++}
++.work-card-eyebrow,
++.result-card-eyebrow {
++  display: block;
++  margin-bottom: 2px;
++  color: var(--text-dim);
++  font-size: var(--t-micro);
++  font-weight: 650;
++  letter-spacing: .75px;
++  text-transform: uppercase;
++}
++.work-card-identity strong,
++.result-card-identity strong {
++  display: block;
++  overflow: hidden;
++  color: var(--text);
++  font-size: 14px;
++  font-weight: 650;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++.work-card-count {
++  flex: 0 0 auto;
++  padding: 4px 8px;
++  border: 1px solid var(--border);
++  border-radius: var(--r-pill);
++  color: var(--text-muted);
++  background: var(--surface-0);
++  font: 10px/1.2 "Cascadia Mono", Consolas, monospace;
++}
++.work-card-phase {
++  margin: var(--s4) 0 var(--s3);
++  color: var(--text-soft);
++  font-size: var(--t-label);
++}
++.work-card-progress {
++  height: 7px;
++  overflow: hidden;
++  border: 1px solid var(--border);
++  border-radius: var(--r-pill);
++  background: var(--surface-0);
++}
++.work-card-progress > i {
++  display: block;
++  width: 0;
++  height: 100%;
++  border-radius: inherit;
++  background: linear-gradient(90deg, var(--shade-5), var(--accent));
++  box-shadow: 0 0 12px rgba(var(--accent-rgb), .24);
++  transition: width .24s ease;
++}
++.work-card.finished .work-card-progress > i {
++  background: linear-gradient(90deg, var(--shade-6), var(--ok));
++}
++.work-card-progress-meta {
++  display: flex;
++  justify-content: space-between;
++  gap: var(--s4);
++  margin-top: var(--s2);
++  color: var(--text-dim);
++  font-size: var(--t-micro);
++}
++.work-card-progress-meta strong {
++  color: var(--accent);
++  font-weight: 700;
++}
++.work-card-steps {
++  display: grid !important;
++  gap: 0 !important;
++  max-height: 190px;
++  margin: var(--s4) 0 0 !important;
++  overflow: auto;
++  border: 1px solid var(--border);
++  border-radius: var(--r-md);
++  background: rgba(7, 16, 28, .42);
++}
++.work-card-steps li {
++  display: grid !important;
++  grid-template-columns: 20px minmax(0, 1fr) auto;
++  align-items: center !important;
++  gap: var(--s3) !important;
++  min-height: 34px;
++  padding: var(--s2) var(--s4);
++  border-bottom: 1px solid rgba(29, 48, 72, .72);
++  color: var(--text-muted) !important;
++  font-size: var(--t-label) !important;
++}
++.work-card-steps li:last-child { border-bottom: 0; }
++.work-card-steps li i {
++  width: 20px !important;
++  color: var(--text-dim) !important;
++  text-align: center;
++}
++.work-card-steps li.done {
++  color: var(--text-soft) !important;
++}
++.work-card-steps li.done i {
++  color: var(--ok) !important;
++}
++.work-card-steps li.active {
++  color: var(--text) !important;
++  background: rgba(var(--accent-rgb), .055);
++}
++.work-card-steps li.active i {
++  color: var(--accent) !important;
++  text-shadow: 0 0 8px rgba(var(--accent-rgb), .45);
++  animation: work-card-pulse 1.2s ease-in-out infinite alternate;
++}
++.work-card-steps li em {
++  color: var(--text-dim);
++  font-size: var(--t-micro);
++  font-style: normal;
++}
++.work-card-steps li.active em { color: var(--accent); }
++.work-card-steps li.done em { color: var(--ok); }
++@keyframes work-card-pulse { to { opacity: .45; } }
++
++.work-card-actions {
++  display: flex;
++  justify-content: flex-end;
++  gap: var(--s2);
++  margin-top: var(--s4);
++}
++.work-card-actions button {
++  padding: var(--s2) var(--s4);
++  border: 1px solid var(--border-strong);
++  border-radius: var(--r-sm);
++  color: var(--text-soft);
++  background: var(--surface-2);
++  cursor: pointer;
++  font-size: var(--t-caption);
++}
++.work-card-actions button.danger {
++  border-color: var(--danger-border);
++  color: var(--danger-soft);
++  background: var(--danger-surface);
++}
++
++/* A finished task keeps the same visual language as the live card, but becomes
++ * compact enough to live under Aura's reply without turning chat into a log. */
++.message-task-card.result-card {
++  width: min(720px, 100%);
++  margin-top: -10px;
++  padding: var(--s5);
++  border-color: var(--border-strong);
++  border-left: 2px solid rgba(var(--accent-rgb), .42);
++  background:
++    linear-gradient(135deg, rgba(var(--accent-rgb), .045), transparent 48%),
++    var(--surface-1);
++  box-shadow: 0 8px 22px rgba(0, 0, 0, .18);
++}
++.message-task-card.result-card.completed {
++  border-left-color: rgba(90, 214, 138, .7);
++}
++.result-card-status {
++  flex: 0 0 auto;
++  padding: 4px 8px;
++  border: 1px solid var(--border);
++  border-radius: var(--r-pill);
++  color: var(--text-muted);
++  background: var(--surface-0);
++  font-size: var(--t-micro);
++  letter-spacing: .55px;
++  text-transform: uppercase;
++}
++.result-card-status.completed {
++  border-color: rgba(90, 214, 138, .3);
++  color: var(--ok);
++  background: rgba(90, 214, 138, .06);
++}
++.result-card-status.error {
++  border-color: var(--danger-border);
++  color: var(--danger-soft);
++  background: var(--danger-surface);
++}
++.result-card-evidence {
++  display: flex;
++  flex-wrap: wrap;
++  gap: var(--s2);
++  margin-top: var(--s4);
++}
++.result-card-evidence span {
++  padding: 4px 8px;
++  border: 1px solid var(--border);
++  border-radius: var(--r-pill);
++  color: var(--text-muted);
++  background: var(--surface-0);
++  font-size: var(--t-caption);
++}
++.result-card-evidence span.strong {
++  border-color: rgba(90, 214, 138, .3);
++  color: var(--ok);
++}
++.result-card-files {
++  display: flex;
++  flex-wrap: wrap;
++  gap: var(--s2);
++  margin-top: var(--s3);
++}
++.result-file-chip {
++  max-width: 180px;
++  padding: 4px 8px;
++  overflow: hidden;
++  border: 1px solid rgba(var(--accent-rgb), .22);
++  border-radius: var(--r-pill);
++  color: var(--text-soft);
++  background: rgba(var(--accent-rgb), .055);
++  cursor: pointer;
++  font-size: var(--t-caption);
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++.result-file-chip:hover {
++  border-color: rgba(var(--accent-rgb), .5);
++  color: var(--text);
++  background: rgba(var(--accent-rgb), .1);
++}
++.result-file-more {
++  align-self: center;
++  color: var(--text-dim);
++  font-size: var(--t-caption);
++}
++.result-card-details {
++  margin-top: var(--s3);
++  color: var(--text-dim);
++  font-size: var(--t-caption);
++}
++.result-card-details summary {
++  width: fit-content;
++  cursor: pointer;
++  color: var(--text-muted);
++}
++.result-card-details .message-task-tools {
++  margin-top: var(--s2);
++}
++.result-card-actions .primary {
++  border-color: rgba(var(--accent-rgb), .4);
++  color: var(--text);
++  background: rgba(var(--accent-rgb), .1);
++}
++.result-card-actions .danger {
++  margin-left: auto;
++  border-color: var(--danger-border);
++  color: var(--danger-soft);
++  background: transparent;
++}
++
++@media (max-width: 720px) {
++  .plan-strip.work-card {
++    margin-inline: 0;
++    padding: var(--s4);
++  }
++  .work-card-steps {
++    max-height: 150px;
++  }
++  .work-card-steps li {
++    grid-template-columns: 18px minmax(0, 1fr);
++  }
++  .work-card-steps li em {
++    display: none;
++  }
++  .message-task-card.result-card {
++    width: 100%;
++  }
++  .result-card-actions .danger {
++    margin-left: 0;
++  }
++}

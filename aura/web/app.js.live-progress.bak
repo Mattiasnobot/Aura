@@ -77,7 +77,6 @@ let previewServerState = { running: false };
 let selectedMindNode = null;
 let planSteps = [];
 let planFinished = false;
-let lastWorkActivity = null;
 // The live work card is only a view over events Aura already emits. It never
 // decides what the agent should do; it just keeps the current work legible.
 // Which project Aura believes the conversation is about. It decides which
@@ -954,15 +953,10 @@ async function handleEvent(event) {
     case "plan_started":
       planSteps = event.steps || [];
       planFinished = false;
-      lastWorkActivity = null;
       renderPlan(planSteps);
       break;
     case "plan_progress":
       planSteps = event.steps || [];
-      renderPlan(planSteps, planFinished);
-      break;
-    case "work_activity":
-      lastWorkActivity = event;
       renderPlan(planSteps, planFinished);
       break;
     case "plan_finished":
@@ -1860,16 +1854,6 @@ async function openSessions(focus = true) {
   }
 }
 
-function workActivityLabel(activity) {
-  if (!activity || !activity.tool) return "";
-  const friendly = FRIENDLY_ACTIONS[activity.tool]
-    || String(activity.tool).replaceAll("_", " ").replace(/^./, letter => letter.toUpperCase());
-  const paths = (activity.paths || []).filter(Boolean);
-  if (!paths.length) return friendly;
-  if (paths.length === 1) return `${friendly}: ${paths[0]}`;
-  return `${friendly}: ${paths[0]} +${paths.length - 1} more`;
-}
-
 function workCardPhase(state, finished = false, done = 0, total = 0) {
   if (finished) {
     return done === total ? "Planned files are ready • preparing the final report"
@@ -1890,10 +1874,7 @@ function updateWorkCardState(state) {
   const phase = elements.planStrip.querySelector(".work-card-phase");
   if (!phase || elements.planStrip.classList.contains("hidden")) return;
   const done = planSteps.filter(step => step.done).length;
-  const activity = workActivityLabel(lastWorkActivity);
-  phase.textContent = (!planFinished && activity)
-    ? `${activity} • ${workCardPhase(state, false, done, planSteps.length)}`
-    : workCardPhase(state, planFinished, done, planSteps.length);
+  phase.textContent = workCardPhase(state, planFinished, done, planSteps.length);
   elements.planStrip.dataset.state = state || "working";
 }
 
@@ -1939,15 +1920,12 @@ function renderPlan(steps, finished = false) {
 
   const phase = document.createElement("div");
   phase.className = "work-card-phase";
-  const activity = workActivityLabel(lastWorkActivity);
-  phase.textContent = (!finished && activity)
-    ? `${activity} • ${workCardPhase(strip.dataset.state, false, done, total)}`
-    : workCardPhase(strip.dataset.state, finished, done, total);
+  phase.textContent = workCardPhase(strip.dataset.state, finished, done, total);
 
   const progress = document.createElement("div");
   progress.className = "work-card-progress";
   progress.setAttribute("role", "progressbar");
-  progress.setAttribute("aria-label", "Approved plan steps completed");
+  progress.setAttribute("aria-label", "Planned files completed");
   progress.setAttribute("aria-valuemin", "0");
   progress.setAttribute("aria-valuemax", String(total));
   progress.setAttribute("aria-valuenow", String(done));
@@ -1959,9 +1937,9 @@ function renderPlan(steps, finished = false) {
   progressMeta.className = "work-card-progress-meta";
   const copy = document.createElement("span");
   copy.textContent = finished
-    ? (done === total ? `All ${total} approved steps complete`
-                      : `${done} of ${total} approved steps complete`)
-    : `${percent}% of the approved plan`;
+    ? (done === total ? `All ${total} planned files written`
+                      : `${done} of ${total} planned files written`)
+    : `${percent}% of the approved file plan`;
   const percentage = document.createElement("strong");
   percentage.textContent = `${percent}%`;
   progressMeta.append(copy, percentage);
@@ -1983,7 +1961,7 @@ function renderPlan(steps, finished = false) {
     const label = document.createElement("span");
     label.textContent = step.text;
     const state = document.createElement("em");
-    state.textContent = step.done ? "Done" : (active ? "Working" : "Pending");
+    state.textContent = step.done ? "Ready" : (active ? "Working" : "Pending");
     row.append(mark, label, state);
     list.append(row);
   }
