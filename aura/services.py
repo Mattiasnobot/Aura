@@ -9,9 +9,12 @@ tool loop.
 Two rules hold for every service, and are enforced here rather than trusted to
 each implementation:
 
-* **It reaches nothing until the user grants its domains.** The handler is given
-  a `fetch` callable that already goes through `reach_domain`, so a service
-  cannot open its own socket or widen its own access.
+* **It cannot open its own socket.** The handler is given a `fetch` callable
+  rather than any networking of its own, so what it reads goes through Aura's
+  one HTTP path — which refuses a name resolving onto the local network, and
+  records every URL as a source. The domain allowlist that used to gate this
+  was removed at Mat's request; the single path was always the load-bearing
+  half, and it remains.
 * **It reports what it read.** Every fetch is recorded as a source, and the
   reply cites it.
 
@@ -23,6 +26,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
+from urllib.parse import quote
 
 
 class Fetch(Protocol):
@@ -39,7 +43,9 @@ class Service:
     parameters: dict
     required: tuple[str, ...]
     handler: Callable[[Fetch, dict], dict]
-    #: Shown to the user when the service needs domains they have not granted.
+    #: One line about what the service reaches, shown in the network panel.
+    #: It used to tell the user which domains to grant; there is nothing to
+    #: grant now, so it describes rather than instructs.
     grant_hint: str = ""
 
     def tool_definition(self) -> dict:
@@ -108,7 +114,11 @@ def _weather(fetch: Fetch, arguments: dict) -> dict:
     place = str(arguments.get("place", "")).strip()
     if not place:
         raise ValueError("Name the place to look up.")
-    found = _decode(fetch(GEOCODE_URL.format(name=place.replace(" ", "+")), timeout=10.0))
+    # Percent-encoded, not merely space-substituted. Every Estonian place name
+    # Mat is likely to ask about carries a letter that has no business going
+    # raw into a URL — "Jõgeva" came back empty, and the model recovered by
+    # guessing "Jogeva", which cost a round trip and only worked by luck.
+    found = _decode(fetch(GEOCODE_URL.format(name=quote(place, safe="")), timeout=10.0))
     results = found.get("results") or []
     if not results:
         return {"ok": False, "error": f"No place called {place!r} was found."}
@@ -136,11 +146,11 @@ def _weather(fetch: Fetch, arguments: dict) -> dict:
 register(Service(
     name="get_weather",
     description=("Look up current weather for a named place using the open, keyless "
-                 "Open-Meteo service. Needs the user to have granted its domains."),
+                 "Open-Meteo service."),
     domains=("geocoding-api.open-meteo.com", "api.open-meteo.com"),
     parameters={"place": {"type": "string",
                           "description": "Town, city, or region name, e.g. 'Tartu'"}},
     required=("place",),
     handler=_weather,
-    grant_hint="Grant geocoding-api.open-meteo.com and api.open-meteo.com to enable weather.",
+    grant_hint="Reads geocoding-api.open-meteo.com and api.open-meteo.com.",
 ))

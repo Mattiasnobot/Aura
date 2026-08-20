@@ -1,6 +1,6 @@
 # Aura
 
-Aura is a local-first AI companion with one interface: HTML, CSS, and JavaScript in your normal web browser. A small local Python service provides the secure connection to LM Studio, workspace tools, approvals, memory, speech, and logs. Aura does not use Tkinter, pywebview, a cloud service, a login, or a database server.
+Aura is a local-first AI companion with one interface: HTML, CSS, and JavaScript in your normal web browser. A small local Python service provides the secure connection to LM Studio, workspace tools, approvals, memory, speech, and logs. Aura does not use Tkinter, pywebview, a login, or a database server. It talks to a model on your own machine unless you deliberately choose otherwise; see **Running the model through Claude** below for the one case where it does not.
 
 ## Run
 
@@ -24,7 +24,25 @@ Launch and recovery history is written to `aura-runtime.log`. A full traceback i
 
 Use **Settings** to switch between models exposed by the server and persist the server URL, model, timeout, temperature, thinking depth, autonomy, local speech preference, and Aura's avatar motion, intensity, and rendering quality. **Deep + Powerful** is the default: it gives Aura longer multi-step runs and the broad tool catalog while preserving approval boundaries for executable code, external network access, and desktop launches. Aura streams generated text into the chat as LM Studio produces it.
 
-No cloud login, API key, or internet connection is used for chat. Aura connects to `http://127.0.0.1:1234/v1` by default.
+No cloud login, API key, or internet connection is used for chat by default. Aura connects to `http://127.0.0.1:1234/v1`.
+
+### Running the model through Claude or GPT
+
+If this machine cannot run a capable model locally, Settings can point Aura at Anthropic's API or OpenAI's instead. It is off unless chosen, and there is no automatic switch: an unreachable local model is reported as an error, never quietly answered somewhere else.
+
+Understand the trade before turning it on. With a local model **nothing leaves the computer**. With this one, the conversation, any memories Aura is allowed to send, and the contents of files her tools read are all sent to Anthropic. The status line says which is happening — `Local • private` or `Claude • sent to api.anthropic.com` — for as long as it is on, rather than mentioning it once in Settings.
+
+**Claude** needs an optional package Aura does not install by itself:
+
+    pip install -r requirements-cloud.txt
+
+**GPT needs nothing extra.** LM Studio serves OpenAI's own chat API, so Aura already speaks that protocol — pointing it at `api.openai.com` with a real key is the whole change. Leave the model name empty to use the first one the key can reach, or press **Refresh models** to see the list that key actually has.
+
+**That protocol is not only OpenAI's**, so the address is a field rather than a constant: any OpenAI-compatible service works with the same client and no extra code. Errors and the status line then name *that* host, not OpenAI. Point it at a model server running on this computer and Aura goes back to saying `Local • private`, because it will be — whether the words leave the machine is decided by the address, not by which provider is selected.
+
+**A subscription is not API access.** A ChatGPT or Claude app subscription covers the web, desktop, and phone apps; the API is billed separately and needs its own credit. They are the same models behind different doors, and the subscription does not open this one.
+
+Each API key is yours to place: set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` in the environment, or paste it in Settings, where it is stored in `config.json` **in plain text** and is never sent back to the browser or written into a diagnostics file. **Forget stored key** removes that one key — never the other — and returns Aura to the local model if it was the one in use.
 
 Optional configuration:
 
@@ -174,6 +192,74 @@ but has not done). Each layer in the legend is also its off-switch.
 Selecting a memory lets you set or clear the project it belongs to. That is the only
 relationship on the map you can edit, because every other one is derived from the data and
 editing it would be a lie about what happens next.
+
+## The progress window
+
+**Progress window** in the activity bar opens a small separate window — put it on a second
+screen and leave it there. It answers one question: is Aura still going, or has she stopped?
+
+It shows the state, the project and whether a role is in force, how long this turn has been
+running, and **how long since anything last happened**. That last number is the useful one:
+it resets every time a tool runs or a token arrives, so a number that keeps returning to zero
+means work is happening, and one that keeps climbing means it is not. It turns amber after a
+minute and red after two, with a sentence saying which of those it thinks is going on.
+
+Underneath is what has actually happened, with timestamps — each tool call and its result.
+
+It reads the same event stream as the main window, where every reader keeps its own place, so
+opening it changes nothing about the work it is watching.
+
+## What Aura will not claim
+
+Every completion passes a short series of checks before Aura answers, and each one exists
+because the opposite was measured happening. Files the request named must exist. A build that
+changed the workspace must validate. And a reply that describes a command's output must have a
+command behind it — measured on two different local models, both of them reported the result of
+a command the user had just declined to approve, one run in three and two in three.
+
+None of this is the model being asked nicely. The system prompt asks nicely too; these are
+checks against what the turn actually did.
+
+## The plan for a project
+
+The first change Aura makes inside a project leaves a `PLAN.md` in that project's
+folder: what you asked for, which tools actually ran, which files exist as a result, and
+an empty "Still open" section.
+
+**She writes it from what the turn really did**, not from a summary she composes — a
+record built from the tools that succeeded cannot claim work that never happened. Files
+appear in it only if they are really on disk.
+
+**It is yours to correct.** Before the next piece of work in that project she reads the
+file back and is told it outranks her own memory of what she intended, so editing the
+plan is how you steer what happens next. It is an ordinary workspace file: visible,
+editable, and covered by undo and history like everything else.
+
+She never overwrites one. A plan she wrote earlier, or one you have edited, stays as it
+is.
+
+## A role for a project
+
+Settings can give a project a role: who Aura should be while working inside it. It reaches
+the model as a system message, after her identity and the language rule, so it shapes what
+she prioritises, what she looks at first, and how she writes.
+
+It belongs to the project and stops at that project's edge — a role set on `shop` does not
+follow her into `promo`, and with no project in play there is no role at all. That is the
+reason to attach it to a project rather than paste it into the chat, where it would compete
+with the system prompt on every turn and vanish with the conversation.
+
+**It changes tone and emphasis, never permissions.** Approvals are enforced in code, not by
+the model, so a role written in the language of full autonomy still cannot run a command,
+reach a domain, or write outside the workspace without being asked. The injected text says
+so explicitly, so the model does not read it as permission either.
+
+**How to tell it is being applied:** the status line names the project as soon as the turn starts — `on shop` — and adds `· role` when a role is in force. It says this *before* the answer arrives, not with it, because by then it is too late to say "no, not that one".
+
+Aura picks the project from the folder name in your message, and remembers it for the rest of the conversation, so a follow-up like "now add a footer" stays in the same one. Naming a different folder moves her. **New** clears it.
+
+Empty the box to remove a role. A role whose folder is gone is still listed, so it can be
+removed rather than lingering invisibly.
 
 ## Project memory
 

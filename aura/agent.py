@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 from .errors import AuraError
+from .tools_files import FilesTools
+from .tools_recovery import RecoveryTools
+from .tools_memory import MemoryTools
+from .tools_outside import OutsideTools
+from .tools_plan import PlanTools
+from .tools_media import MediaTools
+from .tools_system import SystemTools
+from .tools_code import CodeTools
 
 import ast
 import base64
@@ -8,15 +16,14 @@ import hashlib
 import json
 import math
 import os
-import platform
 import posixpath
 import re
-import shutil
 import sys
 import tempfile
+import time
 import threading
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 from typing import Callable
 from uuid import uuid4
 from urllib.error import HTTPError, URLError
@@ -29,24 +36,22 @@ from .commands import CommandAgent
 from .config import ConfigStore
 from .memory import MemoryStore
 from .provider import LMStudioProvider, MockProvider, Provider, ProviderContext, ToolCall
-from . import checks
 from . import language
-from . import routing
+from . import context_budget, empty_reply, routing, sampling, tool_errors, tool_loops
 from . import services
 from . import websearch
 from . import toolkit
 from .toolkit import tool
 from .turn import PASS, GateResult, TurnState
-from .image_diff import compare_images
-from .permissions import (ExternalReader, ExternalWriter, PermissionRefused,
-                          PermissionStore, reject_unsafe_host)
+from .permissions import (ExternalReader, ExternalWriter, PermissionDenied,
+                          PermissionRefused, PermissionStore, reject_unsafe_host)
 from .preview_server import PreviewServer
 from .safety import SandboxViolation, WorkspaceSandbox
 from .screenshot import (ScreenshotUnavailable, browser_command_preview, capture,
                          find_browser)
 from .search_index import WorkspaceIndex
 from .tasks import TaskJournal
-from .validation import check_accessibility, validate_project
+from .validation import check_broken_assets, validate_project
 
 
 EXTERNAL_TOOLS = {
@@ -59,7 +64,14 @@ class TaskCancelled(AuraError, RuntimeError):
     pass
 
 
-class AuraAgent:
+class TurnExpired(AuraError, RuntimeError):
+    """The turn ran past its time budget. Distinct from cancellation: Mat did not
+    ask for this to stop, so the answer says what was achieved rather than that it
+    was called off."""
+
+
+class AuraAgent(FilesTools, RecoveryTools, MemoryTools, OutsideTools, MediaTools,
+                SystemTools, PlanTools, CodeTools):
     MAX_TOOL_ROUNDS = 48
     MAX_WRITE_BYTES = 1_000_000
     MAX_HTTP_BYTES = 250_000
@@ -69,6 +81,10 @@ class AuraAgent:
     RETENTION_CHANGES = 500
     # Total extra model rounds allowed to satisfy the completion gates.
     MAX_COMPLETION_RETRIES = 3
+    #: Silence gets one retry, not three. Across every episode in the live log a
+    #: second and third attempt at the same question returned the same silence,
+    #: costing minutes at 22 tokens a second to learn nothing.
+    MAX_EMPTY_RETRIES = 1
 
     def __init__(self, workspace: str | Path = "aura-workspace", provider: Provider | None = None,
                  on_log: Callable[[dict], None] | None = None) -> None:
@@ -82,13 +98,11 @@ class AuraAgent:
             self.log.record("store_migrated", "ok", **migrated)
         self.memory = MemoryStore(self.sandbox.meta / "memory.json")
         self.config = ConfigStore(self.sandbox.meta / "config.json")
-        self.provider = provider or LMStudioProvider(
-            base_url=os.getenv("AURA_LM_STUDIO_URL", str(self.config.data["lm_studio_url"])),
-            model=os.getenv("AURA_LM_STUDIO_MODEL") or self.config.data["model"],
-            timeout=float(os.getenv("AURA_LM_STUDIO_TIMEOUT", str(self.config.data["timeout"]))),
-            temperature=float(self.config.data["temperature"]),
-            max_tokens=int(self.config.data["max_tokens"]),
-        )
+        #: Learns what this model charges per character from the token counts
+        #: LM Studio returns, so the preflight check is measured against the
+        #: model actually loaded rather than against a rule of thumb.
+        self.budget = context_budget.TokenMeter()
+        self.provider = provider or self._build_provider()
         self._bind_provider_recovery(self.provider)
         self.commands = CommandAgent(self.sandbox, self.log)
         self.index = WorkspaceIndex(self.sandbox)
@@ -106,6 +120,13 @@ class AuraAgent:
         self.fetched_sources: list[str] = []
         #: Sticky for the conversation; cleared when a new one starts.
         self.current_project: str | None = None
+        #: Called as private reasoning arrives, with how much. This model spends
+        #: most of a turn producing reasoning that never reaches the browser, so
+        #: without this the interface cannot tell thinking from a hang.
+        self.on_thinking: Callable[[int], None] | None = None
+        #: The request being handled, in the user's own words. The plan
+        #: file quotes it, so a paraphrase would be worse than nothing.
+        self.current_request: str = ""
         #: Told after every tool, so a caller can follow the work while it
         #: happens. Set per turn, in the same way approve/state/token are.
         self.on_tool: Callable[[str, dict, bool], None] | None = None
@@ -253,6 +274,44 @@ class AuraAgent:
         except Exception as exc:
             self.log.record("retention_sweep", "error", error=str(exc)[:300])
 
+    def _build_provider(self):
+        """Whichever model the user chose — and never a silent switch.
+
+        A cloud provider that stepped in when the local one was unreachable
+        would move the conversation, the memories, and whatever files the tools
+        read off this machine without anyone asking. So there is no fallback
+        here: if the chosen provider cannot be reached, that is an error to
+        report, not a reason to send the same words somewhere else.
+        """
+        chosen = str(self.config.data.get("provider", "local")).strip()
+        if chosen == "openai":
+            from .cloud import OpenAIProvider
+            return OpenAIProvider(
+                api_key=os.getenv("OPENAI_API_KEY")
+                or str(self.config.data.get("openai_api_key") or ""),
+                model=str(self.config.data.get("openai_model") or ""),
+                base_url=str(self.config.data.get("openai_base_url") or ""),
+                timeout=float(self.config.data["timeout"]),
+                max_tokens=int(self.config.data.get("cloud_max_tokens") or 0) or None,
+                temperature=float(self.config.data["temperature"]),
+            )
+        if chosen == "claude":
+            from .cloud import AnthropicProvider
+            return AnthropicProvider(
+                api_key=os.getenv("ANTHROPIC_API_KEY")
+                or str(self.config.data.get("anthropic_api_key") or ""),
+                model=str(self.config.data.get("cloud_model") or ""),
+                timeout=float(self.config.data["timeout"]),
+                max_tokens=int(self.config.data.get("cloud_max_tokens") or 0) or None,
+            )
+        return LMStudioProvider(
+            base_url=os.getenv("AURA_LM_STUDIO_URL", str(self.config.data["lm_studio_url"])),
+            model=os.getenv("AURA_LM_STUDIO_MODEL") or self.config.data["model"],
+            timeout=float(os.getenv("AURA_LM_STUDIO_TIMEOUT", str(self.config.data["timeout"]))),
+            temperature=float(self.config.data["temperature"]),
+            max_tokens=int(self.config.data["max_tokens"]),
+        )
+
     def _bind_provider_recovery(self, provider: Provider) -> None:
         if isinstance(provider, LMStudioProvider):
             provider.on_recovery = self._on_provider_recovery
@@ -293,13 +352,26 @@ class AuraAgent:
             try:
                 supported = bool(prober())
             except Exception:
-                return LMStudioProvider.model_may_support_vision(model)
+                return self._guess_vision(model)
             cache = dict(probed) if isinstance(probed, dict) else {}
             cache[model] = supported
             self.config.update(vision_probe=cache)
             self.log.record("vision_probe", "ok", model=model, supported=supported)
             return supported
-        return LMStudioProvider.model_may_support_vision(model)
+        return self._guess_vision(model)
+
+    def _guess_vision(self, model: str) -> bool:
+        """Ask the provider in use, not the one that used to be the only one.
+
+        This named `LMStudioProvider` outright, so a cloud model was judged by
+        LM Studio's list of name fragments — which no Claude or GPT model
+        matches — and images were quietly withheld from providers that handle
+        them well. The providers' own answers were being written and ignored.
+        """
+        guesser = getattr(self.provider, "model_may_support_vision", None)
+        if not callable(guesser):
+            return LMStudioProvider.model_may_support_vision(model)
+        return bool(guesser(model))
 
     def _capture_page(self, relative: str, approve: Callable[[list[str]], bool] | None,
                       width: int = 1200, height: int = 800) -> dict:
@@ -415,13 +487,126 @@ class AuraAgent:
         # Remember what was recalled so the interface can explain the choice.
         self.last_recalled = recalled
         return ProviderContext(self.memory.data.get("name"), self.memory.data.get("preferences", {}),
-                               self.memory.data.get("conversation", []), recalled)
+                               self.memory.data.get("conversation", []), recalled,
+                               project=project,
+                               lessons=self.lessons_for(project),
+                               steps=self.db.plan_steps(project) if project else [],
+                               plan=self.plan_text(project))
+
+    #: Long enough to hold a real plan, short enough that carrying it into every
+    #: request in the project stays affordable.
+    MAX_PLAN = 6000
+    PLAN_FILE = "PLAN.md"
+
+    def plan_path(self, project: str | None) -> str | None:
+        """Where a project's plan lives: a file inside it, not a card on screen.
+
+        A card is agreed once and then gone. A file survives the turn, can be
+        corrected by hand, shows up in the workspace, and is already covered by
+        undo and history — which is the whole reason to put it there.
+        """
+        return f"{project}/{self.PLAN_FILE}" if project else None
+
+    def plan_text(self, project: str | None) -> str:
+        path = self.plan_path(project)
+        if not path:
+            return ""
+        try:
+            target = self.sandbox.path(path)
+        except Exception:
+            return ""
+        if not target.is_file():
+            return ""
+        try:
+            return target.read_text(encoding="utf-8", errors="replace")[:self.MAX_PLAN].strip()
+        except OSError:
+            return ""
+
+
+    #: Enough for a handful of real rules; past this the prompt is being used as
+    #: a filing cabinet and something else has gone wrong.
+    MAX_LESSONS = 8
+
+    def lessons_for(self, project: str | None) -> list[str]:
+        """Corrections Mat has given about how work is done in this project.
+
+        These outlived the project-role feature they were once carried beside:
+        a lesson is a correction Mat actually gave, which is worth repeating,
+        rather than a stance invented for a folder.
+        """
+        if not project:
+            return []
+        lessons = []
+        for item in self.memory.data.get("profile_memories", []):
+            if str(item.get("category")) != "lesson":
+                continue
+            if str(item.get("project") or "").strip() != project:
+                continue
+            value = str(item.get("value", "")).strip()
+            if value and value not in lessons:
+                lessons.append(value)
+        return lessons[-self.MAX_LESSONS:]
+
+
+    #: Enough of the plan's opening to say what the project is for; not so much
+    #: that the role becomes a second copy of the plan, which is carried anyway.
+    ROLE_PLAN_CHARS = 240
+
+
+    def _plan_subject(self, plan: str) -> str:
+        """The part of a plan that says what the project is for.
+
+        A plan opens with Aura's own scaffolding — "Started by Aura from what the
+        first change actually did. It is a draft — correct it freely…" — which is
+        true, and says nothing about the project. Taking the first 240 characters
+        spent almost all of them on that preamble. The `What was asked` section is
+        the substance, so that is what is read.
+        """
+        text = str(plan or "")
+        if not text.strip():
+            return ""
+        lowered = text.casefold()
+        marker = lowered.find("## what was asked")
+        if marker >= 0:
+            body = text[marker:].split("\n", 1)[-1]
+            # Up to the next heading: the following sections are what Aura did,
+            # not what the project is.
+            body = body.split("\n#", 1)[0]
+        else:
+            # No section to find, so the first line that is not a heading.
+            body = "\n".join(line for line in text.splitlines()
+                             if line.strip() and not line.lstrip().startswith("#"))
+        return " ".join(body.split())[:self.ROLE_PLAN_CHARS]
+
+    #: How far back to look for what working on a project has meant in practice.
+    ROLE_TASK_HISTORY = 40
+
+    def tools_used_in(self, project: str) -> list[str]:
+        """Which tools have actually been used on this project, most used first.
+
+        From the task journal rather than from intent: what the work *was*, not
+        what anybody said it would be.
+        """
+        counted: dict[str, int] = {}
+        for task in self.tasks.recent(self.ROLE_TASK_HISTORY):
+            request = str(task.get("request") or "")
+            if project.casefold() not in request.casefold():
+                continue
+            for name in task.get("tools", []) or []:
+                if name:
+                    counted[str(name)] = counted.get(str(name), 0) + 1
+        ranked = sorted(counted, key=lambda name: -counted[name])
+        return ranked[:6]
 
     def handle(self, message: str, approve: Callable[[list[str]], bool] | None = None,
                state: Callable[[str], None] | None = None,
                token: Callable[[str], None] | None = None) -> str:
         set_state = state or (lambda _: None)
         self.cancel_event.clear()
+        #: What this turn was asked for, in the user's own words. Read by the
+        #: plan file, which is the user's record of why a project looks the way
+        #: it does — a paraphrase there would be worse than nothing.
+        self.current_request = message
         task_id = self.tasks.start(message, session_id=self.session_id)
         self.current_task_id = task_id
         self.sandbox.active_task_id = task_id
@@ -455,6 +640,19 @@ class AuraAgent:
             else:
                 response = self._reply_without_tools(message, approve, set_state)
             set_state("success")
+        except TurnExpired:
+            # Not a failure and not a cancellation: the work simply ran out of time,
+            # and what it managed is worth more than an apology.
+            status = "expired"
+            # The real turn, not a blank one. The clock can run out anywhere —
+            # including between a tool being requested and it running — and a
+            # report that says "nothing happened" when three tools already
+            # succeeded is exactly the dishonesty the gates exist to prevent.
+            response = self._format_out_of_time(
+                getattr(self, "_turn_state", None) or TurnState(),
+                float(self.config.data.get("turn_budget_seconds", 0) or 0))
+            self.log.record("request", "expired", task_id=task_id)
+            set_state("idle")
         except TaskCancelled:
             status = "cancelled"
             response = "Cancelled. No further tools will run. Changes already completed remain in the workspace and can be undone."
@@ -490,31 +688,111 @@ class AuraAgent:
         somebody to approve it: a plan nobody can confirm would just be an extra
         round trip.
         """
-        if len(expected_paths) < 2 or not requires_mutation or approve is None:
+        if not requires_mutation or approve is None:
+            return ""
+        project = self.current_project
+        # Two ways in. A build that names several files has always stopped here.
+        # A build inside a project that has no plan yet now does too, because
+        # the request most worth agreeing first — "look at this and improve it"
+        # — names no files at all, so the old condition never saw it.
+        naming_files = len(expected_paths) >= 2
+        opening_a_project = bool(project) and not self.plan_text(project)
+        if not naming_files and not opening_a_project:
             return ""
         state("thinking")
         asked = list(self.provider.start_messages(message, self._context(message)))
-        asked.append({"role": "system", "content":
-            "Do not create anything yet. List only the files you would create for this "
-            "request, one per line, as `path - one short line on what it holds`. Use "
-            "exactly these paths: " + json.dumps(expected_paths) +
-            ". No preamble, no code, no explanation after the list."})
+        if naming_files:
+            instruction = (
+                "Do not create anything yet. List only the files you would create for this "
+                "request, one per line, as `path - one short line on what it holds`. Use "
+                "exactly these paths: " + json.dumps(expected_paths) +
+                ". No preamble, no code, no explanation after the list.")
+        else:
+            # No filenames were named, so asking for a file list would invite
+            # invention. Steps are what there is to agree here.
+            instruction = (
+                "Do not create or change anything yet. Look first if you have not already, "
+                "then list the steps you would take, one per line, as "
+                "`- step - how it can be checked`. Base every line on what the files you "
+                "read actually show; write no step you cannot check. At most eight lines, "
+                "no preamble and nothing after the list.")
+        # The language rule lives in `start_messages`, several messages earlier,
+        # and this instruction is English and comes last — so the last thing
+        # read before writing said "English" without meaning to. Both models
+        # drafted the plan in Finnish, which is the drift this rule exists to
+        # stop, so it has to be repeated here rather than merely stated once.
+        rule = self.provider.LANGUAGE_RULE.get(language.detect(message))
+        if rule:
+            instruction += " " + rule
+        asked.append({"role": "system", "content": instruction})
         try:
             drafted = self.provider.complete(asked, [])
-        except Exception:
-            # A failed plan must not cost the user their request.
+        except Exception as exc:
+            # A failed plan must not cost the user their request — but it must
+            # not vanish either. This is a whole model call, and it used to fail
+            # leaving no trace anywhere that it had been attempted.
+            self.log.record("plan_draft", "error", error=str(exc))
             return ""
         lines = [line.strip(" -*\t") for line in str(drafted.content or "").splitlines()]
-        listed = [line for line in lines
-                  if line and any(path.split("/")[-1] in line for path in expected_paths)]
-        if not listed:
-            listed = [f"{path} - part of the requested build" for path in expected_paths]
+        if naming_files:
+            listed = [line for line in lines
+                      if line and any(path.split("/")[-1] in line for path in expected_paths)]
+            if not listed:
+                listed = [f"{path} - part of the requested build" for path in expected_paths]
+        else:
+            listed = [line for line in lines if line][:8]
+            if not listed:
+                # Nothing usable came back. Better to get on with the work than
+                # to show the user an empty card and ask them to approve it.
+                return ""
         plan = "\n".join(f"- {line}" for line in listed[:20])
         self.log.record("file_plan", "ok", files=len(listed))
-        if not approve(["PLAN", plan]):
+        # Which of the two lists this is. The browser headed both "the files she
+        # would create", so a list of steps was shown as filenames about to be
+        # written — a card that describes the wrong action is worse than no card.
+        kind = "FILES" if naming_files else "STEPS"
+        if not approve(["PLAN", plan, kind]):
             self.log.record("file_plan", "declined", files=len(listed))
             return self.PLAN_DECLINED
+        # Keep what was agreed. A plan shown once and discarded leaves the next
+        # turn with nothing to work from and the user with nothing to correct,
+        # which is the whole difference between a card and a file.
+        if project and not self.plan_text(project):
+            try:
+                self.sandbox.write_file(self.plan_path(project),
+                                        self._agreed_plan_file(plan))
+                self.log.record("plan_written", "ok", path=self.plan_path(project),
+                                agreed=True)
+            except Exception as exc:
+                # Still worth following — but a plan that was agreed and never
+                # filed is exactly why "continue building it" finds nothing to
+                # continue from, so the failure is recorded rather than shrugged.
+                self.log.record("plan_written", "error",
+                                path=self.plan_path(project), error=str(exc))
         return plan
+
+    def _agreed_plan_file(self, plan: str) -> str:
+        """The approved plan, written the way the user will meet it again."""
+        return "\n".join([
+            f"# {self.current_project}",
+            "",
+            "Agreed with you before the work started. Correct it freely — Aura reads",
+            "this file back before the next piece of work and follows it rather than",
+            "her own memory.",
+            "",
+            "## What was asked",
+            "",
+            str(self.current_request or "").strip() or "_Not recorded._",
+            "",
+            "## The plan",
+            "",
+            plan,
+            "",
+            "## Still open",
+            "",
+            "- _Add what should happen next._",
+            "",
+        ])
 
     def _reply_without_tools(self, message: str, approve: Callable[[list[str]], bool] | None,
                              set_state: Callable[[str], None]) -> str:
@@ -551,11 +829,30 @@ class AuraAgent:
         self.cancel_event.set()
 
     def _check_cancelled(self) -> None:
+        """The one place a turn is allowed to stop, for either of the two reasons.
+
+        Called on every streamed token, so putting the clock here is what makes the
+        budget a real deadline rather than a check between rounds — a single long
+        generation used to sail straight past it.
+        """
         if self.cancel_event.is_set():
             raise TaskCancelled()
+        deadline = getattr(self, "_turn_deadline", None)
+        if deadline is not None and time.monotonic() > deadline:
+            raise TurnExpired()
 
-    def _tool_conversation(self, message: str, approve: Callable[[list[str]], bool] | None,
-                           state: Callable[[str], None], token: Callable[[str], None] | None = None) -> str:
+    def _prepare_turn(self, message: str,
+                      approve: Callable[[list[str]], bool] | None,
+                      state: Callable[[str], None]) -> tuple | None:
+        """Decide what this turn is, before a single word is sent.
+
+        Which tools are offered, which files the request named, whether a plan
+        is already agreed, and what would count as the work actually being done.
+        None of it depends on the loop, and the loop needs only what is returned.
+
+        Returns None when Mat declined the file plan — the only way preparing a
+        turn can end it.
+        """
         messages = self.provider.start_messages(message, self._context(message))
         routing_request = self._routing_request(message)
         autonomy = str(self.config.data.get("autonomy_mode", "balanced"))
@@ -588,8 +885,10 @@ class AuraAgent:
         plan = self._plan_files(message, expected_paths,
                                 self._requires_mutation(routing_request), approve, state)
         if plan is self.PLAN_DECLINED:
-            return ("I stopped before creating anything. Tell me what the file list "
-                    "should be instead and I'll follow that.")
+            # The one way preparation ends the turn: Mat looked at the file list and
+            # said no. Signalled rather than returned, because the caller owns what
+            # the user is told.
+            return None
         if plan:
             messages.insert(1, {"role": "system", "content":
                 "The user has already approved this exact file plan:\n" + plan +
@@ -663,35 +962,155 @@ class AuraAgent:
             "?" in routing_request and self._question_needs_looking(routing_request))
         action_expected = (bool(selected_tools) and asks_for_work
                            and not (auto_learning_only or memory_read_question))
+        # Recorded now, before any tool runs: afterwards a file that was edited and
+        # one that was invented look identical on disk.
+        missing_at_start = {path for path in expected_paths
+                            if path and not self._file_exists(path)}
         state_of_turn = TurnState(
+            missing_at_start=missing_at_start,
+            edit_request=self._is_edit_request(routing_request),
             expected_paths=list(expected_paths), expected_base=expected_base,
             requires_mutation=requires_mutation, action_expected=action_expected,
             validation_asked=validation_asked, build_words=build_words,
             selected_tools=list(selected_tools),
+            sampling_kind=sampling.kind_for_tools(
+                item["function"]["name"] for item in selected_tools),
             # One budget for every gate. Four independent counters once allowed
             # up to nine extra rounds, each re-answering from scratch.
             retries_left=self.MAX_COMPLETION_RETRIES,
         )
+        round_limit = self.ROUND_LIMITS.get(reasoning_depth, self.ROUND_LIMITS["balanced"])
+        return messages, selected_tools, state_of_turn, round_limit
+
+
+    def _finish_turn(self, turn: TurnState, response) -> str:
+        """Compose what Mat reads, once the gates agree the turn may end.
+
+        Three things can still change the answer here: the model went quiet after
+        doing real work, it handed back a tool call written as text, or the
+        evidence footer needs assembling from what was actually verified.
+        """
+        if turn.empty_response and turn.successful_tools:
+            # The work happened; only the closing sentence did not. Raising
+            # here threw away the truth — a live run removed a broken link
+            # and then reported "I couldn't complete that safely", which is
+            # the opposite of what occurred. Aura writes the report herself
+            # from what she actually did.
+            response.content = self._format_silent_completion(turn)
+            turn.record_unconfirmed(
+                "the model stopped responding before summarising, so this "
+                "description was assembled from the recorded actions")
+            turn.empty_response = False
+        elif turn.empty_response:
+            raise RuntimeError(self._empty_response_reason(turn))
+
+        # Last line of defence. The gate asks the model to try again, but if it
+        # spends its retry and still hands back markup, that markup must not be
+        # what Mat reads — it is not an answer, and one of these named a
+        # destructive tool nobody had asked for.
+        if self._is_tool_markup(response.content):
+            turn.emitted_tool_markup = True
+            done = self._format_silent_completion(turn)
+            response.content = f"{self.TOOL_MARKUP_REPLY}\n\n{done}"
+            turn.record_unconfirmed(
+                "the model wrote a tool call out as text rather than running it; "
+                "nothing was executed from it")
+
+        missing = set(turn.missing_artifacts)
+        present = [path for path in turn.expected_paths if path not in missing]
+        return self._format_completion_evidence(
+            response.content, turn.validation_scope,
+            turn.validation_evidence,
+            sorted(turn.verified_final_paths), present,
+            turn.unconfirmed, list(self.fetched_sources),
+            sorted(turn.measured_paths - turn.verified_final_paths),
+            # Named to be changed, and not there to change.
+            sorted(path for path in turn.missing_at_start
+                   if turn.edit_request and self._file_exists(path)),
+        )
+
+    def _tool_conversation(self, message: str, approve: Callable[[list[str]], bool] | None,
+                           state: Callable[[str], None], token: Callable[[str], None] | None = None) -> str:
+        prepared = self._prepare_turn(message, approve, state)
+        if prepared is None:
+            return ("I stopped before creating anything. Tell me what the file list "
+                    "should be instead and I'll follow that.")
+        messages, selected_tools, state_of_turn, round_limit = prepared
+        heat = sampling.for_turn(
+            (item["function"]["name"] for item in selected_tools), self.config.data)
+        #: Read by `_gate_empty_response`, which can only say "of the 6,144 it
+        #: was given" if it knows what this turn was given.
+        self._turn_heat = heat
         def emit(piece: str) -> None:
             self._check_cancelled()
             if token:
                 token(piece)
-        round_limit = self.ROUND_LIMITS.get(reasoning_depth, self.ROUND_LIMITS["balanced"])
+
+        def watch(count: int) -> None:
+            """The reasoning heartbeat, with the clock read on the way past."""
+            self._check_cancelled()
+            if self.on_thinking:
+                self.on_thinking(count)
+        without_tools = False
+        # A round limit bounds the wrong thing. What Mat spends is time, and at 22
+        # tokens a second 48 rounds is not a limit at all — the only real ceiling
+        # was the HTTP timeout, which arrives as a failure instead of an answer.
+        budget = float(self.config.data.get("turn_budget_seconds", 0) or 0)
+        deadline = (time.monotonic() + budget) if budget > 0 else None
+        #: Read by `_check_cancelled` on every streamed token, which is what makes
+        #: this a deadline and not a between-rounds suggestion.
+        self._turn_deadline = deadline
+        #: Reachable from `handle`, so a turn that expires deep inside a round can
+        #: still be reported from what really ran.
+        self._turn_state = state_of_turn
         for round_index in range(round_limit):
             self._check_cancelled()
+            if deadline is not None and round_index and time.monotonic() > deadline:
+                return self._out_of_time(state_of_turn, budget, round_index)
             if round_index:
                 # Any second or later round replaces whatever was streamed
                 # before it. Clearing here — rather than at each individual
                 # retry — means no future retry path can reintroduce the
                 # duplicated-answer bug by forgetting to signal.
                 state("retry")
-            response = self.provider.complete(messages, selected_tools, on_token=emit if token else None)
+            # A conversation that ends with Aura's own reply is not a question, and
+            # asking it anyway is a guaranteed silence: the model answers with a
+            # single stop token, correctly, and the log records "empty response".
+            # Found by replaying a captured payload — removing exactly that last
+            # assistant message turned the silence into a working tool call.
+            self._ensure_something_to_answer(messages)
+            self._fit_to_context(messages, [] if without_tools else selected_tools, heat)
+            try:
+                response = self.provider.complete(
+                    messages, [] if without_tools else selected_tools,
+                    # Sampled for the job. A retry drops the tools but not the
+                    # kind of turn it is, so this reads the original selection.
+                    temperature=heat.temperature, max_tokens=heat.max_tokens,
+                    top_p=heat.top_p, top_k=heat.top_k,
+                    on_token=emit if token else None,
+                    # Wired through `watch` rather than straight to the heartbeat:
+                    # a model emitting only private thinking produces no content
+                    # tokens, so without this the clock is never read at all during
+                    # the exact turns that run long.
+                    on_reasoning=watch)
+            except TurnExpired:
+                return self._out_of_time(state_of_turn, budget, round_index)
+            # Every reply carries the true cost of what was just sent, so the
+            # rate is measured against the loaded model rather than assumed.
+            self.budget.observe(
+                context_budget.request_characters(
+                    messages, [] if without_tools else selected_tools),
+                getattr(response, "prompt_tokens", 0))
+            self.budget.observe_answer(getattr(response, "completion_tokens", 0))
+            # One round only: the next gate decides again from what it sees.
+            without_tools = False
             assistant: dict = {"role": "assistant", "content": response.content or None}
             if response.tool_calls:
                 assistant["tool_calls"] = [{
                     "id": call.id, "type": "function",
                     "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
                 } for call in response.tool_calls]
+            self._carry_reasoning(messages, assistant, response)
             messages.append(assistant)
 
             if response.tool_calls:
@@ -707,6 +1126,13 @@ class AuraAgent:
             # No tool calls: the model believes it is finished. The gates decide
             # whether it may be, in a fixed order, sharing one retry budget.
             retry = None
+            # Judged fresh each round. A note describes the reply in front of the
+            # gate, and the reply changes every round — so accumulating them meant
+            # a doubt raised in round one survived into the final answer after
+            # round two had resolved it. Aura would tell Mat a file "was never
+            # opened" about a file she had since read, in the one section whose
+            # entire purpose is to be true.
+            state_of_turn.unconfirmed.clear()
             for gate in self.COMPLETION_GATES:
                 verdict = gate(self, state_of_turn, response)
                 if verdict.note:
@@ -717,43 +1143,71 @@ class AuraAgent:
             if retry is not None:
                 if retry.notice and token:
                     token(retry.notice)
-                messages.append({"role": "system", "content": retry.instruction})
+                # Make room before adding to the ask. Retrying a failed turn with
+                # a bigger prompt than the one that just failed is how a quiet
+                # model is kept quiet.
+                trimmed = self._compact_for_retry(messages)
+                if trimmed:
+                    self.log.record("retry_compacted", "ok", characters=trimmed)
+                without_tools = retry.drop_tools
+                # A user turn, not a system one. `merge_system_messages` hoists
+                # every system message to the front of the payload, so a retry
+                # appended as `system` left the conversation still ending on Aura's
+                # own reply — which is the guaranteed silence this whole hunt was
+                # about. Measured on the captured payload: as sent, one token back;
+                # the same instruction as a user turn, 354 tokens of answer.
+                messages.append({"role": "user", "content": retry.instruction})
                 continue
-            if state_of_turn.empty_response and state_of_turn.successful_tools:
-                # The work happened; only the closing sentence did not. Raising
-                # here threw away the truth — a live run removed a broken link
-                # and then reported "I couldn't complete that safely", which is
-                # the opposite of what occurred. Aura writes the report herself
-                # from what she actually did.
-                response.content = self._format_silent_completion(state_of_turn)
-                state_of_turn.record_unconfirmed(
-                    "the model stopped responding before summarising, so this "
-                    "description was assembled from the recorded actions")
-                state_of_turn.empty_response = False
-            elif state_of_turn.empty_response:
-                raise RuntimeError(self._empty_response_reason(state_of_turn))
-
-            missing = set(state_of_turn.missing_artifacts)
-            present = [path for path in state_of_turn.expected_paths if path not in missing]
-            return self._format_completion_evidence(
-                response.content, state_of_turn.validation_scope,
-                state_of_turn.validation_evidence,
-                sorted(state_of_turn.verified_final_paths), present,
-                state_of_turn.unconfirmed, list(self.fetched_sources),
-            )
+            return self._finish_turn(state_of_turn, response)
         raise RuntimeError("the model exceeded the tool-operation limit; ask it to continue in a new message")
 
     # ------------------------------------------------------------------ turn
+
+    def _within_reading_budget(self, payload: str, turn: TurnState, name: str) -> str:
+        """Shorten a tool result once the turn has read its fill.
+
+        Every tool already caps itself — `read_many_files` refuses past 250,000
+        characters. Nothing capped their *sum*, and because each round re-sends the
+        whole conversation, a single generous read is paid for again on every round
+        that follows it. The budget is spent across the turn, so early tools get
+        their full result and only the ones past the line are trimmed.
+        """
+        budget = int(self.config.data.get("turn_tool_characters", 0) or 0)
+        turn.tool_characters += len(payload)
+        if budget <= 0 or turn.tool_characters <= budget:
+            return payload
+        # Whatever is left of the budget, never less than enough to be useful.
+        room = max(600, budget - (turn.tool_characters - len(payload)))
+        if len(payload) <= room:
+            return payload
+        self.log.record("reading_budget_reached", "ok", tool=name,
+                        spent=turn.tool_characters, budget=budget, kept=room)
+        return payload[:room] + (
+            f"\n…[this result was shortened: the turn has already read "
+            f"{turn.tool_characters:,} characters of tool output. Ask for a "
+            f"specific file or range if you need more.]")
 
     def _run_one_tool(self, call: ToolCall, approve: Callable[[list[str]], bool] | None,
                       messages: list[dict], turn: TurnState) -> None:
         """Execute one tool call and record what it proves about the turn."""
         result = self._execute_tool(call, approve)
+        if not result.get("ok"):
+            # Said in the tool result rather than the system prompt, because the
+            # model reads this one immediately and in context. A failure used to
+            # be logged and forgotten, so the same call could be made five times
+            # and read five identical errors with nothing pointing that out.
+            advice = tool_loops.note_for(call.name, call.arguments,
+                                         turn.tool_failures, turn.repeated_calls)
+            if advice:
+                result["what_to_do"] = advice
+                self.log.record("tool_loop", "warn", tool=call.name,
+                                failures=turn.tool_failures.get(call.name, 0))
         # An attached image cannot travel inside a tool result, which is plain
         # text. Lift it out and send it as a real multimodal turn.
         attachment = result.pop("content", None) if call.name == "look_at_image" else None
         messages.append({"role": "tool", "tool_call_id": call.id,
-                         "content": json.dumps(result, ensure_ascii=False)})
+                         "content": self._within_reading_budget(
+                             json.dumps(result, ensure_ascii=False), turn, call.name)})
         if attachment:
             messages.append({"role": "user", "content": [
                 {"type": "text",
@@ -763,6 +1217,12 @@ class AuraAgent:
         if not result.get("ok"):
             return
         turn.successful_tools += 1
+        turn.tools_run.append(call.name)
+        if call.name == "run_command" and result.get("approved") and not result.get("timed_out"):
+            # A refused command still produces a successful tool result that
+            # describes the refusal, so the tool's name is not evidence that
+            # anything executed. This is.
+            turn.commands_executed += 1
         if call.name in EXTERNAL_TOOLS:
             turn.external_activity = True
         if call.name in {"write_external_file", "undo_external_change"}:
@@ -787,7 +1247,12 @@ class AuraAgent:
             for verified_path in verified_paths:
                 normalized = self._normalize_path(verified_path)
                 if normalized:
-                    turn.verified_final_paths.add(normalized)
+                    # Measuring a file still proves a write landed — it just does
+                    # not prove anything about what the file says.
+                    if call.name in self.CONTENT_TOOLS:
+                        turn.verified_final_paths.add(normalized)
+                    else:
+                        turn.measured_paths.add(normalized)
                 turn.pending_verifications.pop(normalized, None)
         if call.name == "validate_project" and result.get("valid"):
             requested_path = self._normalize_path(str(call.arguments.get("path", ".")))
@@ -797,6 +1262,39 @@ class AuraAgent:
                 turn.validation_evidence = dict(result)
                 turn.validation_scope = requested_path
         turn.verification_needed = bool(turn.pending_verifications)
+
+    def _out_of_time(self, turn: TurnState, seconds: float, rounds: int) -> str:
+        turn.ran_out_of_time = True
+        self.log.record("turn_budget_reached", "ok", seconds=seconds, rounds=rounds,
+                        tools_run=turn.successful_tools)
+        return self._format_out_of_time(turn, seconds)
+
+    def _format_out_of_time(self, turn: TurnState, seconds: float) -> str:
+        """Stop honestly, rather than leaving Mat watching a spinner.
+
+        Everything here is a fact Aura recorded. The turn is not claimed to be
+        finished, because it is not — but what actually ran is worth more than the
+        timeout that used to arrive in its place.
+        """
+        # Rounding 90 seconds up to "2 minutes" overstates the wait Mat actually
+        # had, which is a small lie in a message whose whole job is honesty.
+        shape = (f"{seconds / 60:.0f} minutes" if seconds >= 120
+                 else f"{seconds:.0f} seconds")
+        lines = [f"I stopped after {shape} — this turn was taking too long, "
+                 f"so here is where it got to rather than nothing at all."]
+        done = list(dict.fromkeys(turn.tools_run))
+        if done:
+            lines.append("What actually ran: "
+                         + ", ".join(f"`{name}`" for name in done[:8]) + ".")
+        read = sorted(turn.verified_final_paths)
+        if read:
+            lines.append("Files read: " + ", ".join(f"`{p}`" for p in read[:8]) + ".")
+        if turn.pending_verifications:
+            lines.append("Not verified: "
+                         + ", ".join(f"`{p}`" for p in sorted(turn.pending_verifications)[:8]) + ".")
+        lines.append("Ask me to continue and I will pick it up from here. "
+                     "You can change the limit in Settings.")
+        return "\n\n".join(lines)
 
     def _format_silent_completion(self, turn: TurnState) -> str:
         """Say what was done when the model stops before saying it itself.
@@ -812,8 +1310,181 @@ class AuraAgent:
             lines.append(f"What actually ran: {summary}.")
         return "\n\n".join(lines)
 
-    @staticmethod
-    def _empty_response_reason(turn: TurnState) -> str:
+    #: Tool results this many rounds back are history the model has already acted
+    #: on. The most recent ones are what it is answering from, so they are left
+    #: whole.
+    KEEP_WHOLE_RESULTS = 2
+    #: Enough to show what a result was, not enough to carry its bulk.
+    TRIMMED_RESULT = 240
+
+    #: How much of the thinking to hand back. The tail, not the head: a chain of
+    #: thought ends with the decision it reached, which is the part the next
+    #: round needs.
+    REASONING_CARRIED = 2400
+
+    def _carry_reasoning(self, messages: list[dict], assistant: dict, response) -> None:
+        """Give the model back the thinking behind its own last turn.
+
+        Roughly three quarters of what this model produces is `reasoning_content`,
+        and all of it used to be discarded — so after calling a tool it saw its
+        own previous turn as a bare function call and had to work out again why it
+        had made it. Only the newest turn keeps its reasoning; carrying every
+        round's would grow the prompt by three quarters each time, which is the
+        problem `_compact_for_retry` exists to fight.
+        """
+        if not self.config.data.get("send_reasoning_back", True):
+            return
+        for earlier in messages:
+            if earlier.get("role") == "assistant":
+                earlier.pop("reasoning_content", None)
+        thinking = str(getattr(response, "reasoning", "") or "").strip()
+        if not thinking:
+            return
+        if len(thinking) > self.REASONING_CARRIED:
+            thinking = "…" + thinking[-self.REASONING_CARRIED:]
+        assistant["reasoning_content"] = thinking
+
+    #: Said when the conversation has nothing outstanding in it. Short on purpose:
+    #: it exists to give the model a turn to take, not to steer the answer.
+    NOTHING_TO_ANSWER = ("Continue from where you left off and finish your reply to "
+                         "the user's last question. Do not repeat what you already said.")
+
+    def _ensure_something_to_answer(self, messages: list[dict]) -> bool:
+        """Never ask the model to speak after Aura's own reply.
+
+        The last cause of the silences, and the only one that was never the model's
+        fault. A payload ending in an assistant turn — no tool calls, nothing
+        outstanding — asks the model to respond to itself, and one stop token is the
+        right answer to that. Replaying the captured payload confirmed it: drop that
+        final assistant message and the same request produced a tool call.
+        """
+        if not messages:
+            return False
+        last = messages[-1]
+        if last.get("role") != "assistant" or last.get("tool_calls"):
+            return False
+        self.log.record("nothing_to_answer", "ok",
+                        trailing=len(str(last.get("content") or "")))
+        # A user turn, not a system one, for two reasons that both bite: the chat
+        # template refuses a system message anywhere but the front, and
+        # `merge_system_messages` would hoist it there anyway — leaving the
+        # conversation still ending in Aura's own reply, which is the whole problem.
+        messages.append({"role": "user", "content": self.NOTHING_TO_ANSWER})
+        return True
+
+    def _fit_to_context(self, messages: list[dict], tools: list[dict], heat) -> None:
+        """Shorten the conversation *before* sending, if it will not fit.
+
+        Aura used to send and hope. When the payload was too large LM Studio
+        trimmed it until the chat template had no user turn left and raised,
+        which arrived looking like a model that had chosen to say nothing.
+        Compaction existed but only ever ran after a turn had already failed.
+
+        Never raises and never blocks the send: if the estimate is wrong, the
+        turn should still be attempted. The worst this can do is shorten some
+        old tool results that were going to be truncated by the server anyway.
+        """
+        try:
+            window = self.provider.loaded_context()
+        except Exception:
+            return              # a provider that cannot say has nothing to check
+        if not window:
+            return
+        answer = getattr(heat, "max_tokens", 0) or 0
+        previous = None
+        for _ in range(3):      # each pass shortens the next tier of results
+            call = context_budget.verdict(self.budget, messages, tools, window, answer)
+            if call["fits"]:
+                return
+            # A pass that barely moves the number is a pass that has run out of
+            # material. Measured: the first cut saved 35,040 characters and the
+            # next two saved 384 and 376 — two rounds of work for nothing.
+            if previous is not None and previous - call["over_by"] < 200:
+                self.log.record(
+                    "context_preflight", "warn", needed=call["guarded"],
+                    room=call["room"], over_by=call["over_by"],
+                    note="nothing left worth shortening")
+                return
+            previous = call["over_by"]
+            saved = self._compact_for_retry(messages)
+            self.log.record(
+                "context_preflight", "ok" if saved else "warn",
+                needed=call["guarded"], room=call["room"],
+                over_by=call["over_by"], characters_saved=saved,
+                chars_per_token=call["chars_per_token"],
+                calibrated=call["calibrated"])
+            if not saved:
+                # Nothing left to shorten. Said plainly rather than silently:
+                # the turn may still work, and if it does not, this line is
+                # the reason, sitting in the log before the failure.
+                return
+
+    def _note_bookkeeping_failure(self, what: str, project: str, exc: Exception) -> None:
+        """Record a failure in the record-keeping itself.
+
+        Guarded twice over: these failures are usually the database, and the
+        log lives in the same database, so an unguarded write here would turn a
+        lost note into a lost turn.
+        """
+        try:
+            self.log.record(what, "error", project=project, error=str(exc))
+        except Exception:
+            pass
+
+    def _compact_for_retry(self, messages: list[dict]) -> int:
+        """Shorten older tool results in place; return the characters saved.
+
+        Shortened, never removed: each `tool` message answers a `tool_call` by
+        id, and dropping one leaves the conversation malformed in a way the
+        server rejects. Nothing else is touched — the system prompt, the user's
+        words and the assistant's own turns all stay exactly as they were.
+        """
+        places = [i for i, message in enumerate(messages)
+                  if message.get("role") == "tool"]
+        saved = 0
+        for index in places[:-self.KEEP_WHOLE_RESULTS] if len(places) > self.KEEP_WHOLE_RESULTS else []:
+            content = str(messages[index].get("content") or "")
+            if len(content) <= self.TRIMMED_RESULT:
+                continue
+            dropped = len(content) - self.TRIMMED_RESULT
+            messages[index] = dict(messages[index], content=(
+                content[:self.TRIMMED_RESULT]
+                + f"\n…[{dropped} characters of this earlier result were trimmed to "
+                  f"make room; ask again if you need them]"))
+            saved += dropped
+        return saved
+
+    #: Enough to find a pattern across a few days, few enough to stay small.
+    SILENCES_KEPT = 10
+
+    def _capture_silence(self) -> str:
+        """Write out the prompt that produced a silence, and return its filename.
+
+        The model is deterministic — the same payload gives the same answer every
+        time — so a silence is not bad luck, it is a specific prompt that reliably
+        produces one token. That makes it reproducible in principle, and it has been
+        irreproducible in practice only because nothing kept the prompt.
+
+        Never allowed to break a turn: a diagnostic that can fail the thing it is
+        diagnosing is worse than no diagnostic.
+        """
+        payload = getattr(self.provider, "last_payload", None)
+        if not payload:
+            return ""
+        try:
+            folder = self.sandbox.meta / "silences"
+            folder.mkdir(exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            target = folder / f"{stamp}.json"
+            target.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+            for old in sorted(folder.glob("*.json"))[:-self.SILENCES_KEPT]:
+                old.unlink(missing_ok=True)
+            return target.name
+        except OSError:
+            return ""
+
+    def _empty_response_reason(self, turn: TurnState) -> str:
         """Explain the silence with what the server actually reported.
 
         Measured on two real occurrences: `finish_reason` was `stop` with a
@@ -821,7 +1492,14 @@ class AuraAgent:
         model was loaded, fast, and answering — it simply chose to say nothing.
         The old message sent the user to check LM Studio, which is the one place
         the evidence had already cleared.
+
+        A classification set by the gate wins, when it made one: it saw the
+        reply rather than only the two fields kept from it, and it is the same
+        judgement that chose the remedy — so the sentence Mat reads and the
+        decision Aura took cannot disagree.
         """
+        if getattr(turn, "empty_explanation", ""):
+            return turn.empty_explanation
         if turn.finish_reason == "length":
             return ("the model ran out of room mid-answer. Raise the maximum "
                     "response length in Settings, or ask for less at once")
@@ -832,8 +1510,54 @@ class AuraAgent:
         if turn.finish_reason:
             return ("the model returned nothing usable and stopped with "
                     f"{turn.finish_reason!r}")
+        service = getattr(self.provider, "SERVICE", "the model server")
         return ("the model kept returning an empty response. Check that a model "
-                "is loaded in LM Studio, or try a shorter request")
+                f"is loaded in {service}, or try a shorter request")
+
+    #: The shapes a text-format tool call arrives in. Deliberately narrow: this
+    #: must catch a reply that *is* a tool call, never a reply that mentions one.
+    TOOL_MARKUP = re.compile(
+        r"<\s*tool_call\s*>|<\s*function\s*=|<\|tool\u2581call\|>|\[TOOL_CALL\]",
+        re.IGNORECASE)
+
+    @classmethod
+    def _is_tool_markup(cls, content: str) -> bool:
+        """Is this reply a tool call the server failed to parse?
+
+        Measured against the real case: the whole reply was four lines of
+        `<tool_call><function=undo_last_change>`. A reply that merely *discusses*
+        tool calls — which happens whenever Mat and Aura talk about her own code —
+        has prose around it, so the markup has to dominate before this fires.
+        """
+        text = str(content or "").strip()
+        if not text or not cls.TOOL_MARKUP.search(text):
+            return False
+        without = cls.TOOL_MARKUP.sub("", text)
+        without = re.sub(r"[<>/=\s\w.\u2581|\[\]-]{0,80}$", "", without, count=1)
+        # What is left once the markup is removed: if almost nothing, the reply was
+        # the call itself rather than a message that happened to contain one.
+        return len(without.strip()) < max(40, len(text) * 0.4)
+
+    def _gate_tool_markup(self, turn: TurnState, response) -> GateResult:
+        """Refuse a tool call that arrived as prose.
+
+        Not parsed and not executed — a call that comes through as content has
+        bypassed the structured path, and the one that prompted this gate was
+        `undo_last_change`, which nobody asked for. Treated as no answer at all.
+        """
+        content = str(getattr(response, "content", "") or "")
+        if not self._is_tool_markup(content):
+            return PASS
+        self.log.record("tool_markup", "error", emitted=content[:200],
+                        captured=self._capture_silence())
+        turn.emitted_tool_markup = True
+        if turn.empty_retries_used >= self.MAX_EMPTY_RETRIES:
+            return PASS
+        turn.empty_retries_used += 1
+        return GateResult(drop_tools=True, instruction=(
+            "Your last reply was a tool call written as text, which does nothing. "
+            "The tools have been taken away for this turn. Answer the user directly "
+            "in plain words, using what you already found."))
 
     def _gate_empty_response(self, turn: TurnState, response) -> GateResult:
         """An empty completion is usually a stumble, not a verdict.
@@ -846,20 +1570,73 @@ class AuraAgent:
         turn.completion_tokens = int(getattr(response, "completion_tokens", 0) or 0)
         if response.content:
             return PASS
+        # Which silence this is decides the remedy. Telling a model its reply was
+        # empty is a sentence about an event it took no part in when the request
+        # never reached it, and it is simply false when the model generated
+        # plenty and spent it all on thinking.
+        limit = getattr(getattr(self, "_turn_heat", None), "max_tokens", 0) or 0
+        kind = empty_reply.classify(response, limit)
+        turn.empty_kind = kind.name
+        turn.empty_explanation = kind.explanation
         # Measured rather than merely reported. "It kept returning an empty
         # response" was true and told nobody anything; finish_reason separates a
         # model that ran out of budget mid-answer from one that chose silence.
         self.log.record(
             "empty_response", "error",
+            kind=kind.name,
             finish_reason=getattr(response, "finish_reason", "") or "(not given)",
             prompt_tokens=getattr(response, "prompt_tokens", 0),
             completion_tokens=getattr(response, "completion_tokens", 0),
             max_tokens=getattr(self.provider, "max_tokens", 0),
             tools_run=turn.successful_tools,
-            retries_left=turn.retries_left)
-        return GateResult(instruction=(
-            "Your last response was completely empty. Answer the user in plain "
-            "text now, or call exactly one tool. Never reply with nothing."))
+            retries_left=turn.retries_left,
+            # The token itself, escaped. A stop marker, a bare newline and a
+            # real word are three different faults and every previous record
+            # of this failure threw away the one field that separates them.
+            emitted=repr(str(getattr(response, "content", "") or ""))[:120],
+            empty_retries_used=turn.empty_retries_used,
+            captured=self._capture_silence(),
+            tools_named=list(turn.tools_run)[-6:])
+        # Every episode in the log spent the full budget on the same question and
+        # got the same silence back. One retry, and it asks differently.
+        if turn.empty_retries_used >= self.MAX_EMPTY_RETRIES:
+            return PASS
+        if not kind.worth_retrying:
+            # Asking again would send the identical request, and it was not the
+            # model that refused it. Ending here saves a round and lets the turn
+            # report the real fault instead of a second silence.
+            return PASS
+        turn.empty_retries_used += 1
+        # Tools stay when the model was mid-work and merely ran out of room to
+        # speak; taking them away there would throw the turn's progress out.
+        return GateResult(drop_tools=(kind.name != "thought_it_away"),
+                          instruction=kind.instruction)
+
+    def _gate_unread_files(self, turn: TurnState, response) -> GateResult:
+        """Note any file the answer discusses but never opened.
+
+        Deliberately not a language test. Aura already knows which files she read
+        and which she only measured, so the honest fact is available without
+        guessing at intent from words — and without the false positives that
+        hunting for "probably" in Estonian and English would bring.
+
+        A note, never a retry: mentioning a file one has not read can be perfectly
+        reasonable, and the point is that Mat can tell the difference.
+        """
+        content = str(getattr(response, "content", "") or "")
+        if not content:
+            return PASS
+        unopened = sorted(turn.measured_paths - turn.verified_final_paths)
+        discussed = [path for path in unopened
+                     if path and PurePosixPath(path).name.lower() in content.lower()]
+        if not discussed:
+            return PASS
+        listed = ", ".join(f"`{path}`" for path in discussed[:6])
+        more = f" and {len(discussed) - 6} more" if len(discussed) > 6 else ""
+        return GateResult(note=(
+            f"anything said about the contents of {listed}{more}: the size and line "
+            f"count were checked, but the {'files were' if len(discussed) > 1 else 'file was'} "
+            f"never opened"))
 
     def _gate_artifacts(self, turn: TurnState, response) -> GateResult:
         """Every file the user named this turn must actually exist."""
@@ -890,6 +1667,231 @@ class AuraAgent:
         # Aura must not imply it was verified.
         return GateResult(note="these files were requested but not found: "
                                + ", ".join(f"`{path}`" for path in turn.missing_artifacts[:8]))
+
+    #: Words that assert a command actually produced something. Deliberately
+    #: past-tense and result-shaped: "I could run X" and "run X to see" are
+    #: proposals, and nagging about those would make the gate a nuisance rather
+    #: than a guard. Both languages, because both are spoken here.
+    COMMAND_CLAIMS = (
+        "käivitasin", "jooksutasin", "väljastas", "väljund oli", "tagastas",
+        "käsu tulemus", "käsk andis", "käsk tagastas", "output was", "it printed",
+        "the command returned", "the command output", "ran the command",
+        "i ran ", "command succeeded", "successfully ran",
+        # Added from a reply that actually appeared rather than from
+        # imagination: "The command has been executed and is awaiting user
+        # approval before completion" — self-contradictory, and the first half
+        # is the false part. The earlier list was written by guessing at
+        # phrasings and missed this one entirely.
+        "has been executed", "was executed", "command has been run",
+        "on käivitatud", "sai käivitatud", "käsk täideti",
+    )
+
+    def _claims_a_command_ran(self, text: str) -> bool:
+        lowered = str(text or "").casefold()
+        return any(phrase in lowered for phrase in self.COMMAND_CLAIMS)
+
+    def _gate_command_claim(self, turn: TurnState, response) -> GateResult:
+        """Describing a command's output requires a command to have run.
+
+        Only bites in the one unambiguous case: the reply asserts a result and
+        nothing executed at all this turn. When a command did run, no attempt is
+        made to match claims to commands — a gate that guesses would produce
+        exactly the false accusations it exists to prevent.
+        """
+        if turn.empty_response or turn.commands_executed:
+            return PASS
+        if not self._claims_a_command_ran(response.content):
+            return PASS
+        if turn.retries_left > 0:
+            return GateResult(
+                notice="Aura is checking what actually ran…\n\n",
+                instruction=(
+                    "No command was executed in this turn — either none was requested of "
+                    "the tool, or the user declined it. Your reply describes a command's "
+                    "result, which did not happen. Rewrite it: say plainly that the command "
+                    "was not run and why, and keep everything you did actually do. Do not "
+                    "report output you did not receive from a tool."))
+        return GateResult(note="the reply describes a command's result, but no command "
+                               "was run in this turn")
+
+    def _gate_plan_progress(self, turn: TurnState, response) -> GateResult:
+        """Move the plan forward from evidence, not from the model remembering to.
+
+        `update_plan_step` exists and she will not reliably call it — the same
+        finding as `_gate_plan`, which stopped asking the model to write PLAN.md
+        and had Aura write it from what the turn actually did.
+
+        Never asks for another round: this is bookkeeping about work already
+        finished, and the user should not wait a minute for it.
+        """
+        project = self.current_project
+        if not project or not turn.successful_tools:
+            return PASS
+        try:
+            steps = self.db.plan_steps(project)
+        except Exception as exc:
+            # Bookkeeping must never break a finished turn, but a plan that
+            # cannot be read is a plan that has silently stopped existing.
+            self._note_bookkeeping_failure("plan_steps_read", project, exc)
+            return PASS
+        if not steps:
+            return PASS
+
+        proof = self._step_evidence(turn)
+        first_open = True
+        for step in steps:
+            if step["status"] == "done" or step["id"] in turn.plan_steps_recorded:
+                continue
+            # A step usually names its own artifact, and whether that file exists
+            # is a fact about the workspace rather than a guess about the turn.
+            # That is what keeps the record level with the files rather than with
+            # what was said about them.
+            named = self._paths_named_in(step["text"])
+            landed = bool(named) and all(
+                self._step_file_exists(project, path) for path in named)
+            evidence = ""
+            if landed and (proof or turn.workspace_mutation):
+                evidence = ("the files it names exist: "
+                            + ", ".join(f"`{p}`" for p in named)
+                            + (f"; {proof}" if proof else ""))
+            elif first_open and proof:
+                evidence = proof
+            try:
+                if evidence:
+                    self.db.set_step_status(step["id"], "done", evidence)
+                    self.log.record("plan_step", "ok", project=project,
+                                    step=step["text"], evidence=evidence, automatic=True)
+                elif first_open and turn.workspace_mutation and step["status"] == "todo":
+                    # Work happened but nothing proved this step finished. "Started"
+                    # is true; "done" would not be.
+                    self.db.set_step_status(step["id"], "doing", "")
+            except Exception as exc:
+                # Without this the durable plan simply stops advancing and
+                # nothing says so — which is the shape of the bug that took
+                # yesterday to find, arriving next time with no evidence at all.
+                self._note_bookkeeping_failure("plan_step", project, exc)
+            first_open = False
+        return PASS
+
+    #: Anything in a step that looks like a workspace file: a path with a folder,
+    #: or a bare name with an extension. Quotes and backticks are stripped because
+    #: a plan written by a model is full of both.
+    STEP_PATH = re.compile(r"[`'\"]?((?:[\w.-]+/)*[\w.-]+\.[A-Za-z0-9]{1,6})[`'\"]?")
+
+    def _step_file_exists(self, project: str, path: str) -> bool:
+        """Does the file a step names exist, however the step spelled it?
+
+        Steps are written from inside the project — "Update js/main.bundle.js"
+        means `shop/js/main.bundle.js`. Measured on Mat's own plan, where two of
+        three steps named their files project-relative and would otherwise have
+        read as missing forever.
+        """
+        if self._file_exists(path):
+            return True
+        return bool(project) and self._file_exists(f"{project}/{path}")
+
+    def _paths_named_in(self, text: str) -> list[str]:
+        """Workspace files a step names, in the order it names them."""
+        found: list[str] = []
+        for match in self.STEP_PATH.finditer(str(text or "")):
+            path = match.group(1).strip("`'\"")
+            # The capture starts after the protocol, so a URL has to be caught by
+            # what precedes it rather than by how it begins.
+            if "://" in str(text)[max(0, match.start() - 3):match.start() + 1]:
+                continue
+            if path in found:
+                continue
+            found.append(path)
+        return found
+
+    def _step_evidence(self, turn: TurnState) -> str:
+        """What this turn proved, in the words Mat will read back later.
+
+        Only verified outcomes count. A successful write says the write succeeded
+        and nothing about whether the step is done — the distinction section 8 of
+        the prompt draws, applied where it decides a fact rather than a sentence.
+        """
+        if turn.validation_succeeded and turn.validation_scope:
+            files = int((turn.validation_evidence or {}).get("files_seen", 0))
+            return (f"validate_project passed on `{turn.validation_scope}`"
+                    + (f", {files} files checked" if files else ""))
+        confirmed = sorted(turn.verified_final_paths)
+        wanted = [path for path in turn.expected_paths if path]
+        if wanted and all(path in turn.verified_final_paths for path in wanted):
+            return "read back after writing: " + ", ".join(f"`{p}`" for p in wanted)
+        if confirmed and turn.workspace_mutation and not turn.missing_artifacts:
+            return "read back after writing: " + ", ".join(f"`{p}`" for p in confirmed[:5])
+        return ""
+
+    def _gate_plan(self, turn: TurnState, response) -> GateResult:
+        """A turn that changed a project leaves a written record behind.
+
+        The system prompt has asked for a PLAN.md since long before this gate,
+        and four measured runs wrote one in two of them — so asking politely
+        achieves it half the time. The first version of this gate asked the
+        model again, which cost a whole extra round (112–370s on this machine)
+        for bookkeeping rather than correctness, and it took retries away from
+        the gates that decide whether the work is actually right. An existing
+        test caught that by pinning the number of model rounds.
+
+        So Aura writes it herself, from what the turn really did. Cheaper, and
+        also truer: a record built from the tools that actually ran cannot
+        claim work that did not happen, which a model summarising itself can.
+        The user corrects it, and the next turn reads it back.
+        """
+        if turn.empty_response or not turn.workspace_mutation:
+            return PASS
+        project = self.current_project
+        path = self.plan_path(project)
+        # Never overwrite. A plan the model wrote, or one the user edited, is
+        # worth more than anything reconstructed here.
+        if not path or self.plan_text(project):
+            return PASS
+        try:
+            self.sandbox.write_file(path, self._describe_turn(turn))
+        except Exception as exc:
+            return GateResult(note=f"no plan could be written to `{path}`: {exc}")
+        self.log.record("plan_written", "ok", path=path, tools=len(turn.tools_run))
+        return PASS
+
+    def _file_exists(self, relative: str) -> bool:
+        try:
+            return self.sandbox.path(relative).is_file()
+        except Exception:
+            return False
+
+    def _describe_turn(self, turn: TurnState) -> str:
+        """The plan file's first draft: what was asked, what was done, what is open.
+
+        Only facts this turn can vouch for. Anything uncertain is left as a
+        blank for the user rather than guessed at, because he reads this and an
+        invented assumption here would quietly become his.
+        """
+        counted: dict[str, int] = {}
+        for name in turn.tools_run:
+            counted[name] = counted.get(name, 0) + 1
+        # Only files that are really there. `expected_paths` is what the
+        # request was read to mean, and the reading can be wrong — one live run
+        # put `avaleht/index.html` in this list because the Estonian phrase for
+        # "the X folder" had been parsed off a word that was not a folder. A
+        # plan naming a file that does not exist is worse than one naming none.
+        touched = sorted(name for name in
+                         set(turn.expected_paths) | set(turn.verified_final_paths)
+                         if self._file_exists(name))
+        request = str(self.current_request or "").strip()
+
+        lines = [f"# {self.current_project}", ""]
+        lines += ["Started by Aura from what the first change to this project actually did.",
+                  "It is a draft — correct it freely. She reads this file back before the",
+                  "next piece of work and follows it rather than her own memory.", ""]
+        lines += ["## What was asked", "", request or "_Not recorded._", ""]
+        lines += ["## What was done", ""]
+        lines += [f"- `{name}`" + (f" ×{count}" if count > 1 else "")
+                  for name, count in counted.items()] or ["- _Nothing recorded._"]
+        lines += ["", "## Files", ""]
+        lines += [f"- `{name}`" for name in touched] or ["- _None named._"]
+        lines += ["", "## Still open", "", "- _Add what should happen next._", ""]
+        return "\n".join(lines)
 
     def _gate_validation(self, turn: TurnState, response) -> GateResult:
         """A build that changed the workspace has to pass validation."""
@@ -1009,8 +2011,25 @@ class AuraAgent:
 
     #: Order matters and is the same order the single long function used: answer
     #: at all, then deliverables, then validation, then action, then verification.
-    COMPLETION_GATES = (_gate_empty_response, _gate_artifacts, _gate_validation,
-                        _gate_action, _gate_verification)
+    # Artifacts first: the files the user named this turn matter more than the
+    # record of why. The plan comes before validation because a plan written
+    # after a failed check would be a description of the failure.
+    # The plan is written last, after every gate that decides whether the work
+    # was actually right. It takes no retry of its own, so it can never spend
+    # the budget those gates need.
+    COMPLETION_GATES = (_gate_tool_markup, _gate_empty_response, _gate_artifacts,
+                        _gate_command_claim,
+                        _gate_validation, _gate_action, _gate_verification,
+                        # Late, and note-only: it judges the answer Mat will actually
+                        # read, after every gate that can still send the model back
+                        # for another round has had its say.
+                        _gate_unread_files, _gate_plan_progress, _gate_plan)
+
+    #: Said instead of the markup when the model cannot be talked out of it.
+    TOOL_MARKUP_REPLY = (
+        "I tried to call one of my own tools and wrote it out as text instead of "
+        "running it, which does nothing. I have not acted on it. Ask me again and "
+        "I will answer directly.")
 
     #: Tools whose success means this turn changed something the user asked to
     #: change. Deliberately wider than MUTATING_TOOL_NAMES, which is only about
@@ -1021,7 +2040,15 @@ class AuraAgent:
         "create_archive", "extract_archive", "undo_last_change", "rollback_task",
         "remember_name", "remember_preference", "remember_personal_fact",
         "forget_personal_fact", "correct_personal_fact"}
-    VERIFICATION_TOOLS = {"read_file", "read_many_files", "file_info", "inspect_code"}
+    #: Tools that read a file's contents. Only these establish what a file says,
+    #: and so only these let the report claim the file was inspected.
+    CONTENT_TOOLS = {"read_file", "read_many_files", "inspect_code"}
+    #: Tools that measure a file without opening it. `file_info` returns bytes,
+    #: line count and modification time — good evidence that a write landed, and
+    #: no evidence at all about content. Counting it as inspection let Aura print
+    #: "Final file state inspected" directly beneath a table of guessed contents.
+    SHAPE_TOOLS = {"file_info"}
+    VERIFICATION_TOOLS = CONTENT_TOOLS | SHAPE_TOOLS
 
     #: Named here because callers and tests reach for it here; the list itself
     #: lives beside the routing that uses it.
@@ -1040,6 +2067,11 @@ class AuraAgent:
         """
         return routing.question_needs_looking(message, self.workspace_projects())
 
+    #: Up to this many words, a bare "this" or "that" is taken to mean the last
+    #: request. Beyond it, the pronoun almost always refers to something inside the
+    #: sentence it appears in.
+    SHORT_REFERENCE_WORDS = 8
+
     def _routing_request(self, message: str) -> str:
         """Add recent user intent only when the message explicitly refers back."""
         lower = message.casefold().strip()
@@ -1049,11 +2081,19 @@ class AuraAgent:
             r"(?:yes|yeah|yep|sure|ok(?:ay)?|continue|proceed|go ahead|keep going|do it|finish it)[.! ]*",
             lower,
         ))
+        # Phrases that can only mean the previous request, at any length.
         reference = bool(re.search(
-            r"\b(?:i meant|run it|fix it|build it|make it|finish it|do it|that|this|those|them|"
+            r"\b(?:i meant|run it|fix it|build it|make it|finish it|do it|"
             r"the same|previous|above|where you left off)\b",
             lower,
         ))
+        # A lone demonstrative is different. "Do this" is a whole request pointing
+        # backwards; "Use this local context only: …" points inside its own
+        # sentence. Length is what separates them, and reading the second kind as a
+        # follow-up made a question about a name inherit "kirjuta" from three turns
+        # earlier and open a build-approval card.
+        if not reference and len(lower.split()) <= self.SHORT_REFERENCE_WORDS:
+            reference = bool(re.search(r"\b(?:that|this|those|them)\b", lower))
         follow_up = continuation or reference
         if not follow_up:
             return message
@@ -1080,6 +2120,22 @@ class AuraAgent:
     @staticmethod
     def _strip_negative_clauses(message: str) -> str:
         return routing.strip_negative_clauses(message)
+
+    #: Verbs that presuppose the thing already exists. "Create a file" says nothing
+    #: about what is there; "change the title in it" asserts there is a title.
+    EDIT_VERBS = ("edit", "change", "update", "fix", "modify", "replace", "rename",
+                  "correct", "adjust", "improve", "refactor", "rewrite")
+    #: Verbs that ask for something new, which make the request ambiguous rather
+    #: than mistaken — so nothing is claimed when both appear.
+    CREATE_VERBS = ("create", "make", "build", "generate", "add", "new")
+
+    @classmethod
+    def _is_edit_request(cls, message: str) -> bool:
+        """Did the user ask to change something they believe already exists?"""
+        lower = language.with_english_hints(str(message).casefold())
+        edits = any(re.search(rf"\b{verb}\b", lower) for verb in cls.EDIT_VERBS)
+        creates = any(re.search(rf"\b{verb}\b", lower) for verb in cls.CREATE_VERBS)
+        return edits and not creates
 
     @staticmethod
     def _requires_mutation(message: str) -> bool:
@@ -1110,6 +2166,21 @@ class AuraAgent:
             "outside the workspace", "outside my workspace", "external folder",
         ))
 
+    #: Technology names that look exactly like filenames and never are. Measured
+    #: on a real request listing a stack: "Next.js" and "Node.js" were read as
+    #: two files Aura had been asked to create, so the completion gate would
+    #: have reported a finished job unfinished for want of them.
+    #:
+    #: A deny-list rather than something cleverer because the only signal that
+    #: separates them is what the word means. The cost is that a project with a
+    #: genuine top-level `next.js` must write it as `./next.js` or put it in a
+    #: folder, which is a far rarer request than naming the framework.
+    NOT_FILENAMES = frozenset({
+        "node.js", "next.js", "nuxt.js", "vue.js", "react.js", "express.js",
+        "three.js", "d3.js", "chart.js", "alpine.js", "ember.js", "backbone.js",
+        "discord.js", "socket.js", "video.js", "moment.js", "nest.js",
+    })
+
     @staticmethod
     def _extract_artifact_contract(message: str) -> tuple[str | None, list[str]]:
         filenames = []
@@ -1121,6 +2192,9 @@ class AuraAgent:
                 r"\.(?:py|json|toml|md|txt|html|css|js|ts|tsx|jsx|yaml|yml))(?![\w-])",
                 message):
             name = match.group(1)
+            # Only bare names are ambiguous; a path was clearly meant as one.
+            if "/" not in name and "\\" not in name and                     name.casefold() in AuraAgent.NOT_FILENAMES:
+                continue
             if name not in filenames:
                 filenames.append(name)
         target = None
@@ -1292,7 +2366,13 @@ class AuraAgent:
                                     validation: dict | None, verified_paths: list[str],
                                     expected_paths: list[str],
                                     unconfirmed: list[str] | None = None,
-                                    sources: list[str] | None = None) -> str:
+                                    sources: list[str] | None = None,
+                                    # Kept apart from `verified_paths` so the report
+                                    # cannot promote a measurement into an inspection.
+                                    measured_paths: list[str] | None = None,
+                                    # Files the request spoke of as existing, which
+                                    # did not, and were created during the turn.
+                                    created_instead: list[str] | None = None) -> str:
         evidence: list[str] = []
         if validation and validation.get("valid"):
             scope = validation_scope or "."
@@ -1314,6 +2394,23 @@ class AuraAgent:
             display = ", ".join(f"`{path}`" for path in verified[:8])
             suffix = f" and {len(verified) - 8} more" if len(verified) > 8 else ""
             evidence.append(f"Final file state inspected: {display}{suffix}.")
+        # Stated as evidence rather than as a doubt: it is confirmed, it was simply
+        # left out. "The heading is correctly set" is true and hides that the file
+        # was invented rather than edited.
+        conjured = [path for path in (created_instead or []) if path]
+        if conjured:
+            display = ", ".join(f"`{path}`" for path in conjured[:8])
+            suffix = f" and {len(conjured) - 8} more" if len(conjured) > 8 else ""
+            evidence.append(
+                f"Did not exist and was created, rather than changed: {display}{suffix}.")
+        # Said separately, and said smaller, because it is a smaller claim.
+        measured = [path for path in (measured_paths or [])
+                    if path and path not in required and path not in verified]
+        if measured:
+            display = ", ".join(f"`{path}`" for path in measured[:8])
+            suffix = f" and {len(measured) - 8} more" if len(measured) > 8 else ""
+            evidence.append(
+                f"Size and line count checked, contents not read: {display}{suffix}.")
         report = content.rstrip()
         if evidence:
             report += "\n\nConfirmed evidence:\n" + "\n".join(f"- {item}" for item in evidence)
@@ -1340,576 +2437,60 @@ class AuraAgent:
         return toolkit.definitions() + [service.tool_definition()
                                         for service in services.services()]
 
-    @tool('list_files', 'List files recursively inside a workspace folder.',
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..', 'default': '.'}}, [])
-    def _tool_list_files(self, name, args, approve, call):
-        result = {"files": self.sandbox.list_files(str(args.get("path", ".")))[:1000]}
-        return result
 
-    @tool('create_folder', 'Create an empty workspace folder and missing parent folders. Use this instead of mkdir.',
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['path'], mutating=True)
-    def _tool_create_folder(self, name, args, approve, call):
-        target = self.sandbox.create_folder(str(args["path"]))
-        result = {"path": target.relative_to(self.sandbox.root).as_posix()}
-        return result
 
-    @tool('read_file', 'Read a UTF-8 text file or a focused line range from the workspace.',
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'start_line': {'type': 'integer', 'minimum': 1, 'default': 1}, 'end_line': {'type': 'integer', 'minimum': 1}}, ['path'])
-    def _tool_read_file(self, name, args, approve, call):
-        content = self.sandbox.read_file(str(args["path"]))
-        lines = content.splitlines(keepends=True)
-        start = max(1, int(args.get("start_line", 1)))
-        end = min(len(lines), int(args.get("end_line", start + 399)))
-        selected = "".join(lines[start - 1:end])
-        result = {"path": args["path"], "content": selected,
-                  "start_line": start, "end_line": end, "total_lines": len(lines),
-                  "truncated": end < len(lines)}
-        return result
 
-    @tool('read_many_files', 'Read several related UTF-8 workspace files in one call with bounded output.',
-          {'paths': {'type': 'array', 'minItems': 1, 'maxItems': 20, 'items': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, 'max_lines_each': {'type': 'integer', 'minimum': 20, 'maximum': 1000, 'default': 300}}, ['paths'])
-    def _tool_read_many_files(self, name, args, approve, call):
-        paths = args.get("paths")
-        if not isinstance(paths, list) or not 1 <= len(paths) <= 20:
-            raise ValueError("paths must contain between 1 and 20 files")
-        max_lines = max(20, min(int(args.get("max_lines_each", 300)), 1000))
-        files = []
-        output_chars = 0
-        for raw_path in paths:
-            path = str(raw_path)
-            content = self.sandbox.read_file(path)
-            lines = content.splitlines(keepends=True)
-            selected = "".join(lines[:max_lines])
-            output_chars += len(selected)
-            if output_chars > 250_000:
-                raise ValueError("combined read exceeds Aura's 250,000 character context limit")
-            files.append({"path": path, "content": selected, "total_lines": len(lines),
-                          "truncated": len(lines) > max_lines})
-        result = {"files": files, "count": len(files)}
-        return result
 
-    @tool('file_info', "Inspect a file's size, line count, and modification time.",
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['path'])
-    def _tool_file_info(self, name, args, approve, call):
-        target = self.sandbox.path(str(args["path"]))
-        if not target.is_file():
-            raise FileNotFoundError(str(args["path"]))
-        stat = target.stat()
-        try:
-            line_count = len(target.read_text(encoding="utf-8").splitlines())
-        except UnicodeDecodeError:
-            line_count = None
-        result = {"path": args["path"], "bytes": stat.st_size,
-                  "lines": line_count, "modified": stat.st_mtime}
-        return result
 
-    @tool('create_file', 'Create a new UTF-8 file; fails if it already exists.',
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'content': {'type': 'string'}}, ['path', 'content'], mutating=True)
-    @tool('write_file', 'Create or replace a UTF-8 file in the workspace.',
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'content': {'type': 'string'}}, ['path', 'content'], mutating=True)
-    @tool('append_file', 'Append UTF-8 text to a workspace file, creating it if needed.',
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'content': {'type': 'string'}}, ['path', 'content'], mutating=True)
-    def _tool_create_file(self, name, args, approve, call):
-        content = str(args["content"])
-        if len(content.encode("utf-8")) > self.MAX_WRITE_BYTES:
-            raise ValueError("file content exceeds Aura's 1 MB tool limit")
-        if name == "create_file":
-            target = self.sandbox.create_file(str(args["path"]), content)
-        elif name == "append_file":
-            path = str(args["path"])
-            existing = self.sandbox.read_file(path) if self.sandbox.path(path).exists() else ""
-            target = self.sandbox.write_file(path, existing + content)
-        else:
-            target = self.sandbox.write_file(str(args["path"]), content)
-        result = {"path": target.relative_to(self.sandbox.root).as_posix(),
-                  "bytes": len(content.encode("utf-8"))}
-        return result
 
-    @tool('write_files', 'Create or replace up to 20 related UTF-8 files in one batch. Every file remains recoverable.',
-          {'files': {'type': 'array', 'minItems': 1, 'maxItems': 20, 'items': {'type': 'object', 'properties': {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'content': {'type': 'string'}}, 'required': ['path', 'content'], 'additionalProperties': False}}}, ['files'], mutating=True)
-    def _tool_write_files(self, name, args, approve, call):
-        items = args.get("files")
-        if not isinstance(items, list) or not 1 <= len(items) <= 20:
-            raise ValueError("files must contain between 1 and 20 items")
-        prepared: list[tuple[str, str, int]] = []
-        total_bytes = 0
-        for item in items:
-            if not isinstance(item, dict) or "path" not in item or "content" not in item:
-                raise ValueError("each file requires path and content")
-            path, content = str(item["path"]), str(item["content"])
-            size = len(content.encode("utf-8"))
-            if size > self.MAX_WRITE_BYTES:
-                raise ValueError(f"{path} exceeds Aura's 1 MB per-file tool limit")
-            self.sandbox.path(path)
-            prepared.append((path, content, size))
-            total_bytes += size
-        if total_bytes > 4_000_000:
-            raise ValueError("combined batch write exceeds Aura's 4 MB limit")
-        written = []
-        for path, content, size in prepared:
-            target = self.sandbox.write_file(path, content)
-            written.append({"path": target.relative_to(self.sandbox.root).as_posix(),
-                            "bytes": size})
-        result = {"files": written, "count": len(written), "bytes": total_bytes}
-        return result
 
-    @tool('replace_in_file', 'Precisely replace exact text in an existing UTF-8 file. Fails if the match count is unexpected.',
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'old_text': {'type': 'string'}, 'new_text': {'type': 'string'}, 'expected_count': {'type': 'integer', 'minimum': 1, 'default': 1}}, ['path', 'old_text', 'new_text'], mutating=True)
-    def _tool_replace_in_file(self, name, args, approve, call):
-        path = str(args["path"])
-        old, new = str(args["old_text"]), str(args["new_text"])
-        if not old:
-            raise ValueError("old_text cannot be empty")
-        content = self.sandbox.read_file(path)
-        expected = int(args.get("expected_count", 1))
-        actual = content.count(old)
-        if actual != expected:
-            raise ValueError(f"expected {expected} exact matches but found {actual}")
-        updated = content.replace(old, new)
-        if len(updated.encode("utf-8")) > self.MAX_WRITE_BYTES:
-            raise ValueError("updated file exceeds Aura's 1 MB tool limit")
-        target = self.sandbox.write_file(path, updated)
-        result = {"path": target.relative_to(self.sandbox.root).as_posix(),
-                  "replacements": actual}
-        return result
 
-    @tool('apply_edits', 'Atomically apply several exact text replacements to one file with one recovery snapshot.',
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'edits': {'type': 'array', 'minItems': 1, 'maxItems': 50, 'items': {'type': 'object', 'properties': {'old_text': {'type': 'string'}, 'new_text': {'type': 'string'}, 'expected_count': {'type': 'integer', 'minimum': 1, 'default': 1}}, 'required': ['old_text', 'new_text'], 'additionalProperties': False}}}, ['path', 'edits'], mutating=True)
-    def _tool_apply_edits(self, name, args, approve, call):
-        path = str(args["path"])
-        edits = args["edits"]
-        if not isinstance(edits, list) or not 1 <= len(edits) <= 50:
-            raise ValueError("edits must contain between 1 and 50 replacements")
-        updated = self.sandbox.read_file(path)
-        applied = 0
-        for edit in edits:
-            old, new = str(edit["old_text"]), str(edit["new_text"])
-            if not old:
-                raise ValueError("old_text cannot be empty")
-            expected = int(edit.get("expected_count", 1))
-            actual = updated.count(old)
-            if actual != expected:
-                raise ValueError(f"expected {expected} matches but found {actual} for edit {applied + 1}")
-            updated = updated.replace(old, new)
-            applied += actual
-        if len(updated.encode("utf-8")) > self.MAX_WRITE_BYTES:
-            raise ValueError("updated file exceeds Aura's 1 MB tool limit")
-        target = self.sandbox.write_file(path, updated)
-        result = {"path": target.relative_to(self.sandbox.root).as_posix(),
-                  "edits": len(edits), "replacements": applied}
-        return result
 
-    @tool('search_files', 'Search file names and UTF-8 contents in the workspace.',
-          {'query': {'type': 'string'}, 'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..', 'default': '.'}}, ['query'])
-    def _tool_search_files(self, name, args, approve, call):
-        result = {"matches": self.sandbox.search_files(
-            str(args["query"]), str(args.get("path", ".")))[:500]}
-        return result
 
-    @tool('search_text', 'Return matching lines with file names and line numbers.',
-          {'query': {'type': 'string'}, 'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..', 'default': '.'}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 500, 'default': 100}}, ['query'])
-    def _tool_search_text(self, name, args, approve, call):
-        limit = max(1, min(int(args.get("limit", 100)), 500))
-        result = {"matches": self.sandbox.search_text(
-            str(args["query"]), str(args.get("path", ".")), limit)}
-        return result
 
-    @tool('list_granted_folders', 'List folders outside the workspace that the user has granted Aura permission to read. Aura cannot grant itself access; only the user can, from the Permissions panel.',
-          {}, [])
-    def _tool_list_granted_folders(self, name, args, approve, call):
-        result = {"folders": [
-            {"path": grant["root"], "mode": grant["mode"],
-             "project": grant.get("project")}
-            for grant in self.permissions.active()
-            if grant.get("capability") == "read_folder"]}
-        return result
 
-    @tool('list_external_folder', 'List files inside a folder the user has already granted. Fails if there is no active permission for that folder.',
-          {'path': {'type': 'string'}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 500, 'default': 200}}, ['path'])
-    def _tool_list_external_folder(self, name, args, approve, call):
-        result = {"path": str(args["path"]),
-                  "files": self.external.list_files(
-                      str(args["path"]), limit=int(args.get("limit", 200)))}
-        return result
 
-    @tool('read_external_file', "Read a UTF-8 text file inside a folder the user has already granted. Fails if there is no active permission for that file's folder.",
-          {'path': {'type': 'string'}}, ['path'])
-    def _tool_read_external_file(self, name, args, approve, call):
-        result = {"path": str(args["path"]),
-                  "content": self.external.read_file(str(args["path"]))}
-        return result
 
-    @tool('write_external_file', 'Write a UTF-8 text file inside a folder the user granted for writing. The previous version is saved first, so the change can be undone. A read grant is not enough; writing needs its own permission.',
-          {'path': {'type': 'string'}, 'content': {'type': 'string'}}, ['path', 'content'], mutating=True)
-    def _tool_write_external_file(self, name, args, approve, call):
-        result = self.external_writer.write_file(
-            str(args["path"]), str(args["content"]),
-            task_id=self.current_task_id)
-        return result
 
-    @tool('undo_external_change', "Undo Aura's most recent write outside the workspace, restoring the previous version or removing a file it created.",
-          {}, [])
-    def _tool_undo_external_change(self, name, args, approve, call):
-        result = self.external_writer.undo_last()
-        return result
 
-    @tool('check_accessibility', 'Report accessibility problems in workspace HTML: images without alt text, form controls without labels, empty links or buttons, a missing lang or title, and skipped heading levels. Structural checks only — it does not evaluate colour contrast.',
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..', 'default': '.'}}, [])
-    def _tool_check_accessibility(self, name, args, approve, call):
-        result = check_accessibility(self.sandbox, str(args.get("path", ".")))
-        return result
 
-    @tool('compare_images', 'Measure exactly how two workspace PNG images differ: percentage of changed pixels and the region that changed. Use it to check a render against a reference or to detect a layout regression between two screenshots. This is a real pixel measurement, not an impression.',
-          {'first': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'second': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'tolerance': {'type': 'integer', 'minimum': 0, 'maximum': 128, 'default': 8}}, ['first', 'second'])
-    def _tool_compare_images(self, name, args, approve, call):
-        result = compare_images(
-            self.sandbox.path(str(args["first"])),
-            self.sandbox.path(str(args["second"])),
-            tolerance=int(args.get("tolerance", 8)))
-        return result
 
-    @tool('capture_page', "Render a workspace HTML page in a local headless browser and save a PNG screenshot of it into the workspace. Use this to see how a page actually looks, then call look_at_image on the saved screenshot. Needs the user's approval because it launches a browser.",
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'width': {'type': 'integer', 'minimum': 320, 'maximum': 2560, 'default': 1200}, 'height': {'type': 'integer', 'minimum': 240, 'maximum': 2000, 'default': 800}}, ['path'])
-    def _tool_capture_page(self, name, args, approve, call):
-        result = self._capture_page(
-            str(args["path"]), approve,
-            int(args.get("width", 1200)), int(args.get("height", 800)))
-        # The wrapper reads "ok" straight from the result now.
-        result["ok"] = bool(result.get("approved"))
-        return result
 
-    @tool('look_at_image', 'Actually look at a workspace image (PNG/JPEG/GIF/WebP/BMP). The image is attached to the conversation so you can describe or compare what it shows. Call this whenever the user asks what an image contains or looks like — listing or reading the file cannot answer that, because its pixels are only visible through this tool.',
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['path'])
-    def _tool_look_at_image(self, name, args, approve, call):
-        if not self.vision_enabled():
-            raise ValueError(
-                "The loaded model does not accept images. Turn vision on in "
-                "Settings if you know it does.")
-        result = self._read_image_attachment(str(args["path"]))
-        return result
 
-    @tool('find_relevant_files', 'Rank workspace files by relevance to a described topic or question. Use this when you do not know the exact wording to search for; use search_files or search_text when you need an exact string. Matches words, not synonyms.',
-          {'query': {'type': 'string'}, 'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..', 'default': '.'}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 50, 'default': 10}}, ['query'])
-    def _tool_find_relevant_files(self, name, args, approve, call):
-        result = {"matches": self.index.search(
-            str(args["query"]), int(args.get("limit", 10)),
-            str(args.get("path", ".")))}
-        return result
 
-    @tool('copy_file', 'Copy a workspace file.',
-          {'source': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'destination': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['source', 'destination'], mutating=True)
-    def _tool_copy_file(self, name, args, approve, call):
-        target = self.sandbox.copy_file(str(args["source"]), str(args["destination"]))
-        result = {"path": target.relative_to(self.sandbox.root).as_posix()}
-        return result
 
-    @tool('move_file', 'Move or rename a workspace file.',
-          {'source': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'destination': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['source', 'destination'], mutating=True)
-    def _tool_move_file(self, name, args, approve, call):
-        target = self.sandbox.move_file(str(args["source"]), str(args["destination"]))
-        result = {"path": target.relative_to(self.sandbox.root).as_posix()}
-        return result
 
-    @tool('safe_delete_file', "Move a file into Aura's recoverable trash.",
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['path'], mutating=True)
-    def _tool_safe_delete_file(self, name, args, approve, call):
-        target = self.sandbox.safe_delete_file(str(args["path"]))
-        result = {"trashed_as": target.name, "recoverable": True}
-        return result
 
-    @tool('undo_last_change', "Undo Aura's most recent file mutation using its protected snapshot history.",
-          {}, [])
-    def _tool_undo_last_change(self, name, args, approve, call):
-        result = self.sandbox.undo_last_change()
-        return result
 
-    @tool('rollback_task', 'Undo every still-active file mutation belonging to a specific Aura task ID.',
-          {'task_id': {'type': 'string'}}, ['task_id'])
-    def _tool_rollback_task(self, name, args, approve, call):
-        result = self.sandbox.rollback_task(str(args["task_id"]))
-        return result
 
-    @tool('change_history', 'List recent recoverable workspace mutations and whether they were undone.',
-          {'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100, 'default': 20}}, [])
-    def _tool_change_history(self, name, args, approve, call):
-        result = {"changes": self.sandbox.change_history(int(args.get("limit", 20)))}
-        return result
 
-    @tool('workspace_summary', 'Summarize workspace file count, size, extensions, and largest files.',
-          {}, [])
-    def _tool_workspace_summary(self, name, args, approve, call):
-        files = self.sandbox.list_files()
-        sizes = []
-        extensions: dict[str, int] = {}
-        for relative in files:
-            target = self.sandbox.path(relative)
-            size = target.stat().st_size
-            sizes.append((relative, size))
-            extension = target.suffix.casefold() or "(none)"
-            extensions[extension] = extensions.get(extension, 0) + 1
-        result = {"file_count": len(files), "total_bytes": sum(size for _, size in sizes),
-                  "extensions": dict(sorted(extensions.items())),
-                  "largest_files": [{"path": path, "bytes": size}
-                                    for path, size in sorted(sizes, key=lambda item: item[1], reverse=True)[:10]]}
-        return result
 
-    @tool('inspect_code', 'Outline symbols, imports, and structure in a Python, JavaScript, or TypeScript file without executing it.',
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['path'])
-    def _tool_inspect_code(self, name, args, approve, call):
-        result = self._inspect_code(str(args["path"]))
-        return result
 
-    @tool('compare_files', 'Produce a bounded unified diff between two UTF-8 workspace files.',
-          {'left': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'right': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'context_lines': {'type': 'integer', 'minimum': 0, 'maximum': 20, 'default': 3}}, ['left', 'right'])
-    def _tool_compare_files(self, name, args, approve, call):
-        left, right = str(args["left"]), str(args["right"])
-        context = max(0, min(int(args.get("context_lines", 3)), 20))
-        result = self.sandbox.compare_files(left, right, context)
-        return result
 
-    @tool('calculate', 'Evaluate arithmetic and common math functions locally without running code.',
-          {'expression': {'type': 'string'}}, ['expression'])
-    def _tool_calculate(self, name, args, approve, call):
-        expression = str(args["expression"])
-        result = {"expression": expression, "result": self._calculate(expression)}
-        return result
 
-    @tool('system_info', 'Inspect non-sensitive local runtime facts such as OS, Python, CPU count, and workspace disk space.',
-          {}, [])
-    def _tool_system_info(self, name, args, approve, call):
-        disk = shutil.disk_usage(self.sandbox.root)
-        result = {"os": platform.platform(), "python": platform.python_version(),
-                  "architecture": platform.machine(), "cpu_count": os.cpu_count(),
-                  "workspace": str(self.sandbox.root),
-                  "workspace_disk": {"total": disk.total, "used": disk.used, "free": disk.free}}
-        return result
 
-    @tool('validate_project', 'Safely validate every project file, including Python, JSON, TOML, HTML, CSS, JavaScript/TypeScript, XML, and UTF-8 text, without executing project code.',
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..', 'default': '.'}}, [])
-    def _tool_validate_project(self, name, args, approve, call):
-        result = self._validate_project(str(args.get("path", ".")))
-        return result
 
-    @tool('run_command', 'Run an actual program, test, build, or project runtime inside the workspace. Commands use a direct argument array with no shell. Never use this for file/folder operations; create_file and write_file create parent folders. Use python for Python; unsafe commands require approval.',
-          {'command': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1}, 'timeout': {'type': 'number', 'minimum': 1, 'maximum': 60, 'default': 15}}, ['command'])
-    def _tool_run_command(self, name, args, approve, call):
-        command = args["command"]
-        if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
-            raise ValueError("command must be an array of strings")
-        timeout = max(1.0, min(float(args.get("timeout", 15)), 60.0))
-        run = self.commands.run(
-            command, approve=approve, timeout=timeout,
-            autonomy=str(self.config.data.get("autonomy_mode", "balanced")),
-        )
-        result = {"approved": run.approved, "returncode": run.returncode,
-                  "stdout": run.stdout[-20_000:], "stderr": run.stderr[-20_000:],
-                  "timed_out": run.timed_out, "blocked": run.blocked}
-        result["ok"] = run.succeeded
-        if not run.succeeded:
-            if run.blocked:
-                reason = run.stderr or "Command is blocked by Aura's workspace policy."
-            elif not run.approved:
-                reason = "Command was not approved."
-            elif run.timed_out:
-                reason = "Command timed out."
-            elif run.returncode is None:
-                reason = run.stderr or "Command could not be started."
-            else:
-                reason = run.stderr.strip() or f"Command exited with code {run.returncode}."
-            result["error"] = reason
-        return result
 
-    @tool('http_get', 'Fetch a bounded HTTP(S) text response. Localhost is direct; any other domain must already be granted by the user under Permissions, and cannot be requested from here.',
-          {'url': {'type': 'string'}, 'timeout': {'type': 'number', 'minimum': 1, 'maximum': 20, 'default': 10}}, ['url'])
-    def _tool_http_get(self, name, args, approve, call):
-        result = self._http_get(str(args["url"]),
-                                max(1.0, min(float(args.get("timeout", 10)), 20.0)))
-        return result
 
-    @tool('search_web',
-          'Search the web through the SearXNG instance the user runs on this machine. '
-          'Returns titles, links, and the snippet the engine already produced. It returns '
-          'snippets only and never opens the result pages, so never describe what a linked '
-          'page says as if you had read it — say the snippet said it. Refuses, with a reason, '
-          'when the user has no search service configured or running.',
-          {'query': {'type': 'string'},
-           'count': {'type': 'integer', 'minimum': 1, 'maximum': 8, 'default': 5}}, ['query'])
-    def _tool_search_web(self, name, args, approve, call):
-        return self._search_web(str(args["query"]), int(args.get("count", 5)))
 
-    @tool('open_workspace_item', 'Open a workspace file or folder in its normal desktop application after approval.',
-          {'path': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['path'])
-    def _tool_open_workspace_item(self, name, args, approve, call):
-        path = str(args["path"])
-        target = self.sandbox.path(path)
-        if not target.exists():
-            raise FileNotFoundError(path)
-        if not approve or not approve(["OPEN", path]):
-            raise PermissionError("Opening a desktop application was not approved")
-        os.startfile(target)  # type: ignore[attr-defined]
-        result = {"path": path, "opened": True}
-        return result
 
-    @tool('create_archive', 'Create a recoverable ZIP archive from a workspace file or folder.',
-          {'source': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'destination': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['source', 'destination'], mutating=True)
-    def _tool_create_archive(self, name, args, approve, call):
-        target = self.sandbox.create_archive(str(args["source"]), str(args["destination"]))
-        result = {"path": target.relative_to(self.sandbox.root).as_posix(),
-                  "bytes": target.stat().st_size}
-        return result
 
-    @tool('extract_archive', 'Safely extract a workspace ZIP with traversal, link, file-count, and size protection.',
-          {'archive': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}, 'destination': {'type': 'string', 'description': 'Workspace-relative path; never absolute and never use ..'}}, ['archive', 'destination'], mutating=True)
-    def _tool_extract_archive(self, name, args, approve, call):
-        extracted = self.sandbox.extract_archive(str(args["archive"]), str(args["destination"]))
-        result = {"files": [path.relative_to(self.sandbox.root).as_posix() for path in extracted],
-                  "count": len(extracted)}
-        return result
 
-    @tool('self_check',
-          'Check whether everything Aura depends on is working: the model server, the '
-          'loaded model, images, the workspace, storage, speech, voice input, and search. '
-          'Read-only. Use it when the user asks whether something is broken.',
-          {}, [])
-    def _tool_self_check(self, name, args, approve, call):
-        from . import health
-        return health.run(self)
 
-    @tool('capability_summary', "List Aura's currently available tools and autonomy policy.",
-          {}, [])
-    def _tool_capability_summary(self, name, args, approve, call):
-        result = {"tools": [item["function"]["name"] for item in self.tool_definitions()],
-                  "tool_count": len(self.tool_definitions()),
-                  "reasoning_depth": self.config.data.get("reasoning_depth"),
-                  "autonomy_mode": self.config.data.get("autonomy_mode"),
-                  "workspace_only": True,
-                  "approval_policy": "Safe local tools are automatic; executable code, external HTTP, and desktop launches ask first."}
-        return result
 
-    @tool('remember_name', "Remember the user's preferred name.",
-          {'name': {'type': 'string'}}, ['name'])
-    def _tool_remember_name(self, name, args, approve, call):
-        self.memory.set_name(str(args["name"]))
-        result = {"remembered": True}
-        return result
 
-    @tool('remember_preference', 'Remember one durable user preference.',
-          {'key': {'type': 'string'}, 'value': {'type': 'string'}}, ['key', 'value'])
-    def _tool_remember_preference(self, name, args, approve, call):
-        self.memory.set_preference(str(args["key"]), str(args["value"]))
-        result = {"remembered": True}
-        return result
 
-    @tool('remember_personal_fact', 'Remember one clear, non-sensitive fact the user explicitly stated about their preferences, interests, goals, projects, tools, or working style.',
-          {'category': {'type': 'string', 'enum': ['goal', 'interest', 'personal', 'preference', 'project', 'tool', 'work_style']}, 'value': {'type': 'string'}}, ['category', 'value'])
-    def _tool_remember_personal_fact(self, name, args, approve, call):
-        item = self.memory.learn_fact(
-            str(args["category"]), str(args["value"]),
-            source="Explicitly remembered through Aura chat", confidence=1.0, explicit=True,
-        )
-        result = {"remembered": True, "memory": item}
-        return result
 
-    @tool('list_personal_memory', 'Review the editable personal facts Aura currently remembers about the user.',
-          {'query': {'type': 'string', 'default': ''}}, [])
-    def _tool_list_personal_memory(self, name, args, approve, call):
-        query = str(args.get("query", "")).strip()
-        memories = (self.memory.find_profile_memories(query) if query
-                    else self.memory.profile_memories())
-        result = {"memories": memories[:100], "count": len(memories)}
-        return result
 
-    @tool('forget_personal_fact', "Forget one personal memory matching the user's description. Ambiguous matches are returned without deleting anything.",
-          {'query': {'type': 'string'}}, ['query'])
-    def _tool_forget_personal_fact(self, name, args, approve, call):
-        query = str(args["query"])
-        matches = self.memory.find_profile_memories(query)
-        if not matches:
-            raise FileNotFoundError("No personal memory matches that description")
-        if len(matches) != 1:
-            choices = "; ".join(str(item.get("value", "")) for item in matches[:5])
-            raise ValueError(f"Memory description is ambiguous; matching facts: {choices}")
-        removed = self.memory.forget_profile_memory(str(matches[0]["id"]))
-        result = {"forgotten": True, "memory": removed}
-        return result
 
-    @tool('correct_personal_fact', 'Correct one unambiguous personal memory and mark the corrected value as user-confirmed.',
-          {'query': {'type': 'string'}, 'new_value': {'type': 'string'}, 'category': {'type': 'string', 'enum': ['goal', 'interest', 'personal', 'preference', 'project', 'tool', 'work_style']}}, ['query', 'new_value'])
-    def _tool_correct_personal_fact(self, name, args, approve, call):
-        query = str(args["query"])
-        matches = self.memory.find_profile_memories(query)
-        if not matches:
-            raise FileNotFoundError("No personal memory matches that description")
-        if len(matches) != 1:
-            choices = "; ".join(str(item.get("value", "")) for item in matches[:5])
-            raise ValueError(f"Memory description is ambiguous; matching facts: {choices}")
-        updated = self.memory.update_profile_memory(
-            str(matches[0]["id"]), value=str(args["new_value"]),
-            category=str(args.get("category") or matches[0].get("category", "personal")),
-        )
-        result = {"corrected": True, "memory": updated}
-        return result
 
-    @tool('recent_tasks', "Review Aura's recent persistent task outcomes and tools used.",
-          {'limit': {'type': 'integer', 'minimum': 1, 'maximum': 20, 'default': 5}}, [])
-    def _tool_recent_tasks(self, name, args, approve, call):
-        result = {"tasks": self.tasks.recent(max(1, min(int(args.get("limit", 5)), 20)))}
-        return result
 
-    @tool('set_check',
-          "Watch something in the workspace on a schedule and speak only when there is "
-          "something worth saying. Read-only: a check never changes anything.",
-          {'check': {'type': 'string', 'enum': checks.names(),
-                     'description': 'Which check to run'},
-           'every_minutes': {'type': 'integer', 'minimum': 15, 'maximum': 20160,
-                             'description': 'How often, at least every 15 minutes'}},
-          ['check', 'every_minutes'])
-    def _tool_set_check(self, name, args, approve, call):
-        wanted = str(args.get("check", "")).strip()
-        if checks.get(wanted) is None:
-            raise ValueError(f"unknown check {wanted!r}; choose one of {', '.join(checks.names())}")
-        every = max(15, min(int(args.get("every_minutes", 1440)), 20160))
-        existing = [task for task in self.db.scheduled_tasks(include_disabled=False)
-                    if task.get("kind") == "check" and task.get("request") == wanted]
-        if existing:
-            return {"check": wanted, "already_scheduled": True,
-                    "next_run": existing[0]["next_run"]}
-        due = datetime.now(timezone.utc) + timedelta(minutes=every)
-        task = self.db.add_scheduled("check", wanted, every_minutes=every,
-                                     next_run=due.isoformat())
-        return {"check": wanted, "every_minutes": every, "next_run": task["next_run"]}
 
     #: A reminder only ever shows a message, so the model may set one. It may
     #: not schedule anything else: this tool hard-codes the kind, so nothing it
     #: writes can become background work that acts.
     MAX_ACTIVE_REMINDERS = 20
 
-    @tool('set_reminder',
-          "Remind the user about something later. Give the delay in minutes from now — "
-          "convert 'tomorrow morning' or 'in an hour' yourself. A reminder only shows a "
-          "message; it cannot change anything, and it waits for quiet hours.",
-          {'text': {'type': 'string', 'description': 'What to remind the user about'},
-           'in_minutes': {'type': 'integer', 'minimum': 1, 'maximum': 20160,
-                          'description': 'Delay from now, up to two weeks'},
-           'repeat_minutes': {'type': 'integer', 'minimum': 5, 'maximum': 20160,
-                              'description': 'Optional: repeat every N minutes'}},
-          ['text', 'in_minutes'])
-    def _tool_set_reminder(self, name, args, approve, call):
-        text = str(args.get("text", "")).strip()
-        if not text:
-            raise ValueError("a reminder needs something to say")
-        active = [task for task in self.db.scheduled_tasks(include_disabled=False)
-                  if task.get("kind") == "reminder"]
-        if len(active) >= self.MAX_ACTIVE_REMINDERS:
-            raise ValueError(
-                f"there are already {len(active)} reminders waiting; cancel one first")
-        delay = max(1, min(int(args.get("in_minutes", 60)), 20160))
-        repeat = int(args.get("repeat_minutes") or 0)
-        due = datetime.now(timezone.utc) + timedelta(minutes=delay)
-        task = self.db.add_scheduled("reminder", text[:400], every_minutes=repeat,
-                                     next_run=due.isoformat())
-        return {"reminder": text[:400], "due": task["next_run"],
-                "in_minutes": delay, "repeats_every_minutes": repeat or None}
 
 
     def _execute_tool(self, call: ToolCall, approve: Callable[[list[str]], bool] | None) -> dict:
@@ -1941,9 +2522,14 @@ class AuraAgent:
             self._report_tool(name, args, True)
             return payload
         except Exception as exc:
-            self.log.record(name, "error", tool_call=call.id, error=str(exc))
+            # The model is told what to do next, not what Python called it. The
+            # log keeps the raw text as well, because the sentence that helps a
+            # model act is not always the one that helps Mat debug.
+            explained = tool_errors.explain(exc, name, args, self.sandbox.root)
+            self.log.record(name, "error", tool_call=call.id, error=explained,
+                            raw_error=str(exc) if explained != str(exc) else None)
             self._report_tool(name, args, False)
-            payload = {"ok": False, "error": str(exc)}
+            payload = {"ok": False, "error": explained}
             if self.current_task_id:
                 safe_args = {k: v for k, v in args.items()
                              if k not in {"content", "old_text", "new_text", "edits"}}
@@ -2114,10 +2700,10 @@ class AuraAgent:
             host = parsed.hostname.casefold()
             is_loopback = host in {"localhost", "127.0.0.1", "::1"}
             if not is_loopback:
-                # A domain grant, never a dialog: asking mid-task is how a model
-                # talks its way outward, and the folder capabilities already
-                # settled that permission is something the user gives up front.
-                self.permissions.check("reach_domain", current, consume=False)
+                # No allowlist any more — Mat removed it, having decided that
+                # granting each site by hand cost more than it protected. What
+                # stays is the address check below, which is a different thing:
+                # it refuses a public name that resolves onto his own network.
                 try:
                     # Re-resolved on every hop, because a name that was public
                     # when granted can point at the local network later.
@@ -2153,7 +2739,35 @@ class AuraAgent:
         raise RuntimeError("HTTP request exceeded five redirects")
 
     def _validate_project(self, relative: str = ".") -> dict:
-        return validate_project(self.sandbox, relative)
+        """Syntax, and whether the pages can actually find what they reference.
+
+        Mat opened a finished landing page and got Times New Roman on white — no
+        styling at all — while Aura reported "validation passed, 0 issues" and
+        "projekt on valmis kasutamiseks". Every stylesheet link was written
+        absolute (`/css/style.css`) against files that live in `shop/css/`, so the
+        markup parsed perfectly and resolved to nothing.
+
+        A page whose own stylesheet does not load is broken, whatever the parser
+        says. `check_broken_assets` already knew this and was never asked.
+        """
+        result = validate_project(self.sandbox, relative)
+        try:
+            assets = check_broken_assets(self.sandbox, relative)
+        except (OSError, ValueError):
+            return result       # never let the extra check break the ordinary one
+        broken = assets.get("broken") or []
+        if not broken:
+            return result
+        issues = list(result.get("issues") or [])
+        for item in broken[:20]:
+            issues.append({
+                "file": item.get("file", ""),
+                "error": (f"references {item.get('reference')!r}, which does not "
+                          f"exist — a leading '/' makes a path absolute, so it looks "
+                          f"outside the project"),
+            })
+        return {**result, "valid": False, "issues": issues,
+                "broken_references": len(broken)}
 
     def build_hello_world(self, approve: Callable[[list[str]], bool] | None,
                           state: Callable[[str], None]) -> str:

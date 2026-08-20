@@ -78,6 +78,12 @@ class WorkspaceBridge:
                 # and the iframe sandbox.
                 result["url"] = "/workspace-preview/" + quote(path, safe="/")
                 result["scripts_enabled"] = False
+                # Whether the page *needs* scripts decides how loudly the panel
+                # says they are off. A blank preview of a page that builds its
+                # own content is indistinguishable from a broken page, and Mat
+                # read one as the other: the shop rendered only its heading here
+                # while the real site rendered every product.
+                result["scripts_present"] = "<script" in content.casefold()
             return result
         except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError, OSError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}

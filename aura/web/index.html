@@ -32,7 +32,7 @@
            doing belongs next to her face; what she is allowed to do belongs in
            the menu with the rest of the settings. -->
       <div id="statusLine" class="status-line" role="status">Local • private • calm</div>
-      <div id="providerLabel" class="provider-label">LM Studio • checking…</div>
+      <div id="providerLabel" class="provider-label">Checking the model…</div>
 
       <nav class="side-actions" aria-label="Aura controls">
         <button id="voiceButton" class="side-button" aria-pressed="false" aria-describedby="voiceHint" title="Click to talk, or hold while speaking"><span class="button-icon">◉</span> <span id="voiceButtonLabel">Voice</span> <span class="voice-wave" aria-hidden="true"><i></i><i></i><i></i></span></button>
@@ -56,6 +56,7 @@
         <button id="settingsButton" class="menu-item" role="menuitem"><span class="button-icon">⚙</span> Settings</button>
         <button id="workspaceButton" class="menu-item" role="menuitem"><span class="button-icon">↗</span> Open workspace folder</button>
         <button id="watchButton" class="menu-item" role="menuitem"><span class="button-icon">◷</span> What Aura watches</button>
+        <button id="openProgress" type="button" title="Open a window that shows whether Aura is still working">Progress window</button>
         <button id="toggleLogButton" class="menu-item" role="menuitem"><span class="button-icon">▤</span> <span id="toggleLogLabel">Show action log</span></button>
         <div class="menu-separator" role="separator"></div>
         <div class="menu-status">
@@ -128,11 +129,23 @@
         <div><strong>Aura Mind</strong><span id="mindSummary">living local map</span></div>
         <div class="mind-tools">
           <label>Find <input id="mindSearch" type="search" placeholder="Search the map"></label>
-          <button id="mindFit">Fit</button><button id="mindReset">Reset</button><button id="mindRefresh">Refresh</button>
+          <button id="mindFit">Fit</button><button id="mindReset" title="Put every node back where Aura would draw it, forgetting the ones you moved">Reset</button><button id="mindRefresh">Refresh</button>
           <button id="mindClose" class="mind-close" aria-label="Close Aura Mind">×</button>
         </div>
       </header>
       <canvas id="mindCanvas" tabindex="0" aria-label="Interactive Aura Mind knowledge map">Aura Mind requires a browser with Canvas support.</canvas>
+      <div id="mindCard" class="mind-card hidden" role="dialog" aria-labelledby="mindCardTitle" aria-modal="false">
+        <header class="mind-card-head">
+          <div><h3 id="mindCardTitle"></h3><span id="mindCardKind" class="mind-card-kind"></span></div>
+          <button id="mindCardClose" class="mind-card-close" aria-label="Close this card">×</button>
+        </header>
+        <div id="mindCardBody" class="mind-card-body"></div>
+        <div id="mindCardEdit" class="mind-card-edit hidden">
+          <label>What Aura remembers<textarea id="mindCardText" rows="4" maxlength="600"></textarea></label>
+          <label>Project<input id="mindCardProject" type="text" maxlength="80" placeholder="none — type a name to link it"></label>
+        </div>
+        <footer id="mindCardActions" class="mind-card-actions"></footer>
+      </div>
       <footer class="mind-footer">
         <div id="mindLegend" class="mind-legend" role="group" aria-label="Map layers — select one to show or hide it"></div>
         <div class="mind-detail-row"><div id="mindDetail">Select a node to see what Aura knows about it.</div><div id="mindActions" class="mind-actions hidden"><label id="mindProjectField" class="mind-project hidden">Project<input id="mindProject" type="text" maxlength="80" placeholder="none — type a name to link it"></label><button id="mindProjectSave" class="hidden">Link</button><button id="mindAsk">Ask Aura</button><button id="mindOpen">Open</button></div></div>
@@ -202,7 +215,7 @@
 
       <section class="welcome-step" data-step="1">
         <p>Aura is a companion that runs entirely on this computer. She answers using a model you run yourself in LM Studio, and she works inside one protected folder.</p>
-        <p class="welcome-note">Her workspace is <code id="welcomeWorkspace">…</code>. Everything she writes goes there, and everything she remembers stays on this machine. There is no account, no cloud service, and no API key.</p>
+        <p class="welcome-note">Her workspace is <code id="welcomeWorkspace">…</code>. Everything she writes goes there, and everything she remembers stays on this machine. There is no account and no API key — unless you deliberately choose a cloud model in Settings, and the status line says so for as long as you do.</p>
       </section>
 
       <section class="welcome-step hidden" data-step="2">
@@ -262,7 +275,7 @@
 
   <div id="permissionsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="permissionsTitle">
     <div class="modal-card memory-card">
-      <header><div><h2 id="permissionsTitle">Permissions</h2><p id="permissionsNote">Folders outside the workspace that Aura may read.</p></div><button class="modal-x" aria-label="Close" data-close="permissionsModal">×</button></header>
+      <header><div><h2 id="permissionsTitle">Permissions</h2><p id="permissionsNote">Folders outside the workspace that Aura may read. Web pages need no permission — she reads any public address, but never one that resolves onto this machine or your network.</p></div><button class="modal-x" aria-label="Close" data-close="permissionsModal">×</button></header>
       <form id="permissionGrant" class="memory-teach">
         <select id="permissionAccess" aria-label="Access level">
           <option value="read">Read only</option>
@@ -276,16 +289,6 @@
         <input id="permissionPath" placeholder="Full path to a folder Aura may use" aria-label="Folder path">
         <button class="primary-button" type="submit">Grant</button>
       </form>
-      <form id="domainGrant" class="memory-teach">
-        <select id="domainMode" aria-label="Domain grant duration">
-          <option value="session">This session</option>
-          <option value="once">Once</option>
-          <option value="persistent">Until revoked</option>
-        </select>
-        <input id="domainName" placeholder="Domain Aura may read, e.g. api.open-meteo.com" aria-label="Domain name">
-        <button class="primary-button" type="submit">Allow domain</button>
-      </form>
-      <p id="domainSuggestions" class="permission-hint"></p>
       <div id="permissionList" class="memory-list"></div>
       <footer><span>Aura cannot grant itself access. Nothing outside the workspace is readable by default.</span><button id="permissionRevokeAll" type="button" class="danger">Revoke all</button><button class="primary-button" data-close="permissionsModal">Done</button></footer>
     </div>
@@ -295,18 +298,83 @@
     <div class="modal-card settings-card">
       <header><div><h2 id="settingsTitle">Aura settings</h2><p>Stored locally on this computer.</p></div><button class="modal-x" aria-label="Close" data-close="settingsModal">×</button></header>
       <div class="settings-grid">
+        <div class="settings-section wide"><strong>Project rules</strong><span>Corrections that apply inside one project, every turn, whatever else is going on.</span></div>
+        <div class="wide role-block">
+          <label class="model-field">Rules for a project<select id="lessonProject"></select></label>
+          <label class="wide">
+            <div class="lesson-row">
+              <input id="lessonText" type="text" maxlength="300"
+                     placeholder="e.g. asset paths must be relative, never start with a slash">
+              <button id="addLesson" type="button">Add rule</button>
+            </div>
+          </label>
+          <ul id="lessonList" class="lesson-list"></ul>
+          <p class="cloud-note">Rules reach every turn in that project. Aura can add them
+            herself when you correct her — but she often does not notice, so this is where
+            you make one stick.</p>
+          <p class="cloud-note">Applies only inside that project, and only while it is the
+            one in play. It changes what she prioritises and how she writes — never what
+            needs your approval.</p>
+        </div>
+        <div class="settings-section wide"><strong>Model</strong><span>Which model answers, and where it runs. Everything stays on this computer unless you choose otherwise here.</span></div>
+        <label class="wide">Where the model runs<select id="settingProvider">
+          <option value="local">On this computer (LM Studio)</option>
+          <option value="claude">Claude, through Anthropic's API</option>
+          <option value="openai">GPT, through OpenAI's API</option>
+        </select></label>
+        <div id="openaiFields" class="wide cloud-fields hidden">
+          <label>Address<input id="settingOpenaiUrl" type="url"
+                              placeholder="leave empty for https://api.openai.com/v1"></label>
+          <label class="model-field">GPT model<input id="settingOpenaiModel" type="text"
+                              list="openaiModels" placeholder="leave empty to pick automatically">
+            <button id="refreshOpenaiModels" type="button">Refresh models</button></label>
+          <datalist id="openaiModels"></datalist>
+          <label class="model-field">API key<input id="settingOpenaiKey" type="password"
+                              autocomplete="off" placeholder="sk-…">
+            <button id="forgetCloudKeyB" type="button">Forget stored key</button></label>
+          <p class="cloud-note">Same trade as Claude: your conversation, any memories Aura
+            may send, and the contents of files her tools read are sent to whoever is at that
+            address. This one needs no extra package — Aura already speaks OpenAI's protocol,
+            and so do a good many other services, which is why the address is a field. Point
+            it at a model server on this computer and the status line goes back to saying
+            local, because it will be.</p>
+        </div>
+        <div id="cloudFields" class="wide cloud-fields hidden">
+          <label>Claude model<select id="settingCloudModel">
+            <option value="claude-opus-5">Claude Opus 5</option>
+            <option value="claude-sonnet-5">Claude Sonnet 5</option>
+            <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
+          </select></label>
+          <label class="model-field">API key<input id="settingCloudKey" type="password"
+                              autocomplete="off" placeholder="sk-ant-…">
+            <button id="forgetCloudKey" type="button">Forget stored key</button></label>
+          <p class="cloud-note">Your conversation, any memories Aura may send, and the
+            contents of files her tools read are sent to Anthropic. Nothing leaves this
+            computer while the model runs locally. Needs
+            <code>pip install -r requirements-cloud.txt</code>.</p>
+        </div>
         <label class="wide">LM Studio URL<input id="settingUrl" type="url"></label>
         <label class="wide model-field">Model<select id="settingModel"></select><button id="refreshModels" type="button">Refresh models</button></label>
-        <label>Timeout (seconds)<input id="settingTimeout" type="number" min="5" max="900"></label>
-        <label>Temperature<input id="settingTemperature" type="number" min="0" max="2" step="0.1"></label>
-        <label>Maximum tokens<input id="settingTokens" type="number" min="256" max="32768"></label>
+        <label>Timeout (seconds)<input id="settingTimeout" type="number" min="5" max="1800"></label>
+        <div class="settings-section wide"><strong>Sampling</strong><span>Chatting, thinking, and writing code want different settings. Measured on this machine: the difference is in wording and variety, not in reliability — tool calls came back correct at every setting tried.</span></div>
+        <div class="sampling-profiles" id="samplingProfiles">
+          <p class="field-note">gpt-oss's own documentation asks for 1.0 throughout. If tool calls start arriving malformed or the thinking begins to loop, raise these rather than lower them.</p>
+          <label>Chatting — temperature<input id="settingTempChat" type="number" min="0" max="2" step="0.1"></label>
+          <label>Chatting — tokens<input id="settingTokensChat" type="number" min="256" max="65536"></label>
+          <label>Working — temperature<input id="settingTempWork" type="number" min="0" max="2" step="0.1"></label>
+          <label>Working — tokens<input id="settingTokensWork" type="number" min="256" max="65536"></label>
+          <label>Coding — temperature<input id="settingTempCode" type="number" min="0" max="2" step="0.1"></label>
+          <label>Coding — tokens<input id="settingTokensCode" type="number" min="256" max="65536"></label>
+          <label class="always-on" title="Leave blank to keep whatever the model was loaded with in LM Studio.">top_p<input id="settingTopP" type="number" min="0" max="1" step="0.05" placeholder="LM Studio decides"></label>
+          <label class="always-on" title="Leave blank to keep whatever the model was loaded with in LM Studio.">top_k<input id="settingTopK" type="number" min="0" max="500" step="1" placeholder="LM Studio decides"></label>
+        </div>
+        <div class="settings-section wide"><strong>How she works</strong><span>How long she may take, how hard she thinks, and how much she may do without asking.</span></div>
+        <label title="How long one answer may take before Aura stops and tells you where it got to. 0 means no limit.">Time limit per answer (seconds)<input id="settingTurnBudget" type="number" min="0" max="3600" step="30"></label>
         <label>Thinking depth<select id="settingReasoning"><option value="fast">Fast</option><option value="balanced">Balanced</option><option value="deep">Deep</option></select></label>
         <label>Autonomy<select id="settingAutonomy"><option value="careful">Careful</option><option value="balanced">Balanced</option><option value="powerful">Powerful</option></select></label>
         <label>Images<select id="settingVision"><option value="auto">Automatic (guess from model name)</option><option value="on">Always send images</option><option value="off">Never send images</option></select></label>
         <div class="power-note wide"><strong>Powerful mode</strong><span>Gives Aura the broad tool catalog and longer multi-step runs. File changes remain recoverable; executable code, external network requests, and desktop launches still ask first.</span></div>
         <label class="toggle-row wide"><input id="settingLearning" type="checkbox"><span>Learn clear, non-sensitive things I state in conversation</span></label>
-        <label class="wide">Estonian voice<select id="settingVoiceEt"></select></label>
-        <div class="power-note wide"><strong>Two languages</strong><span id="speechLanguageNote">Aura answers in whichever language you write in and picks the matching voice for each reply. Leave the Estonian voice empty and Estonian is read by the English voice, which sounds wrong — that is a missing voice, not a fault.</span></div>
         <div class="settings-section wide"><strong>Search</strong><span>Aura holds no search keys and never reaches an engine directly. Point her at a SearXNG you run yourself and she reads its results — titles and snippets only, never opening the pages behind them. Leave empty to keep search off.</span></div>
         <label class="wide">SearXNG folder<input id="settingSearchInstallPath" type="text" maxlength="500" placeholder="C:\Users\you\searxng — the folder you installed it into"></label>
         <label>Search engine<select id="settingSearchMode"><option value="off">Off</option><option value="docker">Docker — Aura runs it (works on Windows)</option><option value="folder">Folder — Aura runs it from the folder above</option></select></label>
@@ -329,6 +397,8 @@
         <label>Speech engine<select id="settingSpeechEngine"><option value="piper">Piper neural</option><option value="sapi">Windows SAPI</option></select></label>
         <label>Neural voice<select id="settingSpeechModel"></select></label>
         <label class="wide model-field">SAPI fallback voice<select id="settingVoice"></select><button id="refreshVoices" type="button">Refresh voices</button></label>
+        <label class="wide">Estonian voice<select id="settingVoiceEt"></select></label>
+        <div class="power-note wide"><strong>Two languages</strong><span id="speechLanguageNote">Aura answers in whichever language you write in and picks the matching voice for each reply. Leave the Estonian voice empty and Estonian is read by the English voice, which sounds wrong — that is a missing voice, not a fault.</span></div>
         <label>Speech rate<input id="settingRate" type="range" min="-10" max="10"><output id="rateOutput"></output></label>
         <label>Speech volume<input id="settingVolume" type="range" min="0" max="100"><output id="volumeOutput"></output></label>
         <label class="toggle-row wide"><input id="settingSpeak" type="checkbox"><span>Speak Aura’s replies locally</span></label>

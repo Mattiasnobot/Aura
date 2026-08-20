@@ -11,6 +11,46 @@ DEFAULTS = {
     "timeout": 180.0,
     "temperature": 0.4,
     "max_tokens": 4096,
+    # Sampling per kind of turn rather than one setting for all three. The old
+    # single pair above stays as the fallback, and switching this off restores
+    # it exactly. See `sampling.py` for why code sits at 0.4 and not 0.2.
+    "sampling_by_task": True,
+    "temperature_chat": 0.9, "max_tokens_chat": 2048,
+    "temperature_work": 0.6, "max_tokens_work": 4096,
+    "temperature_code": 0.4, "max_tokens_code": 6144,
+    # Blank means LM Studio's loaded values stand, which is what Aura did
+    # before it could send these at all. One pair for every profile: the
+    # guides recommend one setting for these, not one per kind of turn.
+    "top_p": None, "top_k": None,
+    # Hand the model back its own thinking after a tool call. On a reasoning
+    # model that keeps three quarters of its work private, discarding it made
+    # every round start from nothing. Switchable because it costs prompt space.
+    "send_reasoning_back": True,
+    # How long one turn may run before Aura stops and reports what she has.
+    # Not the HTTP timeout: that ends a turn as a failure, this ends it as an
+    # answer. 0 removes the limit. Measured 90th percentile is 221s.
+    "turn_budget_seconds": 300,
+    # How much tool output one turn may put in front of the model, across every
+    # tool. Individual tools cap themselves; nothing capped the total, and every
+    # later round pays for the whole of it again. 0 removes the limit.
+    "turn_tool_characters": 120000,
+    # Local unless deliberately changed. "claude" reaches Anthropic's API and
+    # needs the optional `anthropic` package; see requirements-cloud.txt for
+    # what that sends off the machine.
+    "provider": "local",
+    "anthropic_api_key": "",
+    "cloud_model": "claude-opus-5",
+    # Deliberately not `max_tokens`: that one is tuned for a local 9B, and this
+    # model family spends the same budget on thinking before it answers.
+    "cloud_max_tokens": 16000,
+    "openai_api_key": "",
+    "openai_model": "",
+    # Empty means OpenAI itself. Any other OpenAI-compatible service goes here,
+    # which is the whole of what it takes to reach one.
+    "openai_base_url": "",
+    # A role per project, by folder name. A role kept in a chat message competes
+    # with the system prompt every turn and dies with the conversation; kept
+    # here it applies to the project it belongs to and to nothing else.
     "reasoning_depth": "deep",
     "autonomy_mode": "powerful",
     "learn_from_conversations": True,

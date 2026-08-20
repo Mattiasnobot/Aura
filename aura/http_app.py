@@ -23,7 +23,9 @@ MAX_PREVIEW_ASSET_BYTES = 5_000_000
 PREVIEW_PREFIX = "/workspace-preview/"
 API_METHODS = {
     "get_bootstrap", "poll_events", "submit", "stop", "resolve_approval",
-    "check_provider", "get_settings", "save_settings", "get_models", "get_voices",
+    "check_provider", "get_settings", "save_settings", "forget_cloud_key",
+    "get_models", "get_openai_models", "get_voices",
+    "get_project_lessons", "add_project_lesson", "forget_project_lesson",
     "complete_onboarding", "restart_onboarding",
     "start_voice", "stop_voice", "get_microphones", "calibrate_voice", "preview_voice",
     "open_workspace", "recent_tasks", "rollback_task",
@@ -31,7 +33,7 @@ API_METHODS = {
     "open_workspace_item", "import_files", "get_personal_memory", "add_personal_memory",
     "update_personal_memory", "forget_personal_memory", "revert_personal_memory",
     "export_personal_memory", "export_diagnostics",
-    "list_permissions", "grant_folder_access", "grant_domain_access", "network_status",
+    "list_permissions", "grant_folder_access", "network_status",
     "autonomy_status", "pause_autonomy", "emergency_stop",
     "list_reminders", "cancel_reminder", "list_scheduled", "cancel_scheduled",
     "list_proposals", "approve_proposal", "dismiss_proposal", "set_check_enabled", "search_service_status", "self_check", "undo_session",
@@ -146,6 +148,11 @@ class AuraRequestHandler(BaseHTTPRequestHandler):
             "/styles.css": ("styles.css", "text/css; charset=utf-8", False),
             "/avatar-face.js": ("avatar-face.js", "text/javascript; charset=utf-8", False),
             "/app.js": ("app.js", "text/javascript; charset=utf-8", False),
+            # Served with its own session cookie so it works when opened in a
+            # window of its own, which is the only way it is useful.
+            "/progress.js": ("progress.js", "text/javascript; charset=utf-8", False),
+            "/progress": ("progress.html", "text/html; charset=utf-8", True),
+            "/progress.html": ("progress.html", "text/html; charset=utf-8", True),
         }
         asset = assets.get(path)
         if not asset:
@@ -262,7 +269,8 @@ class AuraRequestHandler(BaseHTTPRequestHandler):
 
 def create_server(bridge: AuraWebBridge, port: int = DEFAULT_PORT) -> AuraHTTPServer:
     web_root = Path(__file__).resolve().parent / "web"
-    for required in ("index.html", "styles.css", "avatar-face.js", "app.js"):
+    for required in ("index.html", "styles.css", "avatar-face.js", "app.js",
+                     "progress.html", "progress.js"):
         if not (web_root / required).is_file():
             raise RuntimeError(f"Aura HTML asset is missing: {required}")
     return AuraHTTPServer(("127.0.0.1", port), bridge, web_root)

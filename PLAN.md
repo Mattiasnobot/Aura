@@ -1665,3 +1665,875 @@ the retry ladder doing its job. So the new wording could not be seen live; it is
 tests, not by having been witnessed. Worth saying rather than implying otherwise.
 
 **474 tests, all green.**
+
+
+## Can the model research before it plans? — measured 2026-08-17
+
+The shape asked for is **research → plan → work the plan**. The whole thing stands or falls on
+the first arrow: a plan written without reading is a confident plan built on invented
+assumptions, which is worse than no plan, because it gets trusted.
+
+Four runs of the real agent against the real model, in a temporary workspace seeded with a
+small, deliberately incomplete shop (a page referencing a missing `cart.html` and a missing
+`hero.png`, plus a notes file listing exactly that).
+
+| | |
+|---|---|
+| **looked before writing anything** | **4 / 4** |
+| wrote a plan file | 2 / 4 |
+| turn length | 112–370s |
+
+**The first arrow works.** Every run opened `read_many_files` before touching anything, and both
+plans that were written cite the real contents — `index.html`, `style.css`, `notes.txt`, `cart`,
+`hero`. Nothing was invented. That was the thing genuinely in doubt after a day of watching this
+model guess, and the answer is that it does not guess when the reading tools are in front of it.
+
+**Two findings that decide the shape of the phase:**
+
+1. **The plan is not reliably written — 2 of 4.** The system prompt has always asked for a
+   `PLAN.md` first, and half the time it simply builds instead. So the instruction is not
+   enough; something has to hold the turn to it. That is a gate, not a prompt change.
+2. **Nothing separates planning from doing.** Every run went straight on from the plan into
+   creating files in the same turn. There is no pause where the plan could be read, corrected,
+   or refused — which is exactly the moment the user asked for. `_plan_files` does not fire here
+   because the goal names no filenames, so no approval card appears either.
+
+**And the cost is real.** 112–370 seconds per turn, against 4–10 seconds for a single decision.
+A research-plan-build turn is a minutes-long affair on this machine, which argues for the plan
+living in a **file** the user can read at leisure rather than a card that blocks the interface
+while a model thinks.
+
+**What this means for the phase.** The research half needs nothing built. The work is:
+
+- a gate that a plan exists before implementation begins, in the same family as the artifact
+  contract, since asking politely in the system prompt achieves it half the time;
+- the plan as a durable workspace file rather than a one-shot card, so it survives the turn, can
+  be corrected by hand, and is already covered by undo and history;
+- a deliberate stop between plan and build, which is where "ask my opinion" belongs — the user
+  edits the plan, and the next turn works from what the file now says.
+
+
+## Phase 54.1 — Claude as an alternative to the local model — done 2026-08-17
+
+Asked for by the user on the grounds that someone without a capable machine gets nothing
+from Aura today. That is a fair reason, and today's measurement agrees from the other
+direction: the local 9B took 112–370 seconds to research, plan, and build, and wrote the
+plan it was asked for in only half the runs. The ceiling is the model, not the architecture.
+
+**What was built.** `aura/cloud.py` — an `AnthropicProvider` that speaks the Messages API,
+selectable in Settings, with the `anthropic` package as an optional extra
+(`requirements-cloud.txt`) so the core stays stdlib-only and an install that never wants
+this never installs anything.
+
+**The prompt contract moved up rather than being copied.** `SYSTEM_PROMPT`, the language
+rule, the profile and memory framing, and the system-message merge are now on a shared
+`ChatProvider`, because they are what Aura says to *a* model, not to LM Studio. Copying them
+would have meant a change to Aura's identity applying to one provider and silently not the
+other.
+
+**The translation is a pair of pure functions at the edge.** Aura's whole interior speaks
+one dialect; rather than teach it a second, `to_anthropic` and `from_anthropic` convert at
+the boundary — system messages become a field, a tool result becomes a block inside a user
+message, an assistant turn's calls become content blocks, and results for one turn are
+gathered together so the model is not taught to stop asking for several tools at once.
+Attached images convert too. All of it is tested without a network, a key, or the package.
+
+**Three decisions worth stating.**
+
+*No silent fallback.* An unreachable local model must never become a reason to send the
+same conversation to Anthropic. `_build_provider` therefore catches nothing — and a test
+asserts that it contains no `except`, because this is the kind of helpfulness that gets
+added later by someone being kind.
+
+*The interface stops claiming privacy when it stops being true.* The status line read
+`Local • private • calm` unconditionally; it now reads `Claude • sent to api.anthropic.com`
+with an amber dot, and the sidebar names Anthropic rather than LM Studio in front of the
+model name. Verified in the running page, both ways round.
+
+*The key is write-only and removable.* It is never sent to the browser, never in
+`get_settings`, and deliberately absent from the diagnostics allowlist that is the only
+thing keeping a diagnostics file shareable. A blank field means "keep the stored key",
+because the field always opens blank.
+
+**One real gap found by using it rather than by testing it.** Because blank means "keep",
+there was no way to *remove* a key through the interface at all — a credential you can give
+and cannot take back. **Forget stored key** was added, which clears it and returns Aura to
+the local model in the same step, since staying on Claude with no key would only fail on the
+next message.
+
+**Not done, and not pretended otherwise:** no live call has been made. That needs the
+optional package installed and the user's own key, which is his to place and not mine to
+handle. Everything up to the request is verified; the request itself is not.
+
+**501 tests green.**
+
+
+### 54.1 follow-up — the first real request, 2026-08-17
+
+The user installed the package and added a key, so the one untested part finally ran.
+It found two things.
+
+**The integration is correct.** The request was built, accepted as well-formed, and reached
+Anthropic — a `request_id` came back. The beta fallback parameter was accepted rather than
+rejected, so `client.beta.messages.stream(betas=..., fallbacks="default", ...)` is the right
+shape for the installed SDK (0.122.0). What stopped it was the account, not the code: *"Your
+credit balance is too low to access the Anthropic API."*
+
+**And a real bug in the error handling, which only a real request could have shown.**
+`_explain` had no branch for a plain 400 and fell through to *"Could not reach
+api.anthropic.com"* — which was flatly untrue, and hid the one sentence that explained the
+problem. Two fixes: a server that says something specific is now repeated rather than
+replaced with a guess, and `_sentence` pulls the readable sentence out of `.message`, which
+otherwise carries the entire raw JSON body including the request id.
+
+Worth noting for its own sake: the earlier check reported the package missing because it
+looked at the system Python, while Aura runs from `.venv`. The package was there all along.
+
+**504 tests green.**
+
+
+## Phase 54.2 — GPT as a third choice — done 2026-08-17
+
+**It needed no new dependency and almost no new code**, which is worth saying because the
+Claude provider needed a package and a translation layer. LM Studio serves OpenAI's own
+chat-completions API, so Aura's existing `urllib` client already spoke the protocol; the
+only genuine differences were an address, a key, which of the many models on offer can hold
+a conversation, and two request fields the reasoning models spell differently.
+
+**The transport is now named after the protocol rather than one of its servers.**
+`LMStudioProvider` became `OpenAICompatibleProvider`, with LM Studio as one configuration of
+it — a service name, a default address, a token, and the sentence to print when it cannot be
+reached. `LMStudioProvider` remains a thin subclass on purpose, so that
+`isinstance(provider, LMStudioProvider)` keeps meaning "the local one", which the settings
+code and several tests rely on.
+
+**Where thinking happens is now asked of the provider, not deduced from the settings.**
+`describe_location()` and `is_remote()` live on `Provider`, so a claim about privacy comes
+from the object that would be breaking it, and the status line, the sidebar, and the
+thinking caption all read one label instead of each re-deriving it.
+
+**The model list is asked for rather than hardcoded.** A list of OpenAI model names kept in
+this file would go stale and then fail at the worst possible moment, so **Refresh models**
+asks the key what it can actually use, filtered by what a model is *not* (embeddings, audio,
+images) rather than by names that may be wrong or retired.
+
+**Reasoning-model quirks are learned from the refusal.** Those models reject `temperature`
+and spell the output limit `max_completion_tokens`. Which models those are changes over
+time, so a single bounded retry reads what the server actually complained about and adjusts
+once per session, rather than consulting a list of names.
+
+**Two things this found by being used.**
+
+*Forgetting one key cleared both.* Written that way in the first pass, it would have thrown
+away a working Claude key in order to remove an unused OpenAI one. Now each button forgets
+its own, and only drops back to the local model if the key removed was the one in use.
+
+*The shared transport printed whole JSON error bodies.* The real 401 from OpenAI put the one
+useful sentence behind a wall of braces and a hundred masking asterisks. `_readable` now
+extracts the sentence — the same fix made for the Claude provider, one layer down, so LM
+Studio's errors improved with it.
+
+**Verified live:** three choices in Settings, the panels switch, saving works, the status
+line reads `GPT • sent to api.openai.com`, and forgetting the OpenAI key left the Claude key
+untouched. The request path was exercised against the real API, which answered — the key in
+`OPENAI_API_KEY` is expired, so a completion has not yet been measured.
+
+**513 tests green.**
+
+
+## Phase 54.3 — the address is a field — done 2026-08-17
+
+Prompted by a discovery that cost the user real money: a ChatGPT subscription and a Claude
+subscription cover the apps, not the API, so neither helped here. Worth recording because it
+is a trap the purchase flow does not warn about, and because the answer turned out to make
+the previous phase more useful rather than less.
+
+**OpenAI's chat API is spoken by a good many services**, so hardcoding `api.openai.com` was
+throwing away most of what the protocol work bought. The address is now a setting, which is
+the entire change needed to reach any of them — including any with a free tier, which is
+what makes this an answer to the problem rather than a feature.
+
+**Three details it turned up, each a small correctness fix:**
+
+*The service name has to follow the address.* An error reading "OpenAI returned HTTP 401"
+raised by somebody else's server sends the user to the wrong company to fix it. `SERVICE`
+becomes an instance value derived from the host whenever the host is not OpenAI, and the
+error messages, the sidebar, and the status line all follow from it.
+
+*Whether it is remote is a fact about the address, not about the class.* `is_remote()` now
+asks whether the host is loopback. So the cloud provider pointed at a model server on this
+machine correctly reports `Local • private`, and — the case that actually mattered — the
+local provider pointed at another machine stops claiming privacy it no longer has.
+
+*The sidebar name was being parsed back out of the status label.* That only worked while
+every label had the same shape, and the new ones do not. It is sent as its own field now.
+
+**Verified live**, all four shapes: OpenAI itself, another OpenAI-compatible host (label
+`Sent to api.groq.com`), a model server on this machine (back to `Local • private`), and a
+malformed address, which is refused on save rather than failing on the next message.
+
+**517 tests green.**
+
+**Not measured:** no completion has been obtained from either paid API yet — the Anthropic
+account has no credit and the OpenAI key in the environment is expired. Everything up to and
+including the request is exercised against the real services; the reply is not.
+
+
+## What the provider work broke, found by looking for it — 2026-08-17
+
+The user asked the right question after three phases of change. Four things had been left
+assuming there was only ever one provider; all four are fixed, and none of them were caught
+by 517 passing tests, because every one of them was a *correct* behaviour for the local
+model and wrong only for the new ones.
+
+**Images were silently withheld from the models that handle them best.** `vision_enabled`
+called `LMStudioProvider.model_may_support_vision(model)` by name. That list of name
+fragments matches no Claude or GPT model, so vision was reported unsupported for both — and
+the `model_may_support_vision` overrides written on both cloud providers were dead code that
+nothing ever called. It now asks the provider in use.
+
+**Health told the user to start the wrong program.** `_check_model` said "LM Studio" outright
+and offered "Start LM Studio and open its local server" as the remedy — advice that has
+nothing to do with a cloud model that is merely out of credit. It now names the service in
+use and offers "Check the key and the address in Settings" when that service is remote.
+While in there: `selected_model()` can now raise (the cloud providers reach the network for
+it), which would have turned the health panel into an error instead of a report.
+
+**The same sentence appeared twice more**, in the empty-response explanation and in the
+failing-streak background check. Both now name the provider in use.
+
+**And `_empty_response_reason` was a `@staticmethod`**, so naming the provider inside it
+raised `NameError` — the second time in this work that a static method needed instance state
+(`_parse_completion` was the first). Both are caught by tests now.
+
+**The lesson worth keeping:** a green suite proved the refactor preserved behaviour, which
+is exactly what it was for — and proved nothing at all about behaviour that was only ever
+correct by coincidence. These were found by reading every call site of the things that
+changed, not by running anything.
+
+**518 tests green.**
+
+
+## The ShopMaster prompt, measured in full — 2026-08-17
+
+Measured again with the whole text this time rather than the abridged copy used earlier in
+the day, which is what turned up the defect below. 3329 characters, ~1100 tokens, Estonian,
+`requires_mutation` true, 23 of 52 tools offered — including `search_web` and `http_get`,
+which the abridged version did not reach.
+
+**A real defect, found only because the full text was used.** The artifact contract read
+**`Next.js` and `Node.js` as two files Aura had been asked to create**. The filename regex
+matches any `word.js`, and the prompt lists them as a technology stack. The completion gate
+would then have reported a finished job unfinished, waiting for two files that were never
+files — the exact nagging failure this contract exists to prevent.
+
+Fixed with a deny-list of technology names that look like filenames, applied only to bare
+names: `src/next.js` or `./next.js` is still taken at its word, because a path was clearly
+meant as one. A deny-list rather than something cleverer because the only thing separating
+`Next.js` from `next.js` is what the word means.
+
+**What has changed since the first measurement.** The earlier answer was that the limit was
+the model, not the architecture: a 9B given an eight-section mandate produced a single token
+and stopped. With a cloud provider selected that ceiling moves, and the honest constraints
+that remain are the ones that were always deliberate — the prompt asks for "täieliku
+autonoomiaga" and "ära küsi liigseid täpsustavaid küsimusi", and approvals are not the
+model's to waive; Shopify, Stripe, and AWS remain unreachable because no tool grants a
+domain. Neither of those is a gap to close.
+
+**521 tests green.**
+
+
+## Phase 55 — a role that belongs to a project — done 2026-08-17
+
+The thing proposed at the very start of the day, when the user asked what would happen if he
+fed Aura a long "ShopMaster" persona. The answer then was that it arrives as a user message
+competing with the system prompt every turn and dies with the conversation. This is the
+mechanism that was missing.
+
+**Where it lives.** `project_roles` in config, keyed by folder name, carried to the model on
+`ProviderContext` alongside the profile and the recalled memories — so it reaches both
+providers by the route those already take, rather than each being taught about projects.
+
+**Where it stops.** At the project's edge, which is the entire point. `role_for(None)`
+returns nothing deliberately: a role that applied with no project in play would just be a
+second system prompt, which is the thing this exists instead of.
+
+**What it cannot do.** It is inserted after the identity and the language rule and is
+prefixed with a sentence saying it changes what Aura prioritises and how she writes, not
+what needs approval. That sentence is true rather than decorative — approvals are enforced
+in code — and it is there so a role written in the language of "täieliku autonoomiaga" is
+not read by the model as permission to skip them. A test asserts the sentence is present.
+
+**Capped at 4000 characters**, because it is sent with every message in that project, and
+the refusal says so rather than just saying no.
+
+**Verified live** with the user's own ShopMaster text on his real `shop` project: the role
+reaches the model for a `shop` request (system prompt 3215 → 4909 characters) and does not
+for a `promo` one. One wart found by using it — after saving, the editor jumped away from
+the project just edited — and fixed.
+
+**528 tests green.**
+
+
+### 55.1 — knowing that the role is in force
+
+Asked immediately after the role shipped, and the honest answer was that you largely could
+not tell. Two gaps, both real:
+
+**The project was announced only with the reply.** Which project is in play decides which
+memories are recalled and now which role is applied, so learning it after the answer is
+learning it too late to say "no, not that one". It is now pushed as the turn starts.
+
+**And nothing said a role was being applied at all.** The status line named the project but
+not the fact that a persona was shaping the answer, which is exactly the question the
+setting raises.
+
+Both fixed: the status line reads `on shop · role`, a fresh tab learns it from the
+bootstrap rather than waiting for the next reply, and the two events that carry it go
+through one function so they cannot drift apart.
+
+**Verified live** by sending a real message and sampling the status line: it changed 450ms
+after send, before any reply, from `Local • private • calm` to `Local • private • on shop ·
+role`.
+
+**530 tests green.**
+
+
+## Phase 56 — a window for watching, not for working — done 2026-08-17
+
+Asked for after the role shipped: a way to see whether Aura is actually working. The existing
+answers were the avatar state and the activity panel, both of which say *that* something is
+happening without ever saying *when it last did* — which is the question behind "is she stuck".
+
+**One number does most of the work.** Time since the last event, reset by every tool result
+and every streamed token. Returning to zero means work; climbing means it stopped. Amber after
+a minute and red after two, chosen from the turn lengths measured on this machine, where tens
+of seconds of silence between tool calls is ordinary and two minutes is not.
+
+**It is a window rather than a panel** because the point is to keep it visible while looking
+at something else, which a panel inside the page cannot do. It rides the same event stream —
+every reader already keeps its own cursor, so opening it takes nothing from the main page.
+
+**Two defects, both found by running it rather than by reading it.**
+
+*It never woke up at all.* The page's own `script-src 'self'` blocked its inline script —
+the security header doing exactly its job. The behaviour moved to `progress.js`, and a test
+now asserts the page carries no inline script, because the failure is silent: a window that
+loads and simply never updates.
+
+*Every event was handled twice.* Polls could overlap — a request slower than the one-second
+tick let the next start before the cursor moved — so a reply was logged twice. Worst precisely
+when the machine is busy, which is when this window is being looked at. Fixed with a
+re-entrancy guard and a sequence check, both asserted.
+
+**Verified live** against a real tool-using turn: `read_many_files — error` then
+`read_many_files — ok` with timestamps, no duplicates, and the counters moving as they should.
+
+**534 tests green.**
+
+
+## Phase 54.1 — the plan as a file — done 2026-08-18
+
+Designed and measured yesterday, built this morning. The measurement said the research
+half needed nothing: four real runs opened a reading tool before touching anything, 4/4.
+What it also said was that the `PLAN.md` the system prompt has always asked for got
+written in **2 of 4** — so asking politely achieves it half the time.
+
+**The first attempt was wrong, and an existing test said so.** The gate asked the model
+for another round when the plan was missing. That cost a whole extra turn (112–370s on
+this machine) for bookkeeping rather than correctness, and it took a retry from the
+shared budget that the validation gate needs — which
+`test_validation_must_be_newer_than_last_mutation` caught by pinning the number of model
+rounds. The right shape was the opposite one.
+
+**Aura writes it herself, from what the turn actually did.** No model round, no retry: the
+gate runs last, after every gate that decides whether the work was right, and always
+returns PASS. The file records the request verbatim, the tools that really succeeded and
+how many times, and the files that really exist. That is cheaper *and* truer — a record
+assembled from tool results cannot claim work that did not happen, which a model asked to
+summarise itself can.
+
+**Three things found by running it rather than reading it:**
+
+*`current_request` did not exist.* `_describe_turn` read it off the agent and nothing ever
+set it, so every real plan would have opened with "_Not recorded._" while the test passed,
+because the test set the attribute itself. Now `handle` records it, and a test asserts the
+turn is what puts it there.
+
+*The file list contained a file that was never created.* A live run listed
+`avaleht/index.html`, because the Estonian phrase for "the X folder" had been parsed off a
+word that was not a folder. Only paths that are really on disk are listed now: a plan
+naming a file that does not exist is worse than one naming none.
+
+*Two of yesterday's own test fixtures never shut the bridge down*, so its threads held the
+database open and Windows refused to delete the temporary directory. Mine, not the
+product's — every older bridge fixture already called `shutdown()`.
+
+**And the plan is read back.** `ProviderContext` carries it, so the next turn in that
+project is given the file as it now stands, told it outranks the model's memory of what it
+intended, and asked to say so rather than quietly diverge if it disagrees.
+
+**Verified live** against the real model: a build in a fresh project produced a plan naming
+`read_file`, `write_file`, `validate_project` and the two files that exist. An earlier real
+attempt produced none, because that turn ended in an error before the gates ran — the
+phrasing tripped the artifact contract — so the gate was never reached rather than
+misbehaving.
+
+**544 tests green.**
+
+**Still open in this phase:** the deliberate stop between plan and build, where the plan is
+agreed before the work rather than recorded after it. That is the piece that gives the
+review moment, and it is a bigger behavioural change than this one.
+
+
+## OmniCoder against qwen3.5-9b, same four runs — measured 2026-08-18
+
+Both Q4_K_M, both 9B, same seeded workspace and the same two goals as yesterday, so the
+only variable is the training. The measurement script now records which model produced the
+numbers, which yesterday's did not.
+
+| | qwen3.5-9b | omnicoder-…-claude-4.6-opus-uncensored-v2 |
+|---|---|---|
+| looked before writing | 4 / 4 | **4 / 4** |
+| wrote a plan file | 2 / 4 | **3 / 4** |
+| turn length | 112–370s | **105–169s** |
+| median turn | ~277s | **~123s** |
+
+**Roughly twice as fast, and it reaches for tools more.** The old model's runs were mostly
+one `read_many_files` followed by a wall of prose; this one chains reads with writes and
+follow-up checks — `read_many_files → write_file → read_file`, `→ file_info` — which is the
+behaviour the whole gate apparatus was built to compensate for.
+
+**The first arrow holds: 4/4 again.** Reading before writing was never the weak point and
+still is not.
+
+**And the plan is still not certain — 3 of 4, not 4.** One run wrote it as `plan.md` rather
+than `PLAN.md`. So the gate that files a plan regardless earns its place on this model too;
+it is closer to reliable, not reliable.
+
+**Not measured here:** answer quality, and whether the removed safety training changes
+anything about how it behaves in a long agentic loop. This measured the shape of the work,
+not the worth of it.
+
+
+## Does OmniCoder belong in Aura? — full evaluation, 2026-08-18
+
+Five behaviours, each one a failure this project has measured before, so every number has
+something to be compared against. Both models Q4_K_M, both 9B, same machine.
+
+| | qwen3.5-9b | omnicoder-…-opus-uncensored-v2 |
+|---|---|---|
+| looked before writing (4 runs) | 4 / 4 | 4 / 4 |
+| wrote a plan file | 2 / 4 | **3 / 4** |
+| turn length | 112–370s | **105–185s** |
+| invented a file's length | yes, once measured | **no — answered 47, correct** |
+| Estonian in, Estonian out | drifted historically | **3 / 3 Estonian, no Finnish** |
+| a long dense prompt | 1 completion token, silence | **731 tokens, a real answer** |
+| tool discipline on a vague ask | described | **workspace_summary → list_files → read_many_files** |
+| claimed a refused command's output | **2 / 3** | **1 / 3** |
+
+**Verdict: it fits, and it is better on every axis measured.** Roughly twice as fast, more
+willing to reach for a tool, and — the one that matters most here — it no longer goes silent
+on a long instruction. That single-token silence was the worst behaviour of the old model,
+because it looked like Aura being broken rather than a model declining.
+
+**Two corrections I had to make to my own measuring, both worth recording:**
+
+*The first honesty test measured my own feature.* Refusing every approval refused the new
+plan card, so the run reported "I stopped before creating anything" — nothing to do with the
+model. Approving the plan and refusing only the command fixed it.
+
+*Then I raised an alarm on n=1 and it was wrong.* One run showed the new model claiming a
+refused command's output, and I called it a fabrication before repeating it. Three runs each
+say the opposite of what that suggested: **the old model does it more often (2/3) than the
+new one (1/3)**. Fabrication is not this model's flaw; it is a pre-existing flaw of both, and
+the new model is somewhat better at resisting it.
+
+**Which leaves the real finding, and it is about Aura rather than the model.** Nothing checks
+a claim about a command. `_gate_artifacts` checks files exist; `_gate_validation` checks a
+project validates; no gate asks whether a reply describing a command's output has a
+successful `run_command` behind it. The system prompt says never to claim a command changed
+anything without a tool result confirming it, and both models break that rule some of the
+time. A prompt is not an enforcement mechanism — that is the whole reason the gates exist.
+
+**A live bug found along the way.** Both models drafted the plan in Finnish. The language
+rule is set in `start_messages`, but the plan instruction is appended after it, in English,
+and is the last thing read before writing — so a 9B takes its cue from that. Fixed by
+repeating the rule in the instruction itself, from the same single source, with a test in
+both directions.
+
+**552 tests green.**
+
+
+## Does the model still need the router? — re-measured on OmniCoder, 2026-08-18
+
+The user's question, and a fair one: the model plainly understands Estonian — it answered
+3/3 in Estonian today with no drift, and pasted straight into LM Studio it reasons in English
+about an Estonian prompt and answers in Estonian. So why does Aura carry a layer that maps
+Estonian stems to English keywords?
+
+**Because that layer is not for the model.** `with_english_hints` exists so Aura's own Python
+keyword router can match Estonian words; the model never sees it, and the routing decision is
+made before the model is called. The real question it raises is therefore not "can the model
+understand Estonian" but "should Aura be deciding this at all" — which is measurable, and was
+measured yesterday on a model that no longer runs here.
+
+Same six requests, both ways, three runs each, on OmniCoder:
+
+| | correct | median prompt | median time |
+|---|---|---|---|
+| router's selection | 18 / 18 | **1655 tokens** | **9.6s** |
+| all 53 tools | 15 / 18 raw → **18 / 18 read honestly** | 6490 tokens | 11.4s |
+
+**The three "failures" were my scoring, not the model's mistake.** Asked *"otsi veebist, mis
+on praegu Tallinnas ilm"*, the full-catalogue runs chose `get_weather` — a real capability
+(registered as a service rather than a toolkit tool) and a better fit than `search_web`. I had
+written `{"search_web"}` as the only acceptable answer. Both tools were offered in both
+conditions, so the router constrained nothing; the model simply chose better from a longer
+menu and I marked it wrong.
+
+**Read honestly it is a dead heat, exactly as yesterday.** The router survives on cost alone:
+a quarter of the prompt and about two seconds a call. So the hint layer stays — but for a cost
+reason, not a language one. Trading 4× the prompt to delete ~360 lines is now a measured
+choice rather than a guess, and it belongs to the user.
+
+**Worth recording about the measuring itself.** Three separate false alarms today, each of
+which looked like a finding on first sight: an honesty test that measured Aura's own new plan
+card rather than the model; an n=1 "fabrication" that three runs reversed outright; and a
+"the router offers a tool that does not exist" alarm that came from checking the toolkit
+registry while the tool lives in the service registry. The pattern is the same each time —
+a single observation, read as a result. Anything from one run is a hypothesis.
+
+## A gate for claims about commands — done 2026-08-18
+
+The one real defect the day's measurements found, and it is Aura's rather than any model's.
+
+**Measured on both models:** asked to build a file and run a command, with the command
+refused, the reply reported the command's output anyway — qwen3.5-9b **2 runs in 3**,
+omnicoder **1 in 3**. The system prompt already forbids exactly this ("Never claim that a file
+or command changed unless its tool result confirms it"), which is the point: a prompt is not
+an enforcement mechanism, and every comparable claim already has a gate behind it.
+
+**The fact the gate needed did not exist.** `tools_run` shows `run_command`, but a *refused*
+command still returns a successful tool result describing the refusal — so the tool's presence
+is not evidence anything executed. `TurnState.commands_executed` now counts only commands that
+were approved and finished.
+
+**And the gate only bites in the unambiguous case:** the reply asserts a result and nothing
+executed at all this turn. When a command did run, no attempt is made to match claims to
+commands — a gate that guessed would manufacture the false accusations it exists to prevent.
+The trigger words are past-tense and result-shaped in both languages, so "I could run that"
+and "that needs your approval" pass untouched.
+
+**560 tests green.**
+
+
+### Reading the replies instead of grepping them — 2026-08-18
+
+The gate went in and the automated score barely moved: 1/3 on both models, down from 2/3 on
+one. Rather than guess at why, six replies were captured verbatim and read.
+
+**The gate was working the whole time. The measurements were not.**
+
+Two separate instrument faults, both mine:
+
+*The tracer watched a function nobody calls.* `COMPLETION_GATES` is a tuple of function
+objects captured when the class body executes, so reassigning `AuraAgent._gate_command_claim`
+afterwards cannot reach the loop. `gate saw: []` meant the hook was in the wrong place, not
+that the gate never fired. A test now proves the gate is reached through `handle()` — every
+other test of it called it directly, which is exactly the blind spot that let this stand.
+
+*And the scorer punished honesty.* One reply read "Mis see väljastaks (kui luba oleks): tere"
+— what it **would** print, if permission were given. That is the model being precisely right,
+and the script counted it as a lie because the word `tere` appeared in the text.
+
+**What the six replies actually show.** Five of six decline cleanly and say the command needs
+approval — "Pythoni käsk vajab kasutaja heakskiitu. Kas sa lubad…". One is genuinely wrong,
+and only in half a sentence:
+
+> "I attempted to run `python -c "print('tere')"` which **should** output the text "tere". The
+> command **has been executed** and is awaiting user approval before completion."
+
+The hedge is correct and the assertion beside it is false, in the same breath. The phrase list
+had been written by imagining how a model might phrase it and missed this entirely; it now
+contains the wording that actually appeared, with tests taken verbatim from both the false
+reply and the honest one it used to punish.
+
+**The honest summary of the behaviour: it is rare, and the gate is a net for the rare case
+rather than a fix for a common one.** The earlier "2 in 3" figure was an artefact of grepping
+for an output string.
+
+**563 tests green.**
+
+**And a tally worth keeping visible, because it is the real lesson of the day.** Five separate
+false alarms, every one of which looked like a finding on sight: an honesty test that measured
+Aura's own new plan card; an n=1 fabrication that three runs reversed; a "the router offers a
+tool that does not exist" that came from reading the wrong registry; a tracer bound to a dead
+reference; and a scorer that counted correct behaviour as failure. The models behaved better
+than my instruments did, and every number in this file from a single run should be read as a
+hypothesis.
+
+
+## A hierarchy pass on the interface — 2026-08-18
+
+The tokens were already the careful part: one surface scale, one type scale, contrast measured
+in the running page rather than assumed. What the page lacked was **rank**. The conversation, a
+task card, a suggestion chip and the composer all sat on the same surface, with the same border
+and the same weight, so nothing led the eye — and the avatar, the one thing in this interface
+nobody else has, was the dimmest element on screen.
+
+**Nothing new was invented.** Every value resolves to an existing token or a transparency of
+one, so the contrast work still holds and a future theme change still reaches everything.
+
+- **The ground stops being flat** — two very low-contrast washes, warm where the avatar sits,
+  cold at the opposite corner. At these opacities it reads as depth, not colour.
+- **The avatar became the hero** — a pool of light behind the canvas, never over it.
+- **Buttons gained three ranks instead of one.** `Clear` had exactly the same weight as `New`,
+  which is wrong for the only control there you never want to press by accident.
+- **The two voices separated.** Aura's messages carry a lit edge on the avatar's side; the
+  user's sit flatter and cooler. Before this they differed by four points of blue.
+- **The composer got the strongest surface and a focus ring that announces itself**, because
+  it is the thing you came to use.
+- Suggestions quietened, scrollbars themed, one focus ring for the whole app, and selection
+  in Aura's own colour rather than the browser's blue.
+
+**Verified in the running page, not assumed** — which is this file's standing rule and the one
+that mattered here, because two controls became transparent:
+
+| | contrast |
+|---|---|
+| Clear (now transparent) | 5.18 |
+| suggestion chip | 5.18 |
+| status line, provider label | 7.55 |
+| conversation text | 14.74 |
+
+All above the 4.5 floor. Settings and the narrow layout checked by screenshot; **566 tests
+green**.
+
+
+## Aura Mind: focus before decoration — 2026-08-18
+
+Sixty-four nodes and ninety-four edges drawn with one weight, one flat disc per node, and a
+bare label. Labels landed on edges and on each other, the hub was the same kind of dot as a
+leaf, and anything past two-thirds of the canvas had its label run off the edge and disappear.
+
+**The largest win on a dense graph is not decoration, it is focus.** Hovering a node now dims
+everything not adjacent to it. Hovering "What I watch" reduces ninety-four edges to the five
+that matter — its four checks and the edge home to Aura — while hiding nothing and moving
+nothing. The layout is untouched; only attention changes.
+
+The rest follows from reading the picture honestly:
+
+- **Labels get a dark plate.** A label sitting on an edge was unreadable, and no amount of
+  colour fixes that.
+- **Labels flip side past two-thirds of the canvas** instead of running off it.
+- **Edges into the hub are heavier than leaf edges** — one carries the structure, the other is
+  a detail, and drawing them alike said they were equal.
+- **Light comes off the nodes**, brightest at the hub, which also wears a ring so it reads as
+  the centre rather than merely the largest dot. The shadow is saved and restored around each
+  node; a leaked canvas shadow turns every later label into a smear.
+
+**Verified in the running map**, not asserted: hover tested by actually moving the pointer onto
+a category node and reading the result, and search re-checked afterwards because it shares the
+dimming path — 23 matches on "shop", still correct. **566 tests green.**
+
+
+## A retry asks a smaller question — 2026-08-18
+
+Measured twice inside a single turn, in Mat's own log:
+
+```
+retries_left 2   prompt 10,982 tokens  ->  1 token back
+retries_left 0   prompt 11,090 tokens  ->  1 token back
+```
+
+When the model went quiet, Aura appended an instruction and asked again — which made the
+prompt **larger than the one that had just failed**. Each retry was a slightly harder version
+of the question the model had already declined to answer.
+
+Older tool results are the bulk of that weight and the least useful part of it by the time a
+retry is happening: the model has already read them and acted on them. Beyond the two most
+recent, they are now cut to 240 characters with a note saying so, immediately before the
+retry instruction is appended.
+
+**Shortened, never removed.** Every `tool` message answers a `tool_call` by id, and deleting
+one leaves a conversation the server rejects. A test pins that: the list of `tool_call_id`s is
+identical before and after compaction. Another test reads `agent.py` itself and asserts the
+compaction call comes *before* the instruction is appended — the whole point is the order.
+Nothing but tool results is touched; the system prompt, Mat's words and Aura's own turns are
+byte-identical afterwards.
+
+## Aura Mind stops rearranging itself — 2026-08-18
+
+The physics was already deterministic. The seeding was not, in the way that mattered: every
+ring was laid out **by array index**, so a node's direction depended on how many siblings it
+had and on the order the server happened to send them. One new memory renumbered a ring and
+the same graph arrived looking like a different map.
+
+A node's direction now comes from a hash of its own id. Identity alone clumps — three ids can
+land in the same corner and leave half the circle bare — so each node claims a slot on a wheel
+of *fixed* size (24 at the hub, 36 outside) and probes forward if it is taken. Even spacing,
+without anyone's angle depending on how many others turned up.
+
+Then the part that makes it Mat's map rather than Aura's: **a node he drags stays where he put
+it**, through a filter change, through the 110 steps of physics, and through a page reload.
+Only dragged nodes are written down — settled positions are reproducible from the seeding, so
+storing them would be noise that goes stale. `Reset` now means "forget where I put things",
+because a plain reset would put them straight back.
+
+**Verified in the running page**, and the round trip is the proof:
+
+| check | result |
+|---|---|
+| three resets, same session | identical layout hash `4074243072` |
+| across a full page reload | identical layout hash `4074243072`, step 110 both times |
+| drag `person:name` to (-777, 333), reload | still at (-777, 333) |
+| then press Reset | back at (-584, -8) — exactly its seeded place |
+
+An earlier pixel-level comparison across reloads *did* differ, and that was my own instrument:
+the first sample was taken before the animation had settled. Comparing positions rather than
+pixels showed the layout had been identical all along. **571 tests green.**
+
+
+## What the log said, and what it cost to find out — 2026-08-18
+
+Rather than guess at improvements, I read the 410 rows in `actions`:
+
+| day | asked | failed | silences |
+|---|---|---|---|
+| Aug 14 | — | 12 | 0 |
+| Aug 15 | — | 19 | 0 |
+| Aug 16 | 20 | 1 | 0 |
+| Aug 17 | 35 | 5 | 5 |
+| Aug 18 | 9 | 2 | 6 |
+
+**The old failure class is dead.** All 31 failures on 14–15 August were gates —
+*"required artifacts are still missing: report.txt"*, *"the model did not perform the
+requested workspace action"*. Not one has recurred since. Plan-as-file and the command-claim
+gate closed it, and nothing more should be spent there.
+
+**Silence is the only live failure**, and it began on 17 August. Every failing turn since is
+the same one.
+
+### Feed the model its own thinking back
+
+The cause was in Aura, not the model. At the end of every round the assistant turn went into
+history as `{"content": null, "tool_calls": [...]}` — the `reasoning_content` was **discarded**.
+On a model that keeps three quarters of its output in that field (226 reasoning deltas to 72
+content deltas, measured), that means it looked back at its own last turn, found a bare
+function call, and had to re-derive from scratch why it had made it. The silences in the log
+cluster exactly on turns 2 and 3 tools deep.
+
+**Verified that the field actually lands**, because the whole fix rests on it — the same
+conversation sent twice against LM Studio, once with reasoning and once without:
+
+```
+prompt_tokens without reasoning : 77
+prompt_tokens with reasoning    : 1318   (5,360 characters of thinking)
+```
+
+It is templated, not dropped. Only the *newest* assistant turn keeps its reasoning, capped at
+2,400 characters and kept from the **tail** — a chain of thought ends with the decision it
+reached. Carrying every round's would grow the prompt by three quarters each time, which is
+what `_compact_for_retry` exists to fight. `send_reasoning_back` turns it off.
+
+### A retry that asks a different question
+
+Five of six silence episodes burned the whole budget re-asking the same question, at minutes
+a time, and got the identical silence back. A retry now **removes the tools** for one round —
+a model with no tools cannot answer with a tool call, and plain text is exactly what the gate
+is asking for. Silence buys **one** retry, not three; `test_a_model_that_never_answers_is_
+reported_plainly` was updated from 4 calls to 2, which is the behaviour change, not drift.
+
+### Verified live
+
+A four-tool Estonian request, the shape that used to go quiet: answered in 68 seconds, no
+silence, correct line counts for all four files. **578 tests green.**
+
+Two honest limits. One clean turn is encouraging, not proof — the silences were intermittent,
+and only Mat's ordinary use over the next days can settle it; the mechanism, however, is
+established rather than assumed. And the reply itself ended with a *"Kõige tõenäolisem sisu"*
+table guessing what was inside files it had only measured with `file_info` — unfounded, and
+not something these changes touch.
+
+
+## The audit, worked through — 2026-08-18
+
+Every item from `IMPROVEMENTS.md` that was safe to do, plus the two the sweeps
+afterwards turned up. **617 tests green**, up from 578.
+
+| item | what changed |
+|---|---|
+| 1.1 | `file_info` no longer counts as inspection. `CONTENT_TOOLS` and `SHAPE_TOOLS` are separate, and the footer says "size and line count checked, contents not read" when that is what happened. |
+| 1.2 | A gate names any file the answer discusses but never opened — **without** reading the answer's language, which was the audit's own suggestion and the wrong instrument. |
+| 2.1 | A turn has a deadline, settable in Settings, that stops it and reports what ran. |
+| 2.2 | A per-turn reading budget across all tool results, spent down as tools run. |
+| 3.1 | 50 tool handlers left `agent.py` for six topic modules as mixins. **2,676 → 2,244 lines.** |
+| 3.2 | `build_mind_graph`, 241 lines, became eight layer functions. |
+| 4.1 | 137 literal colours → 37. |
+| 4.2 | The progress window uses the main window's tokens. |
+| 5.2 | `workspace_bridge` and `voice_bridge` went from 3 test mentions to 16 tests. |
+| 5.3 | The one genuine sleep-and-hope in the suite now waits for a fact. |
+
+### What the sweeps caught afterwards — both in my own work
+
+**The deadline was not a deadline.** The budget was read at the top of each round, so a
+round starting one second inside the limit could then run as long as it liked.
+
+*Corrected the same day.* I first justified this with a live turn I said had hung for
+seventeen minutes — evidence that was simply wrong. I had been reading `offsetParent` on
+the Stop button to decide whether Aura was busy, but `setBusy` uses `disabled`, not
+visibility: **that button is always on screen**. The turn I called a hang had finished
+in 4m16s, inside its budget. The sixth time in this project that my own instrument, not
+the code, was the defect.
+
+The mechanism was real even though the anecdote was not, and the fix is justified by
+measurement instead: with a 60-second budget the turn stopped at **60.14 seconds**, and
+the record reads `rounds: 0` — it fired *during* the first generation, which the old
+between-rounds check could never have done. The clock now
+lives in `_check_cancelled`, the one place a turn may stop, which is read on every streamed
+token. The reasoning stream is wired through it too, and that is the case that actually bit:
+a model emitting only private thinking produces no content tokens at all, so a clock read
+only in the content callback is never read during precisely the turns that overrun.
+
+Re-tested live, twice, and the second run is the one that counts — the first was against a
+server still holding its startup config, so the budget under test was never the one I had
+set. Measured properly: **60-second budget, stopped at 60.14 seconds, `rounds: 0`.**
+
+One honest bound: the clock is read on streamed tokens, so a turn can overshoot by roughly
+its time to first token, while the prompt is still being processed and nothing is streaming
+yet. Here that was 0.14s; on a large prompt an earlier run overshot by about 30 seconds.
+
+**And it then overstated the wait** — "I stopped after 2 minutes" for a 90-second budget,
+because 1.5 rounded up. A small lie in the one message whose entire job is honesty. Fixed,
+and pinned by a test.
+
+**An expired turn reported a blank slate.** The outer handler built its message from a fresh
+`TurnState`, so a turn that ran three tools and then overran would have said nothing
+happened. It now reports from the real turn.
+
+### Corrections to the audit itself
+
+Four of its items were wrong, and the measurements say so:
+
+- **"16 `time.sleep` calls in tests."** Fifteen are inside deadline-bounded polling loops —
+  the correct pattern. Exactly **one** was sleep-and-hope.
+- **`read_many_files` uncapped.** It caps at 20 files, 300 lines each, 250,000 characters.
+  The real gap was the absence of a *turn-wide* budget, which is what 2.2 built.
+- **"137 colours break theming."** There is no theme system to break. The work is the
+  precondition for ever having one, not a repair.
+- **`settings_bridge` untested.** 19 test references. The thin ones were `workspace_bridge`
+  and `voice_bridge`.
+
+### Left undone, deliberately
+
+- **3.3 — splitting `app.js` (3,532 lines) into ES modules.** It converts the entire
+  interface to modules in one step, changes `index.html` to `type="module"`, and changes
+  script execution timing under the CSP. It deserves its own change with its own live
+  verification, not the tail of a long batch.
+- **3.4 — `web_bridge.py`, 981 lines.** The same shape of job as 3.1 and safe to do; it ran
+  out of room here rather than out of merit.
+- **3.5 — 38 `except Exception` handlers.** Each needs judging on its own; a blanket
+  narrowing would be a worse bug than the breadth.
+- **`save_settings`** is still 198 lines and 62 branches — the worst density in the project,
+  and slightly worse than before, because 2.1's field was added to it.

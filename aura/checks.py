@@ -180,9 +180,10 @@ def _failing_streak(agent) -> Finding | None:
             break
     if streak < MIN_STREAK:
         return None
+    service = getattr(agent.provider, "SERVICE", "the model server")
     return Finding(
         f"The last {streak} tasks in a row failed. Something changed rather than "
-        f"something being hard: worth checking that LM Studio still has a model "
+        f"something being hard: worth checking that {service} still has a model "
         f"loaded before asking for more.")
 
 

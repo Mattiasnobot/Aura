@@ -1,5 +1,7 @@
 import base64
 import io
+import base64
+import inspect
 import json
 import math
 import os
@@ -34,6 +36,7 @@ from aura import __version__ as aura_version
 from aura import checks
 from aura import health
 from aura import language
+from aura import routing
 from aura import services
 from aura import search_service
 from aura import toolkit
@@ -42,7 +45,7 @@ from aura.turn import PASS, TurnState
 from aura.action_log import ActionLog
 from aura.autonomy import AutonomyGuard
 from aura.scheduler import Scheduler
-from aura.agent import AuraAgent, TaskCancelled
+from aura.agent import AuraAgent, TaskCancelled, TurnExpired
 from aura.errors import AuraError
 from aura.memory import MemoryStore
 from aura.config import ConfigStore
@@ -51,14 +54,22 @@ from aura.http_app import API_METHODS, create_server, existing_aura_url
 from aura.graph_model import build_mind_graph
 from aura.image_diff import UnsupportedImage, compare_images, decode_png
 from aura.permissions import (ExternalReader, ExternalWriter, PermissionDenied,
-                              PermissionRefused,
-                              PermissionStore)
+                              PermissionRefused, PermissionStore,
+                              is_private_address)
 from aura.preview_server import PreviewServer
-from aura.provider import (LMStudioProvider, MockProvider, ProviderContext, ProviderError,
+from aura.cloud import AnthropicProvider, OpenAIProvider
+from aura.provider import (LMStudioProvider, MockProvider,
+                           OpenAICompatibleProvider,
+                           ProviderContext, ProviderError,
                            ProviderReply, ToolCall)
 from aura.speech import SpeechOutput
 from aura.store import Database
 from aura.tasks import TaskJournal
+from aura import code_exec
+from aura import context_budget
+from aura import empty_reply
+from aura import tool_errors
+from aura import sampling
 from aura.validation import check_accessibility, check_broken_assets
 from aura.voice import VoiceInput
 from aura.safety import SandboxViolation, WorkspaceSandbox
@@ -329,6 +340,1071 @@ class CheckBrokenAssetsTests(unittest.TestCase):
         result = check_broken_assets(self.box, "site")
         self.assertTrue(result["ok"])
         self.assertEqual([item["reference"] for item in result["broken"]], ["../../outside.js"])
+
+    def test_assets_named_only_in_a_data_file_are_checked(self):
+        """The shop's real failure: two images 404, validation said no issues.
+
+        `img.src = product.image` puts the path in the data rather than the
+        code, so neither the HTML scan nor the script scan could see it.
+        """
+        self.box.create_file("shop/index.html", '<html><body><div id="list"></div></body></html>')
+        self.box.create_file("shop/img/have.png", "x")
+        self.box.create_file(
+            "shop/data/products.json",
+            '{"products": [{"image": "../img/have.png"}, {"image": "../assets/gone.png"},'
+            ' {"image": "https://cdn.example.com/remote.png"}, {"name": "Not.A.Path"}]}')
+        result = check_broken_assets(self.box, "shop")
+        self.assertTrue(result["ok"])
+        self.assertEqual([item["reference"] for item in result["broken"]], ["../assets/gone.png"])
+
+    def test_data_asset_resolving_from_the_project_root_is_not_reported(self):
+        """Whoever wrote the data file may have meant the path from the page.
+
+        Reporting a path that resolves either way would flag working code, and
+        a checker that cries wolf is one nobody reads.
+        """
+        self.box.create_file("shop/index.html", "<html></html>")
+        self.box.create_file("shop/img/logo.png", "x")
+        self.box.create_file("shop/data/site.json", '{"logo": "img/logo.png"}')
+        self.assertEqual(check_broken_assets(self.box, "shop")["broken"], [])
+
+
+class EditAnchorTests(unittest.TestCase):
+    """A refused edit should leave the model better informed than before."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.agent.sandbox.write_file(
+            "site/index.html",
+            "\n".join(['<main>', '  <div class="product-card">',
+                       '    <h2>Shoe</h2>', '  </div>', '</main>', '']))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def edit(self, anchor):
+        return self.agent._execute_tool(
+            ToolCall("i", "replace_in_file",
+                     {"path": "site/index.html", "old_text": anchor, "new_text": "X"}),
+            lambda *_: True).get("error", "")
+
+    def test_an_anchor_that_starts_wrong_still_finds_the_real_line(self):
+        """The substring probe only recognises an anchor that begins correctly,
+        so `<section>` written for a `<div>` used to find nothing at all."""
+        message = self.edit('<section class="product-card">')
+        self.assertIn("are close", message)
+        self.assertIn('<div class="product-card">', message)
+
+    def test_a_genuinely_absent_anchor_is_not_given_a_false_neighbour(self):
+        message = self.edit('import React from "react";')
+        self.assertIn("not in the file at all", message)
+        self.assertNotIn("are close", message)
+
+    def test_an_ambiguous_anchor_lists_where_it_matched(self):
+        self.agent.sandbox.write_file("site/rows.html",
+                                      "\n".join(["<p>row</p>"] * 3) + "\n")
+        message = self.agent._execute_tool(
+            ToolCall("i", "replace_in_file",
+                     {"path": "site/rows.html", "old_text": "<p>row</p>", "new_text": "X"}),
+            lambda *_: True)["error"]
+        self.assertIn("found 3 matches", message)
+        self.assertIn("line 1", message)
+
+    def test_a_crlf_file_survives_a_multi_line_edit(self):
+        """The model reads LF because Aura normalises, so the anchor it copies
+        is LF — and the file on disk must still come back as CRLF."""
+        crlf = chr(13) + chr(10)
+        raw = crlf.join(["<div>", "  <p>one</p>", "  <p>two</p>",
+                         "</div>", ""]).encode("utf-8")
+        target = self.agent.sandbox.root / "site" / "crlf.html"
+        target.write_bytes(raw)
+        result = self.agent._execute_tool(
+            ToolCall("i", "replace_in_file",
+                     {"path": "site/crlf.html",
+                      "old_text": "\n".join(["  <p>one</p>", "  <p>two</p>"]),
+                      "new_text": "  <p>X</p>"}), lambda *_: True)
+        self.assertTrue(result.get("ok"), result.get("error"))
+        self.assertIn(crlf.encode("utf-8"), target.read_bytes())
+
+
+class SilentFailureTests(unittest.TestCase):
+    """Failures in the record-keeping used to leave no record."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def errors(self, action):
+        return [row for row in self.agent.log.recent(60)
+                if row.get("action") == action and row.get("status") == "error"]
+
+    def test_a_plan_step_that_cannot_be_saved_says_so(self):
+        """Otherwise the durable plan simply stops advancing, which is the shape
+        of the bug that took a day to find — arriving next time with no
+        evidence at all."""
+        self.agent.current_project = "shop"
+        self.agent.sandbox.write_file("shop/index.html", "<html></html>")
+        self.agent.db.set_plan_steps("shop", ["Create shop/index.html with layout"])
+        def refuse(*_args, **_kwargs):
+            raise RuntimeError("database is locked")
+        self.agent.db.set_step_status = refuse
+        turn = TurnState()
+        turn.successful_tools = 1
+        turn.workspace_mutation = True
+        self.agent._gate_plan_progress(turn, None)
+        self.assertTrue(self.errors("plan_step"))
+
+    def test_a_plan_that_cannot_be_read_says_so(self):
+        self.agent.current_project = "shop"
+        def refuse(*_args, **_kwargs):
+            raise RuntimeError("database is gone")
+        self.agent.db.plan_steps = refuse
+        turn = TurnState()
+        turn.successful_tools = 1
+        self.assertEqual(self.agent._gate_plan_progress(turn, None), PASS)
+        self.assertTrue(self.errors("plan_steps_read"))
+
+    def test_recording_the_failure_can_never_itself_break_the_turn(self):
+        """These failures are usually the database, and the log lives in the
+        same database."""
+        def refuse(*_args, **_kwargs):
+            raise RuntimeError("no")
+        self.agent.log.record = refuse
+        self.agent._note_bookkeeping_failure("plan_step", "shop", RuntimeError("x"))
+
+
+class ProjectAnnouncementTests(unittest.TestCase):
+    """Which project is in play has to be said before the work, not after.
+
+    It decides which memories are recalled and which rules apply, so learning
+    it only with the reply is learning it too late to say "no, not that one".
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name) / "workspace"
+        (root / "shop").mkdir(parents=True)
+        (root / "promo").mkdir()
+        self.agent = AuraAgent(root, provider=MockProvider())
+        self.bridge = AuraWebBridge(agent=self.agent, speech=SpeechOutput(enabled=False))
+        # The bridge owns threads that hold the database open, so closing the
+        # connection is not enough to let Windows delete the directory.
+        self.addCleanup(self.bridge.shutdown)
+
+    def test_the_interface_is_told_before_the_work_not_after(self):
+        events = []
+        self.bridge._push = lambda name, **fields: events.append((name, fields))
+        self.bridge._work("Tee shop kausta avaleht valmis")
+        names = [name for name, _ in events]
+        self.assertIn("project", names)
+        announced = next(fields for name, fields in events if name == "project")
+        self.assertEqual(announced.get("project"), "shop")
+        self.assertLess(names.index("project"), len(names) - 1)
+
+
+
+
+class ForeignNameTests(unittest.TestCase):
+    """An Estonian name inside an English sentence is a name, not a language.
+
+    Asked "What's the current weather in Estonia Jõgeva", Aura answered in
+    Estonian — badly enough to render "today's high" as "tänapäeva kõrge" —
+    because one `õ` settled the language of the whole sentence before a single
+    word was counted. She was also asked in English, and the reply is spoken
+    aloud in a voice Mat does not want speaking Estonian.
+    """
+
+    def test_an_english_question_about_an_estonian_place_stays_english(self):
+        for question in ("What is the current weather in Estonia Jõgeva",
+                         "What is the current weather in Estonia Võru",
+                         "Please read Jõgeva.txt and tell me what it says"):
+            with self.subTest(question=question):
+                self.assertEqual(language.detect(question), "en")
+
+    def test_a_real_estonian_sentence_is_still_estonian(self):
+        for question in ("Kas sa võiksid teha mulle veebilehe?",
+                         "Tere! Kuidas sul läheb täna?",
+                         "Palun tee Jõgeva kohta üks leht",
+                         "Mis on ilm Jõgeval?"):
+            with self.subTest(question=question):
+                self.assertEqual(language.detect(question), "et")
+
+    def test_estonian_carrying_an_english_phrase_is_still_estonian(self):
+        """The reverse mistake would be just as wrong."""
+        self.assertEqual(language.detect("Tee mulle üks landing page Võrus"), "et")
+
+    def test_a_place_name_is_percent_encoded_in_the_url(self):
+        """`Jõgeva` went raw onto the wire and came back empty; the model
+        recovered by guessing `Jogeva`, which cost a round trip and only
+        worked because the letter happened to have an ASCII cousin."""
+        asked = []
+
+        def fetch(url, timeout=10.0):
+            asked.append(url)
+            if "search" in url:
+                return {"results": [{"latitude": 58.7, "longitude": 26.4,
+                                     "name": "Jõgeva", "country": "Estonia"}]}
+            return {"current": {"temperature_2m": 16.6, "weather_code": 3},
+                    "daily": {"temperature_2m_max": [19.7], "temperature_2m_min": [6.7]}}
+
+        service = services.get("get_weather")
+        service.handler(fetch, {"place": "Jõgeva"})
+        self.assertIn("name=J%C3%B5geva", asked[0])
+        self.assertNotIn("õ", asked[0])
+
+    def test_a_space_in_a_place_name_still_works(self):
+        asked = []
+
+        def fetch(url, timeout=10.0):
+            asked.append(url)
+            if "search" in url:
+                return {"results": [{"latitude": 1.0, "longitude": 2.0,
+                                     "name": "New York", "country": "USA"}]}
+            return {"current": {}, "daily": {}}
+
+        services.get("get_weather").handler(fetch, {"place": "New York"})
+        self.assertIn("name=New%20York", asked[0])
+
+
+class NetworkReachTests(unittest.TestCase):
+    """What Aura may read now that the domain allowlist is gone.
+
+    Mat removed it: naming every site by hand cost him more than it protected.
+    The address check stayed, and it is a different thing — it refuses a public
+    name that resolves onto this machine or the network it sits on.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+
+    def test_no_tool_can_grant_itself_anything(self):
+        """The rule that outlived the allowlist: reach is something Mat gives,
+        never something the model asks for mid-turn."""
+        offered = {item["function"]["name"] for item in self.agent.tool_definitions()}
+        self.assertFalse([name for name in offered if name.startswith("grant_")])
+
+    def test_a_name_resolving_onto_the_local_network_is_refused(self):
+        """Checked on every hop rather than once, because DNS can change
+        between one request and the next."""
+        with patch("aura.agent.reject_unsafe_host",
+                   side_effect=PermissionRefused("rebound.test resolves to a private address")):
+            result = self.agent._execute_tool(
+                ToolCall("1", "http_get", {"url": "https://rebound.test/"}), None)
+        self.assertFalse(result["ok"])
+        self.assertIn("private address", result["error"])
+        self.assertEqual(self.agent.fetched_sources, [])
+
+    def test_a_private_address_is_recognised_whatever_shape_it_arrives_in(self):
+        for address in ("127.0.0.1", "192.168.1.1", "10.0.0.5", "169.254.169.254"):
+            with self.subTest(address=address):
+                self.assertTrue(is_private_address(address))
+        self.assertFalse(is_private_address("93.184.216.34"))
+
+    def test_the_reply_still_names_every_address_it_read(self):
+        """The half of the old model that mattered most: she cites what she
+        read, so an answer can be checked against its source."""
+        report = AuraAgent._format_completion_evidence(
+            "It is 22 degrees in Tartu.", None, None, [], [], None,
+            ["https://api.open-meteo.com/v1/forecast?x=1",
+             "https://api.open-meteo.com/v1/forecast?x=1"])
+        self.assertIn("Read from the network:", report)
+        self.assertEqual(report.count("https://api.open-meteo.com"), 1)
+
+
+class NetworkStatusTests(unittest.TestCase):
+    """The panel reports what she reads, not what she has been allowed to."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.bridge = AuraWebBridge(agent=self.agent, speech=SpeechOutput(enabled=False))
+        self.addCleanup(self.bridge.shutdown)
+
+    def test_she_is_online_without_anything_being_granted(self):
+        status = self.bridge.network_status()["network"]
+        self.assertTrue(status["online"])
+
+    def test_the_panel_names_what_the_built_in_services_read(self):
+        status = self.bridge.network_status()["network"]
+        self.assertIn("api.open-meteo.com", status["domains"])
+        self.assertTrue(status["services"])
+
+    def test_revoking_everything_leaves_the_web_reachable(self):
+        """Revoke clears folder grants. It never took the web away, and now
+        there is nothing about the web for it to take."""
+        self.bridge.revoke_all_permissions()
+        self.assertTrue(self.bridge.network_status()["network"]["online"])
+
+
+class EveryToolRunsTests(unittest.TestCase):
+    """Call all 57 tools once and see which are actually broken.
+
+    The unit tests above cover tools one at a time, in the shape each was
+    written for. This calls every one with arguments a sensible caller would
+    pass, which is a different question and catches a different fault: it found
+    `list_external_folder` answering "that is a folder, not a file" about a
+    folder it exists to list, because `PermissionDenied` subclasses
+    `PermissionError` and a translator meant for filesystem errors had caught
+    Aura's own refusal.
+
+    Order matters and is fixed here rather than left to the registry: `forget`
+    sorts before `correct`, so running in definition order deletes the memory
+    before the correction creates it.
+    """
+
+    #: Tools that cannot succeed in a scratch workspace, and why. Listed rather
+    #: than skipped, so "it refused" is a claim this test makes on purpose.
+    REFUSES = {
+        "rollback_task": "no such task",
+        "undo_external_change": "nothing was ever written outside",
+        "look_at_image": "the mock model has no vision",
+        "search_web": "no search service is configured here",
+        "read_external_file": "no folder grant",
+        "write_external_file": "no folder grant",
+        "list_external_folder": "no folder grant",
+        "http_get": "no network in tests",
+        "get_weather": "no network in tests",
+    }
+
+    #: Run before the alphabetical sweep, in this order, because they depend on
+    #: each other.
+    ORDERED = ("remember_personal_fact", "correct_personal_fact",
+               "forget_personal_fact")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        box = self.agent.sandbox
+        box.write_file("notes.txt", "first line\n")
+        box.write_file("site/index.html",
+                       "<html><head><title>Shop</title></head><body>"
+                       "<h1>Shop</h1></body></html>")
+        box.write_file("site/app.js", "const grid = document.body;\n")
+        box.write_file("site/style.css", "body { margin: 0; }\n")
+        # compare_files sorts before write_files, so its operands cannot be
+        # something an earlier tool in the sweep happened to create.
+        box.write_file("site/one.txt", "one\n")
+        box.write_file("site/two.txt", "two\n")
+        for name in ("shot.png", "shot2.png"):
+            (box.root / name).write_bytes(self.png())
+        self.agent.current_project = "site"
+
+    @staticmethod
+    def png(colour=(255, 0, 0), size=4):
+        raw = b"".join(b"\x00" + bytes(colour) * size for _ in range(size))
+        def chunk(tag, data):
+            body = tag + data
+            return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+        return (b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw))
+                + chunk(b"IEND", b""))
+
+    def arguments(self):
+        outside = str(Path(self.temp.name) / "outside")
+        return {
+            "list_files": {"path": "."},
+            "read_file": {"path": "site/index.html"},
+            "read_many_files": {"paths": ["site/index.html", "site/app.js"]},
+            "file_info": {"path": "site/index.html"},
+            "append_file": {"path": "notes.txt", "content": "another line\n"},
+            "write_file": {"path": "site/fresh.txt", "content": "written"},
+            "create_file": {"path": "site/created.txt", "content": "created"},
+            "create_folder": {"path": "site/assets"},
+            "write_files": {"files": [{"path": "site/one.txt", "content": "1"},
+                                      {"path": "site/two.txt", "content": "2"}]},
+            "replace_in_file": {"path": "site/app.js", "old_text": "const grid",
+                                "new_text": "const productGrid"},
+            "apply_edits": {"path": "site/index.html",
+                            "edits": [{"old_text": "<title>Shop</title>",
+                                       "new_text": "<title>Shop 2</title>"}]},
+            "copy_file": {"source": "notes.txt", "destination": "notes-copy.txt"},
+            "move_file": {"source": "notes-copy.txt", "destination": "site/moved.txt"},
+            "safe_delete_file": {"path": "site/moved.txt"},
+            "create_archive": {"source": "site", "destination": "site.zip"},
+            "extract_archive": {"archive": "site.zip", "destination": "unpacked"},
+            "search_files": {"query": "index", "path": "."},
+            "search_text": {"query": "grid", "path": "."},
+            "compare_files": {"left": "site/one.txt", "right": "site/two.txt"},
+            "find_relevant_files": {"query": "product grid", "path": "."},
+            "workspace_summary": {},
+            "inspect_code": {"path": "site/app.js"},
+            "validate_project": {"path": "site"},
+            "check_accessibility": {"path": "site"},
+            "undo_last_change": {},
+            "rollback_task": {"task_id": "no-such-task"},
+            "change_history": {"limit": 5},
+            "undo_external_change": {},
+            "recent_tasks": {"limit": 5},
+            "remember_name": {"name": "Mat"},
+            "remember_lesson": {"lesson": "asset paths stay relative"},
+            "remember_preference": {"key": "tone", "value": "direct"},
+            "remember_personal_fact": {"category": "interest", "value": "electronics"},
+            "correct_personal_fact": {"query": "electronics", "new_value": "synthesisers"},
+            "forget_personal_fact": {"query": "synthesisers"},
+            "list_personal_memory": {},
+            "list_granted_folders": {},
+            "record_plan_steps": {"steps": ["Create site/index.html", "Style it"]},
+            "update_plan_step": {"step": "Style it", "status": "done",
+                                 "evidence": "stylesheet written"},
+            "look_at_image": {"path": "shot.png"},
+            "compare_images": {"first": "shot.png", "second": "shot2.png"},
+            "capture_page": {"path": "site/index.html"},
+            "open_workspace_item": {"path": "site/index.html"},
+            "run_command": {"command": ["python", "--version"], "timeout": 20},
+            "system_info": {},
+            "capability_summary": {},
+            "self_check": {},
+            "how_i_have_been_running": {"days": 7},
+            "calculate": {"expression": "17 * 3 + 2"},
+            "execute_code": {"script": "print('ran')", "purpose": "smoke"},
+            "set_check": {"check": "broken_links", "every_minutes": 120},
+            "set_reminder": {"text": "stretch", "in_minutes": 60},
+            "search_web": {"query": "quantum mechanics"},
+            "http_get": {"url": "https://example.invalid/"},
+            "get_weather": {"place": "Tallinn"},
+            "read_external_file": {"path": outside + "/a.txt"},
+            "write_external_file": {"path": outside + "/a.txt", "content": "x"},
+            "list_external_folder": {"path": outside},
+        }
+
+    def test_every_tool_has_arguments_here(self):
+        """A new tool must be added to this sweep, or it is never exercised."""
+        every = {item["function"]["name"] for item in AuraAgent.tool_definitions()}
+        self.assertEqual(every - set(self.arguments()), set())
+
+    def test_no_tool_raises_and_every_one_answers(self):
+        args = self.arguments()
+        names = self.ORDERED + tuple(
+            name for name in sorted(args) if name not in self.ORDERED)
+        broken = []
+        for name in names:
+            with patch("aura.agent.AuraAgent._http_get",
+                       side_effect=RuntimeError("no network in tests")):
+                result = self.agent._execute_tool(
+                    ToolCall("t", name, args[name]), lambda *_: True)
+            self.assertIn("ok", result, name)
+            if not result.get("ok") and name not in self.REFUSES:
+                broken.append(f"{name}: {result.get('error')}")
+        self.assertEqual(broken, [])
+
+    def test_a_refusal_never_describes_a_folder_as_a_file(self):
+        """The bug this sweep found: `list_external_folder` exists to take a
+        folder, and was told it had named one where a file belonged."""
+        result = self.agent._execute_tool(
+            ToolCall("t", "list_external_folder",
+                     {"path": str(Path(self.temp.name) / "outside")}), lambda *_: True)
+        self.assertFalse(result["ok"])
+        self.assertNotIn("not a file", result["error"])
+        self.assertIn("permission", result["error"].casefold())
+
+
+class AskingIfSomethingIsSoundTests(unittest.TestCase):
+    """Measured against the loaded model, not reasoned about.
+
+    Twelve ordinary requests were put to gpt-oss with the real system prompt
+    and the tools routing offers. Two came back wrong for reasons on this side
+    of the wire rather than the model's.
+    """
+
+    def offered(self, message):
+        return {item["function"]["name"] for item in
+                routing.select(message, "powerful", "balanced",
+                               AuraAgent.tool_definitions())}
+
+    def test_asking_whether_something_is_broken_offers_the_tool_that_answers(self):
+        """"Is anything broken in shop?" carries none of the verbs the rule
+        looked for, so it came back with the read-only fallback and not the one
+        tool that could have answered it."""
+        for question in ("Is anything broken in shop?",
+                         "What is wrong with my shop page?",
+                         "Are there problems with the shop project?",
+                         "Any errors in shop?"):
+            with self.subTest(question=question):
+                self.assertIn("validate_project", self.offered(question))
+
+    def test_a_shell_is_not_offered_beside_the_tool_that_answers(self):
+        """Asked to check the shop, the model reached past the offered
+        `validate_project` for `python -m validate_project` — a shell next to a
+        tool that does the same job is an invitation, and it cost a round and a
+        refusal to decline it."""
+        for question in ("Check the shop project for problems",
+                         "Is anything broken in shop?",
+                         "Validate the shop project"):
+            with self.subTest(question=question):
+                offered = self.offered(question)
+                self.assertIn("validate_project", offered)
+                self.assertNotIn("run_command", offered)
+
+    def test_actually_running_something_still_offers_the_shell(self):
+        """The narrowing must not cost the case run_command exists for."""
+        for request in ("Run the tests", "Run python hello.py",
+                        "Execute the build script"):
+            with self.subTest(request=request):
+                self.assertIn("run_command", self.offered(request))
+
+
+class ExecuteCodeTests(unittest.TestCase):
+    """A script the model wrote, with Aura's tools inside it.
+
+    The point is context: reading six files one call at a time put 2,712
+    characters into the conversation and left them there; the same six read
+    inside a script and summarised cost 158. That is the whole reason this
+    exists, and the reason it is worth the surface it adds.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        for index in range(4):
+            self.agent.sandbox.write_file(f"note{index}.txt", f"line {index}\n" * 10)
+        self.agent.sandbox.write_file("a.py", "old_api(1)\n")
+        self.agent.sandbox.write_file("b.py", "old_api(2)\n")
+
+    def run_script(self, script, **extra):
+        return self.agent._execute_tool(
+            ToolCall("c", "execute_code", {"script": script, **extra}),
+            lambda *_: True)
+
+    def test_a_script_can_read_the_workspace_through_the_real_tools(self):
+        result = self.run_script(
+            "from aura_tools import list_files, read_file\n"
+            "names = [f for f in list_files(path='.')['files'] if f.endswith('.txt')]\n"
+            "print(len(names), sum(len(read_file(path=n)['content']) for n in names))")
+        self.assertEqual(result["status"], "ok", result.get("error"))
+        self.assertTrue(result["output"].startswith("4 "))
+        self.assertGreater(result["tool_calls"], 1)
+
+    def test_edits_made_by_a_script_really_land(self):
+        result = self.run_script(
+            "from aura_tools import replace_in_file\n"
+            "for name in ('a.py', 'b.py'):\n"
+            "    replace_in_file(path=name, old_text='old_api', new_text='new_api')\n"
+            "print('done')")
+        self.assertEqual(result["status"], "ok", result.get("error"))
+        self.assertIn("new_api", self.agent.sandbox.read_file("a.py"))
+        self.assertIn("new_api", self.agent.sandbox.read_file("b.py"))
+
+    def test_only_what_it_printed_comes_back(self):
+        """The intermediate reads must not reach the conversation, or the tool
+        has cost a process and saved nothing."""
+        result = self.run_script(
+            "from aura_tools import read_file\n"
+            "body = read_file(path='note0.txt')['content']\n"
+            "print('length', len(body))")
+        self.assertEqual(result["output"].strip(), "length 70")
+        self.assertNotIn("line 0", json.dumps(result))
+
+    def test_a_withheld_tool_is_not_in_the_stub(self):
+        """`run_command` carries the approval prompt, and approving a script is
+        not approving every command it might run."""
+        result = self.run_script(
+            "from aura_tools import run_command\nprint('should not get here')")
+        self.assertEqual(result["status"], "error")
+        self.assertNotIn("should not get here", result.get("output", ""))
+
+    def test_a_tool_not_on_the_list_is_refused_over_the_wire_too(self):
+        """The stub is a convenience; the bridge is the enforcement."""
+        bridge = code_exec.ToolBridge(lambda name, args: {"ok": True},
+                                      allowed=frozenset({"read_file"}), max_calls=5)
+        try:
+            answer = bridge._answer({"token": bridge.token, "tool": "run_command",
+                                     "arguments": {}})
+        finally:
+            bridge.stop()
+        self.assertFalse(answer["ok"])
+        self.assertIn("cannot be called from a script", answer["error"])
+
+    def test_a_call_without_the_token_is_refused(self):
+        """A loopback port has no owner, so any process on this machine could
+        otherwise drive Aura's tools."""
+        bridge = code_exec.ToolBridge(lambda name, args: {"ok": True},
+                                      allowed=frozenset({"read_file"}), max_calls=5)
+        try:
+            answer = bridge._answer({"token": "guessed", "tool": "read_file",
+                                     "arguments": {}})
+        finally:
+            bridge.stop()
+        self.assertFalse(answer["ok"])
+        self.assertIn("not authorised", answer["error"])
+
+    def test_a_script_that_runs_away_is_stopped(self):
+        self.agent.SCRIPT_TIMEOUT = 3.0
+        result = self.run_script("while True:\n    pass")
+        self.assertEqual(result["status"], "timeout")
+
+    def test_a_script_that_prints_nothing_is_told_so(self):
+        """An empty result reads as silence, which is nearly always a mistake
+        rather than an answer."""
+        result = self.run_script("from aura_tools import list_files\nlist_files(path='.')")
+        self.assertEqual(result["status"], "no_output")
+        self.assertIn("print", result["error"])
+
+    def test_a_crash_keeps_what_it_managed_to_print(self):
+        result = self.run_script("print('got this far')\nraise ValueError('no')")
+        self.assertEqual(result["status"], "error")
+        self.assertIn("got this far", result["output"])
+        self.assertIn("ValueError", result["error"])
+
+    def test_secrets_are_stripped_from_the_environment(self):
+        environment = code_exec.safe_environment()
+        for name in environment:
+            self.assertNotIn("key", name.casefold())
+            self.assertNotIn("token", name.casefold())
+            self.assertNotIn("secret", name.casefold())
+
+    def test_the_stub_is_valid_python(self):
+        """It is generated, so nothing else would catch a broken one."""
+        source = code_exec.build_stub({"read_file": 'Read a file "safely"',
+                                       "write_file": "Write a file"})
+        compile(source, "aura_tools.py", "exec")
+        self.assertIn("def read_file(", source)
+        self.assertIn("def write_file(", source)
+
+    def test_it_is_offered_for_work_over_a_set_of_files(self):
+        for request in ("Read every html file and tell me which lack a title",
+                        "Replace old_api with new_api everywhere",
+                        "Check all the pages for broken links"):
+            with self.subTest(request=request):
+                offered = {item["function"]["name"] for item in
+                           routing.select(request, "powerful", "balanced",
+                                          AuraAgent.tool_definitions())}
+                self.assertIn("execute_code", offered)
+
+    def test_it_is_not_offered_for_a_single_step(self):
+        """A script whose body is one tool call costs a process and saves
+        nothing."""
+        offered = {item["function"]["name"] for item in
+                   routing.select("Read shop/index.html", "powerful", "balanced",
+                                  AuraAgent.tool_definitions())}
+        self.assertNotIn("execute_code", offered)
+
+
+class AnswerReserveTests(unittest.TestCase):
+    """How much of the window to keep clear for the reply.
+
+    The first version of this subtracted the whole answer *limit*, on the
+    reasoning that output shares the window with the prompt. The first half is
+    true and the conclusion is not: the limit is a ceiling the server does not
+    hold back against the prompt. Measured against the loaded model — an
+    18,880-token prompt succeeded with the limit at 64,000 on a 66,816-token
+    window, which the old arithmetic called impossible.
+
+    It mattered. Mat raised his profiles to 64,000 and his next turn inspected
+    three files instead of five, because Aura kept compacting a conversation
+    that fitted.
+    """
+
+    def test_a_cap_larger_than_the_window_does_not_swallow_it(self):
+        """The setting that exposed the bug."""
+        self.assertEqual(context_budget.room_for_request(66816, 64000), 62720)
+
+    def test_a_modest_cap_is_still_respected(self):
+        """A limit smaller than the default reserve is the real ceiling: the
+        answer cannot exceed it, so holding more back would be pretending."""
+        self.assertEqual(context_budget.answer_reserve(2048, 66816), 2048)
+
+    def test_a_small_window_keeps_most_of_itself_for_the_conversation(self):
+        reserve = context_budget.answer_reserve(64000, 8192)
+        self.assertLessEqual(reserve, 8192 // context_budget.MOST_OF_WINDOW_RESERVED)
+        self.assertGreater(reserve, 0)
+
+    def test_the_reserve_grows_to_fit_the_replies_actually_seen(self):
+        """Being wrong low is what truncates an answer mid-sentence, so the
+        largest recent reply sets the floor rather than the average."""
+        meter = context_budget.TokenMeter()
+        for reply in (900, 6000, 1100):
+            meter.observe_answer(reply)
+        self.assertEqual(meter.typical_answer, 6000)
+        self.assertGreater(context_budget.answer_reserve(64000, 66816, meter),
+                           context_budget.DEFAULT_ANSWER_RESERVE)
+
+    def test_a_nonsense_completion_is_ignored(self):
+        meter = context_budget.TokenMeter()
+        meter.observe_answer(0)
+        meter.observe_answer("lots")
+        self.assertEqual(meter.typical_answer, 0)
+
+    def test_an_unknown_window_still_claims_nothing(self):
+        self.assertEqual(context_budget.room_for_request(0, 4096), 0)
+
+
+class ContextHealthTests(unittest.TestCase):
+    """What Diagnostics says about the window."""
+
+    class _Provider:
+        def __init__(self, size): self.size = size
+        def loaded_context(self): return self.size
+
+    class _Agent:
+        def __init__(self, size, data):
+            self.provider = ContextHealthTests._Provider(size)
+            self.config = type("C", (), {"data": data})()
+
+    def test_a_small_window_is_still_warned_about(self):
+        result = health._check_context(self._Agent(8000, {"sampling_by_task": True}))
+        self.assertEqual(result.status, health.WARN)
+        self.assertIn("only 8,000", result.detail)
+
+    def test_a_limit_larger_than_the_window_is_called_out_as_confused(self):
+        """Harmless — an answer can never reach it — but it promises something
+        it cannot do, which is worth saying once."""
+        # A small window rather than a huge cap: sampling clamps the limit to
+        # 65,536, so on a 66,816-token window no setting can exceed it. The
+        # case is real the other way round — the limit left at 64,000 while a
+        # model is loaded with 32,768.
+        result = health._check_context(
+            self._Agent(32768, {"sampling_by_task": False, "max_tokens": 64000}))
+        self.assertEqual(result.status, health.WARN)
+        self.assertIn("larger than the whole window", result.detail)
+
+    def test_mats_own_settings_now_read_as_fine(self):
+        result = health._check_context(self._Agent(66816, {
+            "sampling_by_task": True, "max_tokens_chat": 64000,
+            "max_tokens_work": 64000, "max_tokens_code": 64000}))
+        self.assertEqual(result.status, health.OK)
+        self.assertIn("62,720", result.detail)
+
+
+class ToolErrorTests(unittest.TestCase):
+    """Every tool failure the model saw used to be the raw exception."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.agent.sandbox.write_file("shop/js/main.bundle.js", "x")
+        self.agent.sandbox.write_file("shop/notes.txt", "hello")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def fail(self, tool, args):
+        return self.agent._execute_tool(ToolCall("id", tool, args), lambda *_: True)["error"]
+
+    def test_a_folder_read_as_a_file_does_not_claim_a_permission_problem(self):
+        """Windows raises PermissionError for a folder, so the raw message named
+        the one cause that is certainly wrong — and a model that believes it is
+        not allowed stops trying."""
+        message = self.fail("read_file", {"path": "shop"})
+        self.assertIn("is a folder", message)
+        self.assertNotIn("Permission denied", message)
+        self.assertIn("list_files", message)
+
+    def test_a_near_miss_filename_is_offered(self):
+        """From the log: `main_bundle.js` was asked for while `main.bundle.js`
+        sat beside it, and nothing pointed at the answer."""
+        message = self.fail("read_file", {"path": "shop/js/main_bundle.js"})
+        self.assertIn("main.bundle.js", message)
+
+    def test_a_genuinely_missing_file_is_not_given_a_false_suggestion(self):
+        message = self.fail("read_file", {"path": "shop/absent.txt"})
+        self.assertIn("does not exist", message)
+        self.assertNotIn("Did you mean", message)
+
+    def test_the_host_path_never_reaches_the_model(self):
+        """The model works in workspace-relative paths, and Mat's directory
+        layout is not the model's business."""
+        for tool, args in (("read_file", {"path": "shop/absent.txt"}),
+                           ("read_many_files", {"paths": ["shop"]}),
+                           ("read_file", {"path": "shop"})):
+            with self.subTest(tool=tool):
+                message = self.fail(tool, args)
+                self.assertNotIn(str(self.agent.sandbox.root), message)
+                self.assertNotIn("C:" + chr(92) + "Users", message)
+
+    def test_creating_a_file_that_exists_names_the_tool_that_would_work(self):
+        message = self.fail("create_file", {"path": "shop/notes.txt", "content": "x"})
+        self.assertIn("already exists", message)
+        self.assertIn("write_file", message)
+
+    def test_an_unrecognised_failure_is_passed_through_unchanged(self):
+        """A wrong explanation is worse than a raw one."""
+        self.assertEqual(
+            tool_errors.explain(ValueError("something specific broke"), "read_file",
+                                {"path": "x"}, self.agent.sandbox.root),
+            "something specific broke")
+
+    def test_the_log_keeps_the_raw_text_as_well(self):
+        """The sentence that helps a model act is not always the one that helps
+        Mat debug, so the record keeps both."""
+        shown = self.fail("read_file", {"path": "shop"})
+        rows = [row for row in self.agent.log.recent(20)
+                if row.get("action") == "read_file" and row.get("status") == "error"]
+        self.assertTrue(rows)
+        self.assertIn("Errno 13", rows[0]["raw_error"])
+        self.assertNotIn("Errno 13", shown)
+
+
+class RunCommandGuardTests(unittest.TestCase):
+    """A tool reached through a runner is the same mistake as calling it."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def run_command(self, command):
+        return self.agent._tool_run_command(
+            "run_command", {"command": command, "timeout": 5}, lambda c: True, None)
+
+    def test_a_tool_run_as_a_python_module_is_refused(self):
+        """The real attempt from the log, which the direct-name guard missed."""
+        result = self.run_command(["python", "-m", "validate_project"])
+        self.assertTrue(result.get("refused"))
+        self.assertIn("one of your tools", result["error"])
+
+    def test_a_tool_run_inside_a_shell_script_is_refused(self):
+        result = self.run_command(["bash", "-lc", "validate_project shop"])
+        self.assertTrue(result.get("refused"))
+
+    def test_code_that_merely_mentions_a_tool_name_is_not_refused(self):
+        """Refusing this would block real work to prevent a typo."""
+        result = self.run_command(["python", "-c", "def read_file(p): pass"])
+        self.assertFalse(result.get("refused"))
+
+    def test_a_missing_program_is_named(self):
+        """Fourteen of sixteen recorded command failures were an unnamed
+        "[WinError 2] The system cannot find the file specified"."""
+        result = self.run_command(["definitely-not-a-real-program-xyz"])
+        self.assertIn("definitely-not-a-real-program-xyz", result["error"])
+        self.assertIn("not installed", result["error"])
+        self.assertNotIn("WinError", result["error"])
+
+
+class EmptyReplyTests(unittest.TestCase):
+    """The several different failures that all look like silence."""
+
+    def test_a_reply_with_content_is_not_a_silence(self):
+        self.assertEqual(empty_reply.classify(
+            ProviderReply("here you go", [])).name, "none")
+
+    def test_missing_usage_fails_open_to_the_ordinary_retry(self):
+        """The mistake this test exists to prevent.
+
+        A reply carrying no usage at all is indistinguishable from an ordinary
+        quiet turn, and treating it as evidence turned a retryable stumble into
+        a dead turn — nine tests caught it, which is the only reason it never
+        reached Mat.
+        """
+        blank = ProviderReply("", [])
+        self.assertFalse(blank.usage_reported)
+        kind = empty_reply.classify(blank)
+        self.assertNotEqual(kind.name, "never_asked")
+        self.assertTrue(kind.worth_retrying)
+        self.assertIn("completely empty", kind.instruction)
+
+    def test_a_counted_request_that_counted_nothing_is_not_the_models_fault(self):
+        kind = empty_reply.classify(ProviderReply(
+            "", [], "", 0, 0, "", usage_reported=True))
+        self.assertEqual(kind.name, "never_asked")
+        self.assertFalse(kind.worth_retrying)
+        self.assertEqual(kind.instruction, "")
+        self.assertIn("did not reach the model", kind.explanation)
+
+    def test_a_deliberate_stop_is_told_to_answer_directly(self):
+        """The shape in Mat's log: finish_reason stop, one completion token."""
+        kind = empty_reply.classify(ProviderReply(
+            "", [], "stop", 3907, 1, "", usage_reported=True))
+        self.assertEqual(kind.name, "chose_silence")
+        self.assertTrue(kind.worth_retrying)
+        self.assertIn("completely empty", kind.instruction)
+
+    def test_thinking_the_whole_budget_away_is_a_different_fault(self):
+        """gpt-oss reasons in a separate channel, so a turn can generate
+        thousands of tokens and still arrive with no answer. Telling that model
+        it said nothing is false as well as useless."""
+        kind = empty_reply.classify(ProviderReply(
+            "", [], "length", 9000, 6144, "long private reasoning",
+            usage_reported=True), answer_limit=6144)
+        self.assertEqual(kind.name, "thought_it_away")
+        self.assertIn("thinking", kind.instruction)
+        self.assertIn("6,144", kind.explanation)
+
+    def test_the_tools_survive_a_turn_that_only_ran_out_of_room(self):
+        """Taking the tools away there would throw out the turn's own work."""
+        thought = empty_reply.classify(ProviderReply(
+            "", [], "length", 9000, 6144, "thinking", usage_reported=True))
+        silent = empty_reply.classify(ProviderReply(
+            "", [], "stop", 3907, 1, "", usage_reported=True))
+        self.assertEqual(thought.name, "thought_it_away")
+        self.assertEqual(silent.name, "chose_silence")
+
+    def test_it_never_raises_on_a_reply_it_does_not_recognise(self):
+        class Odd:
+            content = ""
+            prompt_tokens = "lots"
+            completion_tokens = None
+        kind = empty_reply.classify(Odd())
+        self.assertTrue(kind.worth_retrying)
+
+
+class ContextBudgetTests(unittest.TestCase):
+    """Measuring the request before sending it, rather than after it failed."""
+
+    def test_a_short_string_never_costs_nothing(self):
+        """A hundred short tool results that each estimate as zero add up to
+        zero, and the check meant to catch overflow is the thing that misses it."""
+        meter = context_budget.TokenMeter()
+        self.assertGreater(meter.tokens_for(context_budget.request_characters(
+            [{"role": "tool", "content": "ok"}])), 0)
+
+    def test_tool_schemas_are_part_of_the_bill(self):
+        """They measured as the densest content in the payload, and they are
+        easy to forget because nobody types them."""
+        messages = [{"role": "user", "content": "hello"}]
+        tools = [{"function": {"name": "read_file", "description": "x" * 400}}]
+        self.assertGreater(context_budget.request_characters(messages, tools),
+                           context_budget.request_characters(messages) + 300)
+
+    def test_the_rate_is_learned_from_what_the_model_charged(self):
+        meter = context_budget.TokenMeter()
+        self.assertFalse(meter.calibrated)
+        meter.observe(48000, 10128)      # 48k chars cost 10k tokens: ~4.8 each
+        self.assertTrue(meter.calibrated)
+        self.assertAlmostEqual(meter.chars_per_token, 4.8, places=1)
+
+    def test_it_bills_at_the_densest_rate_seen_not_the_average(self):
+        """The densest observation gives the largest estimate. Overestimating
+        costs a little context; underestimating costs the turn."""
+        meter = context_budget.TokenMeter()
+        meter.observe(60000, 10128)      # ~6.0 chars per token
+        meter.observe(40000, 10128)      # ~4.0 — denser, so this one wins
+        self.assertAlmostEqual(meter.chars_per_token, 4.0, places=1)
+
+    def test_a_tiny_request_does_not_teach_it_anything(self):
+        """At 35 characters the template preamble is most of the bill, so a
+        short turn measures the preamble rather than the rate."""
+        meter = context_budget.TokenMeter()
+        meter.observe(35, 68)
+        self.assertFalse(meter.calibrated)
+
+    def test_a_nonsense_observation_is_ignored(self):
+        meter = context_budget.TokenMeter()
+        meter.observe(50000, 200)        # 250 chars per token is not a tokenizer
+        meter.observe(2000, "many")
+        self.assertFalse(meter.calibrated)
+
+
+    def test_an_unknown_window_never_blocks_a_turn(self):
+        call = context_budget.verdict(context_budget.TokenMeter(),
+                                      [{"role": "user", "content": "x" * 500000}],
+                                      None, 0, 4096)
+        self.assertFalse(call["known"])
+        self.assertTrue(call["fits"])
+        self.assertEqual(call["over_by"], 0)
+
+    def test_an_oversized_request_is_reported_as_not_fitting(self):
+        call = context_budget.verdict(context_budget.TokenMeter(),
+                                      [{"role": "user", "content": "x" * 200000}],
+                                      None, 36608, 6144)
+        self.assertFalse(call["fits"])
+        self.assertGreater(call["over_by"], 0)
+
+    def test_the_guard_rounds_against_the_request(self):
+        call = context_budget.verdict(context_budget.TokenMeter(),
+                                      [{"role": "user", "content": "x" * 40000}],
+                                      None, 36608, 4096)
+        self.assertGreater(call["guarded"], call["needed"])
+
+
+class SamplingTests(unittest.TestCase):
+    """One temperature for chatting, thinking, and writing code was one too few."""
+
+    def test_the_kind_of_turn_comes_from_the_tools_it_was_offered(self):
+        self.assertEqual(sampling.kind_for_tools(["write_file", "read_file"]), "code")
+        self.assertEqual(sampling.kind_for_tools(["read_file", "validate_project"]), "work")
+        self.assertEqual(sampling.kind_for_tools(["remember_name"]), "chat")
+        self.assertEqual(sampling.kind_for_tools([]), "chat")
+
+    def test_writing_wins_over_reading_when_both_are_offered(self):
+        """Almost every build turn also reads. The write is what decides it."""
+        self.assertEqual(
+            sampling.kind_for_tools(["read_file", "search_files", "apply_edits"]), "code")
+
+    def test_each_profile_is_cooler_than_the_one_before(self):
+        heats = [sampling.for_turn(tools, {}).temperature for tools in
+                 (["remember_name"], ["read_file"], ["write_file"])]
+        self.assertEqual(heats, sorted(heats, reverse=True))
+
+    def test_switching_the_profile_off_restores_the_single_pair(self):
+        off = sampling.for_turn(["write_file"], {
+            "sampling_by_task": False, "temperature": 0.55, "max_tokens": 3000})
+        self.assertEqual((off.temperature, off.max_tokens), (0.55, 3000))
+
+    def test_mats_own_values_are_used_when_he_has_set_them(self):
+        tuned = sampling.for_turn(["write_file"], {"temperature_code": 1.0,
+                                                   "max_tokens_code": 8192})
+        self.assertEqual((tuned.temperature, tuned.max_tokens), (1.0, 8192))
+
+    def test_a_nonsense_setting_falls_back_rather_than_raising(self):
+        """A bad value in config.json must not cost a turn."""
+        safe = sampling.for_turn(["read_file"], {"temperature_work": "warm",
+                                                 "max_tokens_work": None})
+        self.assertEqual((safe.temperature, safe.max_tokens), sampling.DEFAULTS["work"])
+
+    def test_top_p_and_top_k_are_silent_until_mat_sets_them(self):
+        """Blank means LM Studio's loaded value stands, which is not the same
+        as sending 1.0 and 0 — that would override the slider with "no
+        filtering" rather than leaving it alone."""
+        quiet = sampling.for_turn(["write_file"], {})
+        self.assertIsNone(quiet.top_p)
+        self.assertIsNone(quiet.top_k)
+        set_by_hand = sampling.for_turn(["write_file"], {"top_p": 0.9, "top_k": 40})
+        self.assertEqual((set_by_hand.top_p, set_by_hand.top_k), (0.9, 40))
+
+    def test_top_values_apply_whichever_way_temperature_is_decided(self):
+        single = sampling.for_turn(["write_file"], {"sampling_by_task": False,
+                                                    "top_p": 1.0, "top_k": 0})
+        self.assertEqual((single.top_p, single.top_k), (1.0, 0))
+
+    def test_a_top_value_that_is_not_a_number_falls_back_to_silence(self):
+        odd = sampling.for_turn(["read_file"], {"top_p": "wide", "top_k": ""})
+        self.assertIsNone(odd.top_p)
+        self.assertIsNone(odd.top_k)
+
+    def test_the_payload_carries_them_only_when_set(self):
+        """The measured point: a value in the request overrides the loaded one,
+        so an unset field has to be absent rather than defaulted."""
+        provider = LMStudioProvider(base_url="http://127.0.0.1:1234/v1", model="m")
+        captured = {}
+
+        def fake(payload):
+            captured.update(payload)
+            return ProviderReply(content="ok", tool_calls=[])
+
+        provider._complete_without_stream = fake
+        provider.complete([{"role": "user", "content": "hi"}], temperature=0.5)
+        self.assertNotIn("top_p", captured)
+        self.assertNotIn("top_k", captured)
+        self.assertEqual(captured["temperature"], 0.5)
+        captured.clear()
+        provider.complete([{"role": "user", "content": "hi"}],
+                          temperature=0.5, top_p=0.9, top_k=40)
+        self.assertEqual((captured["top_p"], captured["top_k"]), (0.9, 40))
+
+    def test_every_routable_tool_has_a_profile(self):
+        """A tool in neither set would quietly sample its turn as chat."""
+        known = sampling.WRITING_TOOLS | sampling.WORKING_TOOLS
+        chatting = {"remember_name", "remember_preference", "remember_personal_fact",
+                    "remember_lesson", "list_personal_memory", "forget_personal_fact",
+                    "correct_personal_fact", "capability_summary", "get_weather",
+                    "set_reminder", "set_check", "safe_delete_file"}
+        every = {item["function"]["name"] for item in AuraAgent.tool_definitions()}
+        self.assertEqual(every - known - chatting, set())
+
+
 
 
 class AgentTests(unittest.TestCase):
@@ -1939,8 +3015,11 @@ class LMStudioProviderTests(unittest.TestCase):
             answer = agent.handle("What do you think of this idea?")
             self.assertIn("empty response", answer)
             self.assertIn("LM Studio", answer)
-            # The shared budget bounds it: four calls, not an endless loop.
-            self.assertEqual(provider.complete.call_count, 4)
+            # Two calls, not four. Every silence episode in the live log spent the
+            # full budget re-asking the same question and got the same silence
+            # back, at minutes a time. Silence now buys exactly one retry — the
+            # one that asks differently.
+            self.assertEqual(provider.complete.call_count, 2)
 
     def test_follow_up_routing_inherits_recent_build_intent(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2146,7 +3225,10 @@ class LMStudioProviderTests(unittest.TestCase):
         names = {tool["function"]["name"] for tool in AuraAgent.select_tool_definitions(
             "Build a Python project, validate it, and do not run commands"
         )}
-        self.assertEqual(names, {"list_files", "read_file", "create_file", "write_file", "validate_project"})
+        # The plan tools ride with every build: recording steps is part of building,
+        # and a tool the router never offers does not exist.
+        self.assertEqual(names, {"list_files", "read_file", "create_file", "write_file",
+                                 "validate_project", "record_plan_steps", "update_plan_step"})
 
     def test_artifact_contract_extracts_exact_project_paths(self):
         base, paths = AuraAgent._extract_artifact_contract(
@@ -2569,7 +3651,14 @@ class VoiceInputTests(unittest.TestCase):
                 mode="hold", on_partial=partials.append,
                 on_level=lambda level, _rms: levels.append(level))))
             worker.start()
-            time.sleep(0.03)
+            # Wait for the thing that actually has to have happened — the stream
+            # delivering audio — rather than for a guessed 30 milliseconds. A fixed
+            # sleep is a bet on the machine's mood: too short and the test fails on a
+            # busy day, too long and every run pays for it.
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not levels:
+                time.sleep(0.005)
+            self.assertTrue(levels, "the fake stream never delivered audio")
             voice.request_stop()
             worker.join(timeout=2)
         self.assertEqual(results, [(True, "hello aura")])
@@ -2947,6 +4036,13 @@ class WebBridgeTests(unittest.TestCase):
         self.assertIn("<h1>Aura</h1>", preview["content"])
         self.assertEqual(preview["url"], "/workspace-preview/site/index.html")
         self.assertFalse(preview["scripts_enabled"])
+        # This page renders whole without scripts, so the panel stays quiet.
+        self.assertFalse(preview["scripts_present"])
+        self.bridge.agent.sandbox.write_file(
+            "site/app.html", '<html><body><div id="list"></div>'
+                             '<script src="app.js"></script></body></html>')
+        # This one builds its own content, so the empty preview needs explaining.
+        self.assertTrue(self.bridge.preview_workspace_file("site/app.html")["scripts_present"])
         self.assertEqual(self.bridge.preview_workspace_file("site/archive.bin")["kind"], "binary")
 
         encoded = base64.b64encode(b"dragged into Aura").decode("ascii")
@@ -3086,6 +4182,145 @@ class WebBridgeTests(unittest.TestCase):
                                                  "session")
         self.assertFalse(result["ok"])
         self.assertEqual(self.bridge.list_permissions()["active"], [])
+
+    def test_the_provider_choice_is_saved_and_the_key_never_comes_back(self):
+        """The key is write-only from the interface. It is left out of
+        get_settings and out of diagnostics, which is the only thing keeping a
+        diagnostics file shareable."""
+        saved = self.bridge.save_settings({**self.bridge.get_settings(),
+                                           "provider": "claude",
+                                           "cloud_model": "claude-sonnet-5",
+                                           "anthropic_api_key": "sk-ant-secret"})
+        self.assertTrue(saved.get("ok"), saved)
+        settings = self.bridge.get_settings()
+        self.assertEqual(settings["provider"], "claude")
+        self.assertEqual(settings["cloud_model"], "claude-sonnet-5")
+        self.assertNotIn("anthropic_api_key", settings)
+        self.assertTrue(settings["anthropic_key_set"])
+        self.assertNotIn("anthropic_api_key", AuraWebBridge.DIAGNOSTIC_SETTINGS)
+        self.assertIsInstance(self.bridge.agent.provider, AnthropicProvider)
+
+    def test_a_blank_key_field_keeps_the_stored_key(self):
+        """The field opens blank because the key is never sent to the browser,
+        so treating blank as "erase it" would delete the key on every save."""
+        self.bridge.save_settings({**self.bridge.get_settings(), "provider": "claude",
+                                   "anthropic_api_key": "sk-ant-secret"})
+        self.bridge.save_settings({**self.bridge.get_settings(), "provider": "claude",
+                                   "anthropic_api_key": ""})
+        self.assertEqual(self.bridge.agent.config.data["anthropic_api_key"], "sk-ant-secret")
+        self.assertTrue(self.bridge.get_settings()["anthropic_key_set"])
+
+    def test_choosing_claude_without_a_key_is_refused_with_the_way_out(self):
+        with unittest.mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}, clear=False):
+            result = self.bridge.save_settings({**self.bridge.get_settings(),
+                                                "provider": "claude",
+                                                "anthropic_api_key": ""})
+        self.assertFalse(result["ok"])
+        self.assertIn("ANTHROPIC_API_KEY", result["error"])
+
+    def test_an_unknown_model_name_is_refused_rather_than_sent(self):
+        result = self.bridge.save_settings({**self.bridge.get_settings(),
+                                            "provider": "claude",
+                                            "anthropic_api_key": "sk-ant-secret",
+                                            "cloud_model": "claude-whatever"})
+        self.assertFalse(result["ok"])
+
+    def test_the_interface_is_told_where_thinking_happens(self):
+        """The status line read "Local - private" unconditionally, which stops
+        being true the moment the conversation is going to Anthropic."""
+        self.assertEqual(self.bridge.get_bootstrap()["capabilities"]["thinking_at"], "local")
+        self.bridge.save_settings({**self.bridge.get_settings(), "provider": "claude",
+                                   "anthropic_api_key": "sk-ant-secret"})
+        capabilities = self.bridge.get_bootstrap()["capabilities"]
+        self.assertEqual(capabilities["thinking_at"], "cloud")
+        self.assertEqual(capabilities["thinking_model"], "claude-opus-5")
+
+    def test_local_settings_survive_a_trip_through_claude_and_back(self):
+        """Switching away and back must not mean filling the form in again."""
+        before = self.bridge.get_settings()["lm_studio_url"]
+        self.bridge.save_settings({**self.bridge.get_settings(), "provider": "claude",
+                                   "anthropic_api_key": "sk-ant-secret"})
+        self.bridge.save_settings({**self.bridge.get_settings(), "provider": "local"})
+        self.assertEqual(self.bridge.get_settings()["lm_studio_url"], before)
+        self.assertIsInstance(self.bridge.agent.provider, LMStudioProvider)
+
+    def test_gpt_is_a_third_choice_with_its_own_key(self):
+        saved = self.bridge.save_settings({**self.bridge.get_settings(),
+                                           "provider": "openai",
+                                           "openai_model": "gpt-5",
+                                           "openai_api_key": "sk-openai-secret"})
+        self.assertTrue(saved.get("ok"), saved)
+        settings = self.bridge.get_settings()
+        self.assertEqual(settings["provider"], "openai")
+        self.assertEqual(settings["openai_model"], "gpt-5")
+        self.assertNotIn("openai_api_key", settings)
+        self.assertTrue(settings["openai_key_set"])
+        self.assertIsInstance(self.bridge.agent.provider, OpenAIProvider)
+        capabilities = self.bridge.get_bootstrap()["capabilities"]
+        self.assertEqual(capabilities["thinking_at"], "cloud")
+        self.assertIn("api.openai.com", capabilities["thinking_label"])
+
+    def test_the_address_survives_settings_and_is_checked_there(self):
+        saved = self.bridge.save_settings({**self.bridge.get_settings(),
+                                           "provider": "openai",
+                                           "openai_base_url": "https://api.groq.com/openai/v1",
+                                           "openai_api_key": "sk-somewhere"})
+        self.assertTrue(saved.get("ok"), saved)
+        self.assertEqual(self.bridge.get_settings()["openai_base_url"],
+                         "https://api.groq.com/openai/v1")
+        self.assertIn("api.groq.com",
+                      self.bridge.get_bootstrap()["capabilities"]["thinking_label"])
+        # A wrong address is a message on save, not a failure on the next message.
+        refused = self.bridge.save_settings({**self.bridge.get_settings(),
+                                             "openai_base_url": "not-a-url"})
+        self.assertFalse(refused["ok"])
+
+    def test_choosing_gpt_without_a_key_is_refused(self):
+        with unittest.mock.patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
+            result = self.bridge.save_settings({**self.bridge.get_settings(),
+                                                "provider": "openai",
+                                                "openai_api_key": ""})
+        self.assertFalse(result["ok"])
+        self.assertIn("OPENAI_API_KEY", result["error"])
+
+    def test_the_two_keys_do_not_overwrite_each_other(self):
+        """One save carries both fields, and a blank one must not wipe the key
+        belonging to the provider that is not being changed."""
+        self.bridge.save_settings({**self.bridge.get_settings(), "provider": "claude",
+                                   "anthropic_api_key": "sk-ant-secret"})
+        self.bridge.save_settings({**self.bridge.get_settings(), "provider": "openai",
+                                   "openai_api_key": "sk-openai-secret"})
+        config = self.bridge.agent.config.data
+        self.assertEqual(config["anthropic_api_key"], "sk-ant-secret")
+        self.assertEqual(config["openai_api_key"], "sk-openai-secret")
+
+    def test_a_stored_key_can_be_taken_back(self):
+        """Blank means "keep the stored key", so without this there is no way
+        to withdraw a credential through the interface at all."""
+        self.bridge.save_settings({**self.bridge.get_settings(), "provider": "claude",
+                                   "anthropic_api_key": "sk-ant-secret"})
+        with unittest.mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}, clear=False):
+            result = self.bridge.forget_cloud_key("claude")
+            self.assertTrue(result["ok"])
+            self.assertFalse(self.bridge.get_settings()["anthropic_key_set"])
+        self.assertEqual(self.bridge.agent.config.data["anthropic_api_key"], "")
+        # Staying on Claude with no key would only fail on the next message.
+        self.assertEqual(self.bridge.get_settings()["provider"], "local")
+        self.assertIsInstance(self.bridge.agent.provider, LMStudioProvider)
+
+    def test_forgetting_one_key_leaves_the_other_alone(self):
+        """An earlier version cleared both, which would have thrown away a
+        working key in order to remove an unused one."""
+        self.bridge.save_settings({**self.bridge.get_settings(), "provider": "claude",
+                                   "anthropic_api_key": "sk-ant-secret",
+                                   "openai_api_key": "sk-openai-secret"})
+        self.bridge.forget_cloud_key("openai")
+        config = self.bridge.agent.config.data
+        self.assertEqual(config["openai_api_key"], "")
+        self.assertEqual(config["anthropic_api_key"], "sk-ant-secret")
+        # Claude was in use and had nothing removed, so it stays in use.
+        self.assertEqual(config["provider"], "claude")
+        self.assertIsInstance(self.bridge.agent.provider, AnthropicProvider)
 
     def test_vision_mode_is_settable_and_readable_through_settings(self):
         # The override existed in config but had no Settings control, so the
@@ -4210,15 +5445,2074 @@ class ConversationUndoTests(unittest.TestCase):
         self.assertNotIn("rollback_session", names)
 
 
+class ProgressWindowTests(unittest.TestCase):
+    """A second window whose only job is answering "is she still going".
+
+    It rides the same event stream as the main page, so what is tested here is
+    that it is served, that it cannot run its own script inline, and that the
+    stream it needs gives every reader an independent cursor.
+    """
+
+    def setUp(self):
+        self.web = Path(__file__).parents[1] / "aura" / "web"
+
+    def test_the_window_is_served_and_shipped(self):
+        from aura import http_app
+        self.assertTrue((self.web / "progress.html").is_file())
+        self.assertTrue((self.web / "progress.js").is_file())
+        source = (Path(__file__).parents[1] / "aura" / "http_app.py").read_text(encoding="utf-8")
+        self.assertIn('"/progress"', source)
+        self.assertIn('"/progress.js"', source)
+        # A missing file must fail the startup check rather than serve a blank
+        # window that looks like Aura having nothing to say.
+        self.assertIn('"progress.html", "progress.js"', source)
+
+    def test_it_carries_no_inline_script(self):
+        """The page's own Content-Security-Policy is `script-src 'self'`, which
+        blocks an inline script outright — measured, as a window that never
+        woke up at all."""
+        page = (self.web / "progress.html").read_text(encoding="utf-8")
+        self.assertNotIn("<script>", page)
+        self.assertIn('<script src="/progress.js">', page)
+
+    def test_polls_cannot_overlap_and_double_count(self):
+        """A slow request let the next tick start before the cursor moved, so
+        both handled the same events — measured as one reply logged twice, and
+        worst exactly when the machine is busy."""
+        script = (self.web / "progress.js").read_text(encoding="utf-8")
+        self.assertIn("if (polling) return;", script)
+        self.assertIn("seq <= cursor", script)
+
+    def test_every_reader_gets_its_own_cursor(self):
+        """Opening the window must not steal events from the main page."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        agent = AuraAgent(Path(temp.name) / "workspace", provider=MockProvider())
+        bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+        self.addCleanup(bridge.shutdown)
+        bridge._push("state", value="working")
+        first = bridge.poll_events(0, 50)
+        self.assertTrue(first)
+        # A second reader starting from the same place sees the same events.
+        self.assertEqual([e["_seq"] for e in bridge.poll_events(0, 50)],
+                         [e["_seq"] for e in first])
+
+
+class SilentRetryTests(unittest.TestCase):
+    """A retry after silence has to be a different question, not a louder one."""
+
+    def test_the_retry_takes_the_tools_away(self):
+        """A model given no tools cannot answer with a tool call, and plain text
+        is what the empty-response gate is asking for."""
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            provider.complete = unittest.mock.Mock(
+                side_effect=lambda *args, **kwargs: ProviderReply("", []))
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            agent.handle("Create a file called plan.txt in my workspace")
+            first, second = provider.complete.call_args_list[:2]
+            self.assertTrue(first[0][1], "the first round should offer tools")
+            self.assertEqual(second[0][1], [], "the retry should offer none")
+
+    def test_the_tools_come_back_afterwards(self):
+        """One round only. A tool-less round is a nudge, not a new mode."""
+        replies = [ProviderReply("", []), ProviderReply("", []), ProviderReply("done", [])]
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = LMStudioProvider(model="local-model")
+            provider.complete = unittest.mock.Mock(
+                side_effect=lambda *args, **kwargs: replies.pop(0) if replies
+                else ProviderReply("done", []))
+            agent = AuraAgent(Path(temporary) / "workspace", provider=provider)
+            agent.handle("Create a file called plan.txt in my workspace")
+            calls = provider.complete.call_args_list
+            self.assertEqual(calls[1][0][1], [])
+            if len(calls) > 2:
+                self.assertTrue(calls[2][0][1], "tools should be offered again")
+
+
+class ReasoningCarriedTests(unittest.TestCase):
+    """Roughly three quarters of this model's output is private reasoning, and
+    all of it used to be discarded — so after a tool call it saw its own last
+    turn as a bare function call with no memory of why it made it."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+
+    def test_the_newest_turn_keeps_its_thinking(self):
+        messages = []
+        assistant = {"role": "assistant", "content": None}
+        self.agent._carry_reasoning(messages, assistant, ProviderReply(
+            "", [], reasoning="The file is missing, so I will create it."))
+        self.assertEqual(assistant["reasoning_content"],
+                         "The file is missing, so I will create it.")
+
+    def test_only_the_newest_turn_keeps_it(self):
+        """Carrying every round's reasoning would grow the prompt by three
+        quarters each time — the very thing compaction exists to fight."""
+        older = {"role": "assistant", "content": None, "reasoning_content": "old thought"}
+        messages = [{"role": "user", "content": "hi"}, older]
+        assistant = {"role": "assistant", "content": None}
+        self.agent._carry_reasoning(messages, assistant, ProviderReply(
+            "", [], reasoning="new thought"))
+        self.assertNotIn("reasoning_content", older)
+        self.assertEqual(assistant["reasoning_content"], "new thought")
+
+    def test_long_thinking_keeps_its_ending(self):
+        """A chain of thought ends with the decision it reached."""
+        reasoning = "x" * 9000 + " therefore I will read the file."
+        assistant = {"role": "assistant", "content": None}
+        self.agent._carry_reasoning([], assistant, ProviderReply("", [], reasoning=reasoning))
+        carried = assistant["reasoning_content"]
+        self.assertLessEqual(len(carried), self.agent.REASONING_CARRIED + 1)
+        self.assertTrue(carried.endswith("therefore I will read the file."))
+
+    def test_promoted_thinking_is_not_sent_twice(self):
+        """When the thinking became the answer, handing it back as reasoning as
+        well would say the same thing twice."""
+        assistant = {"role": "assistant", "content": "the answer"}
+        self.agent._carry_reasoning([], assistant, ProviderReply("the answer", []))
+        self.assertNotIn("reasoning_content", assistant)
+
+    def test_it_can_be_switched_off(self):
+        self.agent.config.update(send_reasoning_back=False)
+        assistant = {"role": "assistant", "content": None}
+        self.agent._carry_reasoning([], assistant, ProviderReply("", [], reasoning="thought"))
+        self.assertNotIn("reasoning_content", assistant)
+
+
+class MeasuredIsNotInspectedTests(unittest.TestCase):
+    """Aura may not say she inspected a file she only measured.
+
+    Watched on 2026-08-18: four `file_info` calls, a model-written table guessing
+    what was in each file, and underneath it Aura's own footer reading
+    "Final file state inspected". The footer vouched for the guesses.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+
+    def test_file_info_does_not_claim_the_contents_were_read(self):
+        report = self.agent._format_completion_evidence(
+            "Here is what I found.", None, None, [], [], None, None, ["notes.txt"])
+        self.assertIn("Size and line count checked, contents not read", report)
+        self.assertNotIn("Final file state inspected", report)
+
+    def test_read_file_still_claims_inspection(self):
+        report = self.agent._format_completion_evidence(
+            "Here is what I found.", None, None, ["notes.txt"], [], None, None, [])
+        self.assertIn("Final file state inspected", report)
+        self.assertNotIn("contents not read", report)
+
+    def test_a_file_both_measured_and_read_is_reported_once_as_read(self):
+        report = self.agent._format_completion_evidence(
+            "Done.", None, None, ["notes.txt"], [], None, None, ["notes.txt"])
+        self.assertIn("Final file state inspected", report)
+        self.assertNotIn("contents not read", report)
+
+    def test_the_two_tool_sets_do_not_overlap(self):
+        self.assertEqual(self.agent.CONTENT_TOOLS & self.agent.SHAPE_TOOLS, set())
+        self.assertNotIn("file_info", self.agent.CONTENT_TOOLS)
+        # Still verification: measuring a file proves a write landed.
+        self.assertIn("file_info", self.agent.VERIFICATION_TOOLS)
+
+
+class UnreadFileNoteTests(unittest.TestCase):
+    """The reply that started this: a table of guessed file contents, printed
+    under Aura's own "Confirmed evidence" footer."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+
+    def gate(self, content, measured=(), read=()):
+        turn = TurnState()
+        turn.measured_paths = set(measured)
+        turn.verified_final_paths = set(read)
+        return self.agent._gate_unread_files(turn, ProviderReply(content, []))
+
+    def test_a_measured_file_the_answer_talks_about_is_named(self):
+        result = self.gate("notes.txt probably holds the product notes.",
+                           measured=["shop/notes.txt"])
+        self.assertIn("never opened", result.note)
+        self.assertIn("shop/notes.txt", result.note)
+        self.assertFalse(result.wants_retry, "this is a note, not another round")
+
+    def test_a_file_that_was_actually_read_is_not_named(self):
+        self.assertEqual(self.gate("notes.txt holds the product notes.",
+                                   measured=["shop/notes.txt"],
+                                   read=["shop/notes.txt"]).note, "")
+
+    def test_a_measured_file_the_answer_never_mentions_is_left_alone(self):
+        self.assertEqual(self.gate("All four files are present.",
+                                   measured=["shop/notes.txt"]).note, "")
+
+    def test_it_does_not_depend_on_the_language_of_the_answer(self):
+        """The first draft of this gate hunted for words like "probably" in two
+        languages. Aura already knows what she read; she does not need to guess
+        at intent from vocabulary."""
+        estonian = self.gate("notes.txt sisaldab tõenäoliselt tootemärkmeid.",
+                             measured=["shop/notes.txt"])
+        english = self.gate("notes.txt likely contains the product notes.",
+                            measured=["shop/notes.txt"])
+        self.assertIn("never opened", estonian.note)
+        self.assertIn("never opened", english.note)
+
+    def test_an_empty_answer_says_nothing(self):
+        self.assertEqual(self.gate("", measured=["a.txt"]).note, "")
+
+    def test_the_gate_runs_inside_a_real_turn(self):
+        self.assertIn(AuraAgent._gate_unread_files, AuraAgent.COMPLETION_GATES)
+
+
+class TurnBudgetTests(unittest.TestCase):
+    """A turn spends time, so time is what should bound it.
+
+    Measured across 65 real turns: median 24s, 90th percentile 221s, worst 985s —
+    one tool and sixteen minutes of thinking, ended by an HTTP timeout that arrived
+    as a failure rather than as an answer.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+
+    def agent_with(self, seconds, replies):
+        provider = LMStudioProvider(model="local-model")
+        provider.complete = unittest.mock.Mock(
+            side_effect=lambda *a, **k: replies.pop(0) if replies else ProviderReply("late", []))
+        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=provider)
+        self.addCleanup(agent.db.close)
+        agent.config.update(turn_budget_seconds=seconds)
+        return agent, provider
+
+    def test_a_turn_that_runs_long_stops_and_says_where_it_got_to(self):
+        """Time passes where time actually passes — inside the model call — so the
+        first round and its tool complete, and the turn expires while asking again."""
+        clock = [0.0]
+        replies = [ProviderReply("", [ToolCall("c1", "list_files", {"path": "."})]),
+                   ProviderReply("", [ToolCall("c2", "list_files", {"path": "."})]),
+                   ProviderReply("finally", [])]
+        costs = iter([5, 25])          # a quick round, then one that overruns
+
+        def generate(*_args, **_kwargs):
+            clock[0] += next(costs, 25)
+            return replies.pop(0) if replies else ProviderReply("late", [])
+
+        provider = LMStudioProvider(model="local-model")
+        provider.complete = unittest.mock.Mock(side_effect=generate)
+        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=provider)
+        self.addCleanup(agent.db.close)
+        agent.config.update(turn_budget_seconds=20)
+        with unittest.mock.patch("aura.agent.time.monotonic", side_effect=lambda: clock[0]):
+            answer = agent.handle("List the files please")
+        self.assertIn("I stopped after", answer)
+        self.assertIn("list_files", answer, "it should say what it managed to run")
+        self.assertIn("Settings", answer)
+        self.assertEqual(provider.complete.call_count, 2,
+                         "the third round is never asked for")
+
+    def test_the_clock_is_read_during_a_generation_not_only_between_rounds(self):
+        """Caught by the second sweep, in this feature's own first version: the
+        budget was checked at the top of each round, so a round starting one second
+        inside the limit could then run for seventeen minutes. Live, it did."""
+        agent, provider = self.agent_with(30, [])
+        agent._turn_deadline = time.monotonic() - 1
+        with self.assertRaises(TurnExpired):
+            agent._check_cancelled()
+
+    def test_a_turn_with_time_left_is_not_stopped(self):
+        agent, _ = self.agent_with(30, [])
+        agent._turn_deadline = time.monotonic() + 60
+        agent._check_cancelled()   # must not raise
+
+    def test_cancelling_still_wins_over_the_clock(self):
+        agent, _ = self.agent_with(30, [])
+        agent._turn_deadline = time.monotonic() - 1
+        agent.cancel_event.set()
+        with self.assertRaises(TaskCancelled):
+            agent._check_cancelled()
+
+    def test_a_silent_thinking_model_still_gets_its_clock_read(self):
+        """The case that actually bit. A model emitting only private reasoning
+        produces no content tokens, so a clock read only in the content callback is
+        never read at all during exactly the turns that run long."""
+        source = (Path(__file__).parents[1] / "aura" / "agent.py").read_text(encoding="utf-8")
+        self.assertIn("on_reasoning=watch", source)
+        watch = source[source.index("def watch(count: int)"):]
+        self.assertIn("_check_cancelled", watch[:300])
+
+    def test_the_wait_is_described_without_rounding_it_up(self):
+        """Live on 2026-08-18 a 90-second budget reported "I stopped after 2
+        minutes". Overstating the wait in the one message whose job is honesty."""
+        agent, _ = self.agent_with(90, [])
+        self.assertIn("90 seconds", agent._format_out_of_time(TurnState(), 90))
+        self.assertIn("5 minutes", agent._format_out_of_time(TurnState(), 300))
+        self.assertIn("45 seconds", agent._format_out_of_time(TurnState(), 45))
+
+    def test_zero_means_no_limit(self):
+        agent, provider = self.agent_with(0, [ProviderReply("done", [])])
+        with unittest.mock.patch("aura.agent.time.monotonic", side_effect=[0, 10**9, 10**9]):
+            answer = agent.handle("Say hello")
+        self.assertNotIn("I stopped after", answer)
+
+    def test_a_quick_turn_is_untouched(self):
+        agent, provider = self.agent_with(300, [ProviderReply("done", [])])
+        self.assertNotIn("I stopped after", agent.handle("Say hello"))
+
+    def test_the_limit_is_reachable_from_settings(self):
+        """The out-of-time message tells Mat to change it in Settings, so Settings
+        has to carry it — a promise in a message is a feature."""
+        html = (Path(__file__).parents[1] / "aura" / "web" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="settingTurnBudget"', html)
+        # and the browser must both read it and send it back
+        js = (Path(__file__).parents[1] / "aura" / "web" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('$("#settingTurnBudget").value = settings.turn_budget_seconds', js)
+        self.assertIn("turn_budget_seconds: $(\"#settingTurnBudget\").value", js)
+        agent, _ = self.agent_with(300, [])
+        self.assertIn("turn_budget_seconds", agent.config.data)
+
+
+class ReadingBudgetTests(unittest.TestCase):
+    """Every tool caps itself; nothing capped their sum, and each later round pays
+    for the whole of it again."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+        self.agent.config.update(turn_tool_characters=1000)
+
+    def test_early_results_arrive_whole(self):
+        turn = TurnState()
+        payload = "x" * 800
+        self.assertEqual(self.agent._within_reading_budget(payload, turn, "read_file"), payload)
+
+    def test_results_past_the_line_are_shortened_not_dropped(self):
+        turn = TurnState()
+        self.agent._within_reading_budget("x" * 900, turn, "read_file")
+        second = self.agent._within_reading_budget("y" * 5000, turn, "read_many_files")
+        self.assertLess(len(second), 5000)
+        self.assertIn("this result was shortened", second)
+        self.assertTrue(second.startswith("y"), "what survives is the start of the result")
+
+    def test_zero_means_no_limit(self):
+        self.agent.config.update(turn_tool_characters=0)
+        turn = TurnState()
+        payload = "x" * 500000
+        self.assertEqual(self.agent._within_reading_budget(payload, turn, "read_file"), payload)
+
+    def test_the_budget_is_spent_across_the_whole_turn(self):
+        turn = TurnState()
+        for _ in range(4):
+            self.agent._within_reading_budget("z" * 400, turn, "read_file")
+        self.assertEqual(turn.tool_characters, 1600)
+
+
+class WorkspaceBridgeTests(unittest.TestCase):
+    """`workspace_bridge.py` is 284 lines and 21 methods, and the sweep found it
+    the thinnest-covered module in the project — while being the one that moves,
+    renames and deletes Mat's actual files."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.root = agent.sandbox.root
+        self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+
+    def tearDown(self):
+        self.bridge.shutdown()
+        self.temp.cleanup()
+
+    def dropped(self, name, raw=b"hello"):
+        return {"name": name, "content": base64.b64encode(raw).decode("ascii")}
+
+    # ---- importing, which is the path a drag-and-drop takes
+    def test_a_dropped_file_lands_in_the_workspace(self):
+        result = self.bridge.import_files([self.dropped("notes.txt", b"line\n")])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["files"], ["notes.txt"])
+        self.assertEqual((self.root / "notes.txt").read_bytes(), b"line\n")
+
+    def test_a_second_file_of_the_same_name_does_not_overwrite_the_first(self):
+        self.bridge.import_files([self.dropped("notes.txt", b"first")])
+        second = self.bridge.import_files([self.dropped("notes.txt", b"second")])
+        self.assertEqual(second["files"], ["notes (2).txt"])
+        self.assertEqual((self.root / "notes.txt").read_bytes(), b"first")
+
+    def test_a_path_in_the_dropped_name_cannot_escape_the_workspace(self):
+        result = self.bridge.import_files([self.dropped("../../escaped.txt")])
+        # Only the final component is used, so it lands inside and nowhere else.
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["files"], ["escaped.txt"])
+        self.assertTrue((self.root / "escaped.txt").exists())
+
+    def test_a_name_that_is_only_dots_is_refused(self):
+        self.assertFalse(self.bridge.import_files([self.dropped("..")])["ok"])
+
+    def test_content_that_is_not_base64_is_refused_by_name(self):
+        result = self.bridge.import_files([{"name": "bad.txt", "content": "not base64!!"}])
+        self.assertFalse(result["ok"])
+        self.assertIn("bad.txt", result["error"])
+
+    def test_more_than_five_files_at_once_is_refused(self):
+        many = [self.dropped(f"f{n}.txt") for n in range(6)]
+        self.assertFalse(self.bridge.import_files(many)["ok"])
+
+    def test_an_oversized_file_is_refused(self):
+        big = b"x" * (self.bridge.MAX_IMPORT_FILE_BYTES + 1)
+        result = self.bridge.import_files([self.dropped("big.bin", big)])
+        self.assertFalse(result["ok"])
+        self.assertFalse((self.root / "big.bin").exists())
+
+    def test_nothing_is_written_when_one_file_in_the_batch_is_bad(self):
+        """Decoding happens for the whole batch before anything is written, so a
+        rejected file cannot leave half a drop on disk."""
+        result = self.bridge.import_files(
+            [self.dropped("good.txt"), {"name": "bad.txt", "content": "!!!"}])
+        self.assertFalse(result["ok"])
+        self.assertFalse((self.root / "good.txt").exists())
+
+    # ---- creating, renaming, moving, deleting
+    def test_create_rename_move_and_delete_round_trip(self):
+        self.assertTrue(self.bridge.create_workspace_folder("stuff")["ok"])
+        self.assertTrue(self.bridge.create_workspace_file("stuff/a.txt", "hi")["ok"])
+        self.assertEqual((self.root / "stuff" / "a.txt").read_text(encoding="utf-8"), "hi")
+
+        self.assertTrue(self.bridge.rename_workspace_item("stuff/a.txt", "b.txt")["ok"])
+        self.assertTrue((self.root / "stuff" / "b.txt").exists())
+
+        self.assertTrue(self.bridge.copy_workspace_item("stuff/b.txt", "c.txt")["ok"])
+        self.assertTrue((self.root / "c.txt").exists())
+
+        self.assertTrue(self.bridge.delete_workspace_item("c.txt")["ok"])
+        self.assertFalse((self.root / "c.txt").exists())
+        # Deleted, not gone: it is recoverable from the trash.
+        self.assertTrue(self.bridge.list_trash()["items"])
+
+    def test_a_deleted_file_can_be_restored(self):
+        self.bridge.create_workspace_file("gone.txt", "text")
+        self.bridge.delete_workspace_item("gone.txt")
+        name = self.bridge.list_trash()["items"][0]["trash_name"]
+        self.assertTrue(self.bridge.restore_workspace_item(name)["ok"])
+        self.assertTrue((self.root / "gone.txt").exists())
+
+    def test_a_path_typed_into_the_rename_box_cannot_walk_out(self):
+        """Only the final component of a new name is used, so `../there.txt`
+        renames the file inside the workspace instead of escaping it. Checked at
+        the filesystem, not by trusting the return value."""
+        self.bridge.create_workspace_file("here.txt", "x")
+        result = self.bridge.rename_workspace_item("here.txt", "../there.txt")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["path"], "there.txt")
+        self.assertTrue((self.root / "there.txt").exists())
+        self.assertNotIn("there.txt", [p.name for p in self.root.parent.iterdir()])
+
+    def test_a_snapshot_reports_what_is_really_there(self):
+        self.bridge.create_workspace_file("one.txt", "1")
+        self.bridge.create_workspace_folder("sub")
+        snapshot = self.bridge.workspace_snapshot()
+        self.assertTrue(snapshot["ok"], snapshot)
+        names = {item["path"] for item in snapshot["files"]}
+        self.assertIn("one.txt", names)
+
+    def test_previewing_a_missing_file_fails_without_raising(self):
+        result = self.bridge.preview_workspace_file("not-there.txt")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result.get("error"))
+
+
+class VoiceBridgeTests(unittest.TestCase):
+    """`voice_bridge.py` had exactly one mention in the whole suite. It owns the
+    microphone, so its refusals matter more than its successes."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+
+    def tearDown(self):
+        self.bridge.shutdown()
+        self.temp.cleanup()
+
+    def test_listing_voices_and_microphones_never_raises(self):
+        """These run on whatever hardware Mat happens to have, including none."""
+        voices = self.bridge.get_voices()
+        mics = self.bridge.get_microphones()
+        self.assertIn("ok", voices)
+        self.assertIn("ok", mics)
+        for result in (voices, mics):
+            if result.get("ok"):
+                self.assertIsInstance(result.get("voices", result.get("devices", [])), list)
+
+    def test_stopping_when_nothing_is_listening_is_harmless(self):
+        result = self.bridge.stop_voice()
+        self.assertIn("ok", result)
+
+    def test_voice_does_not_start_while_a_turn_is_running(self):
+        """The microphone and the model share Aura's attention; starting one
+        during the other is how two answers arrive for one question."""
+        self.bridge._busy = True
+        try:
+            result = self.bridge.start_voice()
+            self.assertFalse(result.get("ok"), result)
+        finally:
+            self.bridge._busy = False
+
+
+class SilenceCaptureTests(unittest.TestCase):
+    """A silence is a reproducible failure that nothing was keeping.
+
+    Measured against the real model: the same payload returns the same tokens every
+    time, at 0.4 and at 1.2, three runs each and ~10 seconds apiece — regenerating,
+    not cached. So a silence is not bad luck; it is one specific prompt that reliably
+    produces a single token. Irreproducible only because the prompt was thrown away.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+        self.folder = self.agent.sandbox.meta / "silences"
+
+    def test_the_prompt_that_went_quiet_is_written_down(self):
+        self.agent.provider.last_payload = {"model": "m", "messages": [
+            {"role": "user", "content": "kirjuta midagi"}]}
+        name = self.agent._capture_silence()
+        self.assertTrue(name.endswith(".json"))
+        saved = json.loads((self.folder / name).read_text(encoding="utf-8"))
+        self.assertEqual(saved["messages"][0]["content"], "kirjuta midagi")
+
+    def test_nothing_to_capture_is_not_an_error(self):
+        self.assertEqual(self.agent._capture_silence(), "")
+        self.assertFalse(self.folder.exists())
+
+    def test_only_the_newest_are_kept(self):
+        for index in range(self.agent.SILENCES_KEPT + 4):
+            self.agent.provider.last_payload = {"n": index}
+            self.folder.mkdir(exist_ok=True)
+            (self.folder / f"2020010{index:02d}T000000.json").write_text("{}", encoding="utf-8")
+        self.agent._capture_silence()
+        self.assertLessEqual(len(list(self.folder.glob("*.json"))),
+                             self.agent.SILENCES_KEPT)
+
+    def test_a_broken_diagnostic_never_breaks_the_turn(self):
+        """Worse than no diagnostic is one that fails the thing it diagnoses."""
+        self.agent.provider.last_payload = {"model": "m"}
+        with unittest.mock.patch.object(type(self.agent.sandbox.meta), "mkdir",
+                                        side_effect=OSError("disk full")):
+            self.assertEqual(self.agent._capture_silence(), "")
+
+    def test_the_provider_keeps_what_it_actually_sent(self):
+        """After merging and tuning, not before — the first version of the probe
+        that investigated this posted the unmerged messages and LM Studio refused
+        them outright."""
+        source = (Path(__file__).parents[1] / "aura" / "provider.py").read_text(encoding="utf-8")
+        tune = source.index("payload = self._tune_payload(payload)")
+        self.assertIn("self.last_payload = payload", source[tune:tune + 400])
+
+
+class BareDemonstrativeTests(unittest.TestCase):
+    """A long sentence containing "this" is not a follow-up.
+
+    Live on 2026-08-18: clicking Ask Aura on the node `Mat` sent "…Use this local
+    context only: Aura remembers the user's name as Mat." The bare "this" made it a
+    follow-up, so it inherited "Kirjuta väga pikk essee…" from three turns earlier,
+    `kirjuta` maps to `write`, and a question about a name opened a build-approval
+    card listing markdown headings as files to create.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+        self.agent.memory.remember_message("user", "Kirjuta väga pikk essee Eesti ajaloost")
+
+    def test_the_question_that_caused_this_no_longer_inherits_a_build(self):
+        asked = ("Tell me what you know about \u201cMat\u201d from Aura Mind. "
+                 "Use this local context only: Aura remembers the user\u2019s name as Mat.")
+        routed = self.agent._routing_request(asked)
+        self.assertEqual(routed, asked, "a long sentence must not pull in prior intent")
+        self.assertFalse(self.agent._requires_mutation(routed))
+
+    def test_a_short_demonstrative_still_refers_back(self):
+        """"Fix this" is a whole request pointing at the last one, and must keep
+        working — the fix must not cost the feature."""
+        routed = self.agent._routing_request("fix this")
+        self.assertIn("Kirjuta", routed)
+        self.assertTrue(self.agent._requires_mutation(routed))
+
+    def test_phrases_refer_back_at_any_length(self):
+        long_follow_up = ("I meant the thing we were doing before, please carry on "
+                          "from where you left off and finish the whole essay properly")
+        self.assertIn("Kirjuta", self.agent._routing_request(long_follow_up))
+
+    def test_a_long_sentence_about_something_else_is_left_alone(self):
+        asked = ("Explain what this function does in the file I am looking at right "
+                 "now, because the naming is confusing me quite a lot today")
+        self.assertEqual(self.agent._routing_request(asked), asked)
+
+
+class PlanKindTests(unittest.TestCase):
+    """A plan is either files about to be written or steps about to be taken, and
+    the card said "the files she would create" for both."""
+
+    def test_the_plan_carries_which_kind_it_is(self):
+        source = (Path(__file__).parents[1] / "aura" / "agent.py").read_text(encoding="utf-8")
+        section = source[source.index("def _plan_files"):]
+        section = section[:section.index("return plan")]
+        self.assertIn('kind = "FILES" if naming_files else "STEPS"', section)
+        self.assertIn('approve(["PLAN", plan, kind])', section)
+
+    def test_the_browser_says_the_right_thing_for_steps(self):
+        js = (Path(__file__).parents[1] / "aura" / "web" / "app.js").read_text(encoding="utf-8")
+        section = js[js.index("function showApproval"):]
+        section = section[:section.index("openModal(")]
+        self.assertIn('=== "STEPS"', section)
+        self.assertIn("This is the approach she would take", section)
+        # and the kind marker is not printed as if it were one of the lines
+        self.assertIn("steps ? -1 : undefined", section)
+
+
+
+
+class SelfKnowledgeTests(unittest.TestCase):
+    """Asked what could be improved about herself, Aura estimated her response time
+    at "~100-500ms". Her measured median is 24 seconds and her worst was 985. She
+    also asked for a tool she had used that same day, and listed three background
+    projects that do not exist. She had no way to look; now she does."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        # A real provider, because these are about what reaches the prompt.
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace",
+                               provider=LMStudioProvider(model="local-model"))
+        self.addCleanup(self.agent.db.close)
+
+    def test_she_can_tell_the_time(self):
+        """Her one accurate self-criticism: 3,755 characters of system prompt and
+        no clock anywhere in it."""
+        messages = self.agent.provider.start_messages(
+            "mis kell on?", self.agent._context("mis kell on?"))
+        text = " ".join(str(m.get("content") or "") for m in messages)
+        self.assertIn("current local time", text)
+        self.assertIn(str(datetime.now().year), text)
+
+    def test_a_question_about_herself_reaches_the_mirror(self):
+        """Caught live, from a captured silence: asked how fast she was, Aura was
+        offered list_files, read_file, validate_project and run_command — and
+        answered with a table headed "Real Data Only" full of invented numbers,
+        having run nothing. A tool she cannot be given is a tool she does not have."""
+        for asked in ("Kui kiire sa tegelikult oled ja mis sul ebaõnnestunud on?",
+                      "What could be improved about you?",
+                      "how fast are you really?",
+                      "what went wrong lately?"):
+            names = {item["function"]["name"]
+                     for item in self.agent.select_tool_definitions(asked)}
+            self.assertIn("how_i_have_been_running", names, asked)
+
+    def test_ordinary_work_is_not_offered_the_mirror(self):
+        names = {item["function"]["name"]
+                 for item in self.agent.select_tool_definitions("Tee shop kausta avaleht")}
+        self.assertNotIn("how_i_have_been_running", names)
+
+    def test_the_report_is_measured_not_estimated(self):
+        self.agent.memory.remember_message("user", "üks")
+        self.agent.memory.remember_message("assistant", "kaks")
+        report = self.agent._tool_how_i_have_been_running(
+            "how_i_have_been_running", {"days": 7}, None, None)
+        # A finished sentence, not parts. Given the parts and told not to combine
+        # them, the model published a trend, a cause and 70/86 = 81% — all three
+        # things the note forbade. `checks.py` settled this next door: a sentence
+        # has nothing left in it to analyse.
+        self.assertIn("finding", report)
+        self.assertNotIn("seconds_per_turn", report)
+        self.assertNotIn("failures", report)
+        self.assertIn("7 days", report["finding"])
+
+    def test_it_never_calls_the_model(self):
+        """A measurement that could hallucinate is not a measurement — the rule
+        checks.py already states."""
+        self.agent.provider.complete = unittest.mock.Mock(
+            side_effect=AssertionError("this must not reach the model"))
+        self.agent._tool_how_i_have_been_running(
+            "how_i_have_been_running", {"days": 3}, None, None)
+
+    def test_the_window_is_bounded(self):
+        for asked, expected in ((0, 1), (999, 30), (None, 7)):
+            report = self.agent._tool_how_i_have_been_running(
+                "how_i_have_been_running", {"days": asked}, None, None)
+            self.assertIn(f"last {expected} days", report["finding"])
+
+    def turn_lasting(self, seconds: int) -> None:
+        """One answered turn in the log — the report reads the database, not the
+        conversation held in memory."""
+        started = datetime.now(timezone.utc)
+        self.agent.db.add_message("s", "user", "küsimus", started.isoformat())
+        self.agent.db.add_message(
+            "s", "assistant", "vastus",
+            (started + timedelta(seconds=seconds)).isoformat())
+
+    def test_the_finding_says_what_the_log_cannot_show(self):
+        """Named inside the finding, where it cannot be skipped, rather than in a
+        note beside it — which is where it was, and was ignored."""
+        self.turn_lasting(30)
+        finding = self.agent._tool_how_i_have_been_running(
+            "how_i_have_been_running", {"days": 7}, None, None)["finding"]
+        self.assertIn("not why", finding)
+        self.assertIn("getting better", finding)
+        self.assertIn("30 seconds", finding)
+
+    def test_an_empty_window_says_so_plainly(self):
+        finding = self.agent._tool_how_i_have_been_running(
+            "how_i_have_been_running", {"days": 7}, None, None)["finding"]
+        self.assertIn("Nothing was measured", finding)
+
+
+
+
+class ToolMarkupTests(unittest.TestCase):
+    """A tool call written as text is not an answer, and must never become one.
+
+    Live on 2026-08-18: asked how fast she was, Aura ran the right tool and then
+    finished the turn with `<tool_call><function=undo_last_change></tool_call>` as
+    her visible reply. Nothing was executed — the log shows the last real undo was
+    two days earlier — but Mat was shown raw markup, and the tool it reached for
+    was destructive and unrequested.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+
+    def test_the_exact_reply_that_caused_this(self):
+        markup = "<tool_call>\n<function=undo_last_change>\n</function>\n</tool_call>"
+        self.assertTrue(AuraAgent._is_tool_markup(markup))
+
+    def test_other_markup_shapes(self):
+        for text in ("[TOOL_CALL] read_file", "<function=list_files>", "<tool_call>"):
+            self.assertTrue(AuraAgent._is_tool_markup(text), text)
+
+    def test_talking_about_tool_calls_is_not_making_one(self):
+        """Mat and Aura discuss her own internals constantly; a gate that fired on
+        the word would be unusable."""
+        prose = ("I could write <tool_call> style markup here, but LM Studio parses "
+                 "the structured field instead, so it only reaches you as content "
+                 "when the chat template misfires. That is what the gate catches.")
+        self.assertFalse(AuraAgent._is_tool_markup(prose))
+        self.assertFalse(AuraAgent._is_tool_markup("Sinu shop kaustas on neli faili."))
+        self.assertFalse(AuraAgent._is_tool_markup(""))
+
+    def test_it_is_refused_rather_than_obeyed(self):
+        """The safe response is to refuse. A call arriving as prose has bypassed
+        every structured path, and this one was `undo_last_change`."""
+        turn = TurnState()
+        verdict = self.agent._gate_tool_markup(
+            turn, ProviderReply("<tool_call>\n<function=undo_last_change>\n</tool_call>", []))
+        self.assertTrue(verdict.wants_retry)
+        self.assertTrue(verdict.drop_tools)
+        self.assertTrue(turn.emitted_tool_markup)
+        self.assertNotIn("undo", verdict.instruction.casefold())
+
+    def test_a_real_answer_passes_untouched(self):
+        turn = TurnState()
+        self.assertEqual(
+            self.agent._gate_tool_markup(turn, ProviderReply("Neli faili.", [])).instruction, "")
+        self.assertFalse(turn.emitted_tool_markup)
+
+    def test_the_gate_runs_before_anything_reasons_about_the_reply(self):
+        gates = list(AuraAgent.COMPLETION_GATES)
+        self.assertEqual(gates[0], AuraAgent._gate_tool_markup)
+
+
+class NothingToAnswerTests(unittest.TestCase):
+    """Never ask the model to reply to Aura's own reply.
+
+    The last of the three causes behind the silences, and the only one that was
+    never the model's fault. A captured payload ending in an assistant turn
+    reproduced the silence every time — `completion_tokens: 1`, `finish_reason:
+    stop` — and appending one turn to it produced 879 tokens of answer instead.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+
+    def test_a_conversation_ending_in_aura_gets_something_to_answer(self):
+        messages = [{"role": "system", "content": "You are Aura."},
+                    {"role": "user", "content": "How big is the shop folder?"},
+                    {"role": "assistant", "content": "Four files, about 11 KB."}]
+        self.assertTrue(self.agent._ensure_something_to_answer(messages))
+        self.assertEqual(messages[-1]["role"], "user")
+        self.assertEqual(messages[-1]["content"], self.agent.NOTHING_TO_ANSWER)
+
+    def test_it_must_be_a_user_turn(self):
+        """A system message is refused by the chat template anywhere but the front,
+        and `merge_system_messages` would hoist it there — leaving the conversation
+        still ending in Aura's own reply, which is the entire problem."""
+        messages = [{"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"}]
+        self.agent._ensure_something_to_answer(messages)
+        self.assertNotEqual(messages[-1]["role"], "system")
+
+    def test_a_normal_conversation_is_untouched(self):
+        for tail in ({"role": "user", "content": "and now?"},
+                     {"role": "tool", "tool_call_id": "t1", "content": "{}"}):
+            messages = [{"role": "user", "content": "hi"}, tail]
+            self.assertFalse(self.agent._ensure_something_to_answer(messages))
+            self.assertEqual(messages[-1], tail)
+
+    def test_an_assistant_turn_that_called_a_tool_is_left_alone(self):
+        """That conversation is not finished — the tool results come next."""
+        messages = [{"role": "user", "content": "read it"},
+                    {"role": "assistant", "content": None, "tool_calls": [
+                        {"id": "t1", "type": "function",
+                         "function": {"name": "read_file", "arguments": "{}"}}]}]
+        self.assertFalse(self.agent._ensure_something_to_answer(messages))
+
+    def test_an_empty_conversation_is_not_touched(self):
+        messages = []
+        self.assertFalse(self.agent._ensure_something_to_answer(messages))
+
+    def test_the_guard_runs_before_every_request(self):
+        source = (Path(__file__).parents[1] / "aura" / "agent.py").read_text(encoding="utf-8")
+        section = source[source.index("for round_index in range(round_limit)"):]
+        section = section[:section.index("response = self.provider.complete")]
+        self.assertIn("_ensure_something_to_answer", section)
+
+
+class ValidationChecksAssetsTests(unittest.TestCase):
+    """A page whose stylesheet does not load is broken, whatever the parser says.
+
+    Mat opened a finished landing page and got Times New Roman on white. Aura had
+    reported "validation passed, 0 issues" and "projekt on valmis kasutamiseks" —
+    truthfully, by the only measure she was using. Every link was absolute
+    (`/css/style.css`) against files living in `shop/css/`, so the markup parsed
+    and resolved to nothing.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+        self.agent.sandbox.write_file("shop/css/style.css", "body { color: red; }")
+
+    def page(self, href):
+        self.agent.sandbox.write_file(
+            "shop/index.html",
+            f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            f'<title>Shop</title><link rel="stylesheet" href="{href}"></head>'
+            f'<body><h1>Shop</h1></body></html>')
+
+    def test_an_absolute_link_that_resolves_nowhere_fails_validation(self):
+        self.page("/css/style.css")
+        result = self.agent._validate_project("shop")
+        self.assertFalse(result["valid"], "syntactically fine, and it cannot load its stylesheet")
+        self.assertTrue(result.get("broken_references"))
+        self.assertIn("style.css", " ".join(i["error"] for i in result["issues"]))
+
+    def test_the_error_says_what_to_change(self):
+        self.page("/css/style.css")
+        errors = " ".join(i["error"] for i in self.agent._validate_project("shop")["issues"])
+        self.assertIn("leading '/'", errors)
+
+    def test_the_same_page_with_a_relative_link_passes(self):
+        self.page("css/style.css")
+        result = self.agent._validate_project("shop")
+        self.assertTrue(result["valid"], result.get("issues"))
+        self.assertNotIn("broken_references", result)
+
+    def test_a_fetch_path_a_browser_cannot_resolve_fails_validation(self):
+        """The shop validated clean while rendering a header and nothing else.
+        Every tag resolved; the failure was a string literal inside the bundle:
+        fetch('/data/products.json') against a file at shop/data/products.json."""
+        self.agent.sandbox.write_file("shop/data/products.json", '[{"id": 1}]')
+        self.agent.sandbox.write_file(
+            "shop/js/main.bundle.js", "fetch('/data/products.json').then(r => r.json());")
+        self.page("css/style.css")
+        result = self.agent._validate_project("shop")
+        self.assertFalse(result["valid"])
+        self.assertIn("products.json", " ".join(i["error"] for i in result["issues"]))
+
+    def test_a_relative_fetch_is_left_alone(self):
+        """A relative path in a script may be joined from variables or resolved
+        against a base this cannot see. A checker that cries wolf is not read."""
+        self.agent.sandbox.write_file("shop/data/products.json", '[{"id": 1}]')
+        self.agent.sandbox.write_file(
+            "shop/js/main.bundle.js", "fetch('./data/products.json').then(r => r.json());")
+        self.page("css/style.css")
+        self.assertTrue(self.agent._validate_project("shop")["valid"])
+
+    def test_urls_and_routes_are_not_mistaken_for_files(self):
+        from aura.validation import _absolute_paths_in_script as paths
+        self.assertEqual(paths("fetch('https://api.example.com/v1/x.json')"), [])
+        self.assertEqual(paths("fetch('//cdn.example.com/lib.js')"), [])
+        self.assertEqual(paths("const route = '/shop'"), [])
+        self.assertEqual(paths("img.src = '/images/mug.jpg'"), ["/images/mug.jpg"])
+
+    def test_syntax_errors_are_still_reported(self):
+        """The asset check adds to validation, it does not replace it."""
+        self.agent.sandbox.write_file("shop/index.html", "<html><body><div></body></html>")
+        self.assertFalse(self.agent._validate_project("shop")["valid"])
+
+
+class AskedToEditCreatedInsteadTests(unittest.TestCase):
+    """"Change the heading in X" presupposes X. When it is not there, saying so is
+    the answer — not quietly making the presupposition true.
+
+    Found by a behavioural sweep, not by reading: asked to change the heading in a
+    file that did not exist, Aura created it and reported "demo/missing.html exists.
+    The heading is correctly set to 'Gone'. Final state confirmed." All true, and it
+    never says the file was invented. Harmless for a page; for "move my 3pm meeting"
+    it is a second meeting while the first stays put.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+
+    def test_the_request_that_caused_this_is_recognised_as_an_edit(self):
+        self.assertTrue(self.agent._is_edit_request(
+            "In demo/missing.html change the heading to 'Gone'"))
+
+    def test_asking_for_something_new_is_not_an_edit(self):
+        self.assertFalse(self.agent._is_edit_request("Create demo/new.html with a heading"))
+
+    def test_both_verbs_together_claim_nothing(self):
+        """Ambiguous rather than mistaken, so it stays quiet."""
+        self.assertFalse(self.agent._is_edit_request(
+            "Create a config file and then change its title"))
+
+    def test_it_works_in_estonian(self):
+        self.assertTrue(self.agent._is_edit_request("Muuda demo/page.html pealkiri"))
+
+    def test_the_evidence_says_the_file_was_created_not_changed(self):
+        report = self.agent._format_completion_evidence(
+            "The heading is correctly set to 'Gone'.", None, None, [], [], None, None,
+            [], ["demo/missing.html"])
+        self.assertIn("Did not exist and was created, rather than changed", report)
+        self.assertIn("demo/missing.html", report)
+
+    def test_an_ordinary_edit_says_nothing_extra(self):
+        report = self.agent._format_completion_evidence(
+            "Done.", None, None, ["demo/page.html"], [], None, None, [], [])
+        self.assertNotIn("Did not exist", report)
+
+    def test_the_turn_records_what_was_missing_before_any_tool_ran(self):
+        """Afterwards a file that was edited and one that was invented look the
+        same on disk, so the fact has to be captured up front."""
+        turn = TurnState(missing_at_start={"demo/missing.html"}, edit_request=True)
+        self.assertEqual(turn.missing_at_start, {"demo/missing.html"})
+        self.assertTrue(turn.edit_request)
+
+
+class ToolIsNotACommandTests(unittest.TestCase):
+    """Saying it in the prompt three times did not work.
+
+    Section 6 says workspace capabilities are tools not commands; section 11 says
+    twice more not to conclude a tool is missing from a failed command. Aura then
+    asked to run `validate_project .` as a command, twice, and told Mat the tool was
+    unavailable while holding it. So the refusal moved into the code.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+
+    def run_command(self, command):
+        return self.agent._tool_run_command("run_command", {"command": command}, None, None)
+
+    def test_a_tool_name_is_refused(self):
+        result = self.run_command(["validate_project", "."])
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["refused"])
+
+    def test_the_refusal_says_the_tool_exists(self):
+        """The failure being prevented is not the command failing — it is what she
+        concluded from it. "Cannot find the executable" reads as "no such
+        capability", so the refusal has to contradict that directly."""
+        error = self.run_command(["validate_project", "."])["error"]
+        self.assertIn("is one of your tools", error)
+        self.assertIn("exists", error)
+
+    def test_a_windows_executable_name_is_caught_too(self):
+        self.assertTrue(self.run_command(["validate_project.exe", "."])["refused"])
+
+    def test_a_full_path_to_a_tool_name_is_caught(self):
+        self.assertTrue(self.run_command(["/usr/bin/read_file", "x"])["refused"])
+
+    def test_a_real_program_is_left_alone(self):
+        """The guard must not become a reason she cannot run anything."""
+        result = self.run_command(["python", "-c", "print(1)"])
+        self.assertNotIn("refused", result)
+
+    def test_it_is_refused_before_approval(self):
+        """Mat is never asked to authorise a mistake."""
+        def approve(_command):
+            raise AssertionError("approval must not be reached for a tool name")
+        self.agent._tool_run_command(
+            "run_command", {"command": ["validate_project", "."]}, approve, None)
+
+
+class RefusedEditFeedbackTests(unittest.TestCase):
+    """A refused edit should make the next attempt land.
+
+    Nineteen edit failures in the log since the silence fixes, all match-count
+    mismatches. The refusals were correct — that check is what stops a blind
+    replace hitting the wrong line — but "found 3" said a guess was wrong and
+    nothing about what to guess instead, so the next attempt guessed again.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+        self.agent.sandbox.write_file(
+            "page.html",
+            '<div class="row">one</div>\n<div class="row">two</div>\n'
+            '<div class="row">three</div>\n')
+
+    def replace(self, old, new="x", expected=1):
+        return self.agent._tool_replace_in_file(
+            "replace_in_file",
+            {"path": "page.html", "old_text": old, "new_text": new,
+             "expected_count": expected}, None, None)
+
+    def test_too_many_matches_shows_where_they_are(self):
+        with self.assertRaises(ValueError) as caught:
+            self.replace('<div class="row">')
+        message = str(caught.exception)
+        self.assertIn("found 3 matches, not 1", message)
+        self.assertIn("line 1:", message)
+        self.assertIn("line 3:", message)
+        self.assertIn("expected_count to 3", message)
+
+    def test_no_match_shows_the_near_misses(self):
+        with self.assertRaises(ValueError) as caught:
+            self.replace('<div class="rows">one</div>')
+        message = str(caught.exception)
+        self.assertIn("not in the file", message)
+        self.assertIn("line 1:", message)
+
+    def test_no_match_and_nothing_close_says_so_plainly(self):
+        with self.assertRaises(ValueError) as caught:
+            self.replace("zzzzzzzz")
+        message = str(caught.exception)
+        self.assertIn("not in the file at all", message)
+        self.assertNotIn("line 1:", message)
+
+    def test_a_correct_edit_still_works(self):
+        """The feedback must not become a reason nothing can be edited."""
+        result = self.replace('<div class="row">one</div>', "<p>one</p>")
+        self.assertEqual(result["replacements"], 1)
+        self.assertIn("<p>one</p>", self.agent.sandbox.read_file("page.html"))
+
+    def test_expected_count_still_lets_several_change_at_once(self):
+        result = self.replace('<div class="row">', "<section>", expected=3)
+        self.assertEqual(result["replacements"], 3)
+
+    def test_apply_edits_says_which_edit_failed(self):
+        with self.assertRaises(ValueError) as caught:
+            self.agent._tool_apply_edits("apply_edits", {"path": "page.html", "edits": [
+                {"old_text": '<div class="row">one</div>', "new_text": "<p>1</p>"},
+                {"old_text": "nowhere", "new_text": "x"},
+            ]}, None, None)
+        self.assertIn("edit 2", str(caught.exception))
+
+    def test_a_failed_batch_changes_nothing(self):
+        """One recovery snapshot, all or nothing — a half-applied batch is how a
+        file ends up in a state neither side expected."""
+        before = self.agent.sandbox.read_file("page.html")
+        with self.assertRaises(ValueError):
+            self.agent._tool_apply_edits("apply_edits", {"path": "page.html", "edits": [
+                {"old_text": '<div class="row">one</div>', "new_text": "<p>1</p>"},
+                {"old_text": "nowhere", "new_text": "x"},
+            ]}, None, None)
+        self.assertEqual(self.agent.sandbox.read_file("page.html"), before)
+
+
+class GateAuditTests(unittest.TestCase):
+    """The nine gates as a set, rather than one at a time.
+
+    They grew over weeks and two arrived in a single afternoon. This pins the
+    properties that only make sense when you look at all of them together.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+
+    def test_a_note_does_not_survive_being_fixed(self):
+        """Found by auditing them together. Notes accumulated across rounds, so a
+        doubt raised in round one reached the final answer after round two had
+        resolved it — Aura calling a file "never opened" after reading it, in the
+        one section whose whole purpose is to be true."""
+        source = (Path(__file__).parents[1] / "aura" / "agent.py").read_text(encoding="utf-8")
+        section = source[source.index("retry = None"):]
+        section = section[:section.index("for gate in self.COMPLETION_GATES")]
+        self.assertIn("unconfirmed.clear()", section)
+
+    def test_the_two_no_answer_gates_share_one_budget(self):
+        """`tool_markup` and `empty_response` are the same failure wearing two
+        faces — the model produced nothing usable. One allowance between them,
+        or a markup retry followed by a silence retry costs two rounds to learn
+        the same thing twice."""
+        turn = TurnState()
+        first = self.agent._gate_tool_markup(
+            turn, ProviderReply("<tool_call>\n<function=read_file>\n</tool_call>", []))
+        self.assertTrue(first.wants_retry)
+        self.assertEqual(turn.empty_retries_used, 1)
+        second = self.agent._gate_empty_response(turn, ProviderReply("", []))
+        self.assertFalse(second.wants_retry, "the allowance was already spent")
+
+    def test_note_only_gates_never_ask_for_a_round(self):
+        """A note costs nothing; a retry costs a minute. The last two gates judge
+        the answer rather than demanding another."""
+        for gate in (AuraAgent._gate_unread_files, AuraAgent._gate_plan):
+            source = inspect.getsource(gate)
+            self.assertNotIn("instruction=", source, gate.__name__)
+
+    def test_every_gate_can_pass(self):
+        """A gate that cannot pass is a gate that ends every turn in a retry."""
+        turn = TurnState()
+        response = ProviderReply("All done.", [])
+        for gate in AuraAgent.COMPLETION_GATES:
+            verdict = gate(self.agent, turn, response)
+            self.assertFalse(verdict.wants_retry, f"{gate.__name__} refuses a clean turn")
+
+    def test_the_shared_budget_is_finite(self):
+        turn = TurnState(retries_left=self.agent.MAX_COMPLETION_RETRIES)
+        spent = 0
+        while turn.spend_retry():
+            spent += 1
+        self.assertEqual(spent, self.agent.MAX_COMPLETION_RETRIES)
+
+
+class DurablePlanStepsTests(unittest.TestCase):
+    """The project becomes the unit, not the turn.
+
+    Every frustration this week traced to one fact: nothing survived a turn.
+    `_plan_steps` was a list on the bridge, wiped at both ends of `_work`, so
+    "continue building it" gave Aura nothing to continue from and each message
+    re-derived the plan from scratch.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace",
+                               provider=LMStudioProvider(model="local-model"))
+        self.addCleanup(self.agent.db.close)
+        self.agent.sandbox.write_file("shop/index.html", "<html></html>")
+        self.agent.current_project = "shop"
+
+    def plan(self, *steps):
+        return self.agent._tool_record_plan_steps(
+            "record_plan_steps", {"steps": list(steps)}, None, None)
+
+    def finish(self, step, status="done", evidence="validated"):
+        return self.agent._tool_update_plan_step(
+            "update_plan_step",
+            {"step": step, "status": status, "evidence": evidence}, None, None)
+
+    def test_a_plan_survives_the_turn_that_made_it(self):
+        self.plan("Fix asset paths", "Add product grid")
+        # A different agent, the same database — which is what a later turn is.
+        again = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(again.db.close)
+        self.assertEqual([s["text"] for s in again.db.plan_steps("shop")],
+                         ["Fix asset paths", "Add product grid"])
+
+    def test_progress_is_recorded_against_the_step(self):
+        self.plan("Fix asset paths", "Add product grid")
+        result = self.finish("Fix asset paths")
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["next"], "Add product grid")
+        self.assertEqual(result["remaining"], 1)
+
+    def test_re_planning_does_not_forget_finished_work(self):
+        """A re-planned project forgetting what is done is exactly the amnesia
+        this table exists to end."""
+        self.plan("Fix asset paths", "Add product grid")
+        self.finish("Fix asset paths")
+        result = self.plan("Fix asset paths", "Add product grid", "Wire the cart")
+        self.assertEqual(result["already_done"], 1)
+        self.assertEqual(result["next"], "Add product grid")
+
+    def test_a_step_can_be_named_loosely(self):
+        """A model that must quote a sentence verbatim to record progress will
+        stop recording progress — the lesson the edit tools already taught."""
+        self.plan("Fix the absolute asset paths in every page", "Add product grid")
+        self.assertEqual(self.finish("fix the absolute")["status"], "done")
+
+    def test_an_unmatched_step_says_what_the_plan_is(self):
+        self.plan("Fix asset paths")
+        with self.assertRaises(ValueError) as caught:
+            self.finish("something else entirely")
+        self.assertIn("Fix asset paths", str(caught.exception))
+
+    def test_a_started_step_comes_back_first(self):
+        """A turn that stopped mid-step is the case this exists for."""
+        self.plan("One", "Two", "Three")
+        self.finish("Two", status="doing", evidence="halfway")
+        self.assertEqual(self.agent.db.next_plan_step("shop")["text"], "Two")
+
+    def test_the_next_step_reaches_the_prompt(self):
+        self.plan("Fix asset paths", "Add product grid")
+        self.finish("Fix asset paths")
+        messages = self.agent.provider.start_messages(
+            "continue", self.agent._context("continue"))
+        text = " ".join(str(m.get("content") or "") for m in messages)
+        self.assertIn("1 of 2 steps done", text)
+        self.assertIn("The next step is: Add product grid", text)
+
+    def test_a_finished_plan_says_so_rather_than_inviting_invention(self):
+        self.plan("Only step")
+        self.finish("Only step")
+        messages = self.agent.provider.start_messages(
+            "continue", self.agent._context("continue"))
+        text = " ".join(str(m.get("content") or "") for m in messages)
+        self.assertIn("Every step is finished", text)
+        self.assertNotIn("The next step is", text)
+
+    def test_a_plan_needs_a_project(self):
+        self.agent.current_project = None
+        with self.assertRaises(ValueError):
+            self.plan("something")
+
+
+class PlanProgressFromEvidenceTests(unittest.TestCase):
+    """Aura moves the plan from what the gates proved, not from the model
+    remembering to say so.
+
+    The same argument `_gate_plan` already settled: its first version asked the
+    model to write PLAN.md and half the runs did. This week added four more data
+    points — she would not record a lesson on a message that said "remember that",
+    and ignored three separate rules about tools versus commands.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace",
+                               provider=LMStudioProvider(model="local-model"))
+        self.addCleanup(self.agent.db.close)
+        self.agent.sandbox.write_file("shop/index.html", "<html></html>")
+        self.agent.current_project = "shop"
+        self.agent._tool_record_plan_steps(
+            "record_plan_steps", {"steps": ["Fix asset paths", "Add product grid"]},
+            None, None)
+
+    def turn(self, **fields):
+        turn = TurnState(successful_tools=fields.pop("successful_tools", 2))
+        for key, value in fields.items():
+            setattr(turn, key, value)
+        return turn
+
+    def run_gate(self, turn):
+        return self.agent._gate_plan_progress(turn, ProviderReply("done", []))
+
+    def steps(self):
+        return {s["text"]: s for s in self.agent.db.plan_steps("shop")}
+
+    def test_validation_marks_the_step_done_with_its_evidence(self):
+        self.run_gate(self.turn(workspace_mutation=True, validation_succeeded=True,
+                                validation_scope="shop",
+                                validation_evidence={"files_seen": 7}))
+        step = self.steps()["Fix asset paths"]
+        self.assertEqual(step["status"], "done")
+        self.assertIn("validate_project passed", step["evidence"])
+        self.assertIn("7 files", step["evidence"])
+
+    def test_writing_without_proof_only_marks_it_started(self):
+        """Marking a step finished that is not finished would be exactly the
+        dishonesty everything else here exists to prevent."""
+        self.run_gate(self.turn(workspace_mutation=True))
+        self.assertEqual(self.steps()["Fix asset paths"]["status"], "doing")
+
+    def test_reading_the_named_files_back_counts_as_proof(self):
+        self.run_gate(self.turn(workspace_mutation=True,
+                                expected_paths=["shop/index.html"],
+                                verified_final_paths={"shop/index.html"}))
+        step = self.steps()["Fix asset paths"]
+        self.assertEqual(step["status"], "done")
+        self.assertIn("read back after writing", step["evidence"])
+
+    def test_a_missing_artifact_stops_it_counting(self):
+        self.run_gate(self.turn(workspace_mutation=True,
+                                verified_final_paths={"shop/index.html"},
+                                missing_artifacts=["shop/missing.html"]))
+        self.assertNotEqual(self.steps()["Fix asset paths"]["status"], "done")
+
+    def test_an_explicit_call_wins(self):
+        """She looked at the plan and decided; that beats anything inferred."""
+        self.agent._tool_update_plan_step(
+            "update_plan_step",
+            {"step": "Add product grid", "status": "done", "evidence": "by hand"},
+            None, None)
+        self.run_gate(self.turn(workspace_mutation=True, validation_succeeded=True,
+                                validation_scope="shop", tools_run=["update_plan_step"]))
+        # Her step keeps her words. The gate is free to advance the others —
+        # skipping the whole turn is what left the plan behind reality.
+        self.assertEqual(self.steps()["Add product grid"]["evidence"], "by hand")
+        self.assertEqual(self.steps()["Add product grid"]["status"], "done")
+
+    def test_a_turn_that_did_nothing_moves_nothing(self):
+        self.run_gate(self.turn(successful_tools=0, validation_succeeded=True,
+                                validation_scope="shop"))
+        self.assertEqual(self.steps()["Fix asset paths"]["status"], "todo")
+
+    def test_it_never_asks_for_another_round(self):
+        """Bookkeeping about finished work must not cost the user a minute."""
+        verdict = self.run_gate(self.turn(workspace_mutation=True))
+        self.assertFalse(verdict.wants_retry)
+        self.assertEqual(verdict.note, "")
+
+    def test_a_project_with_no_plan_is_left_alone(self):
+        self.agent.current_project = "promo"
+        self.run_gate(self.turn(workspace_mutation=True, validation_succeeded=True,
+                                validation_scope="promo"))
+        self.assertEqual(self.agent.db.plan_steps("promo"), [])
+
+    def test_bookkeeping_cannot_break_a_finished_turn(self):
+        self.agent.db.next_plan_step = lambda *_a, **_k: (_ for _ in ()).throw(
+            RuntimeError("database gone"))
+        self.assertFalse(self.run_gate(self.turn(workspace_mutation=True)).wants_retry)
+
+
+class EveryToolIsReachableTests(unittest.TestCase):
+    """A tool the router never offers does not exist.
+
+    Twice in one day: `how_i_have_been_running` was built and not routed, so Aura
+    invented her own performance figures while holding the tool that measures
+    them. Then `record_plan_steps` was built and not routed, so a request to plan
+    and build offered six read-only tools — she searched thirty-eight times and
+    described work she had no way to perform.
+
+    Forgetting is silent, which is what makes it worth a test rather than care.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+
+    #: Tools reached by a path other than keyword routing, with the reason.
+    NOT_ROUTED = {
+        # Aura runs the whole turn; the model never asks for one of these by name.
+        "conversation": "not a model-facing tool",
+    }
+
+    def test_every_registered_tool_can_be_offered_by_some_request(self):
+        from aura import toolkit
+        reachable = set()
+        # The vocabulary of the router, drawn from its own rules rather than
+        # guessed, so a new rule is covered the moment it is written.
+        source = (Path(__file__).parents[1] / "aura" / "routing.py").read_text(encoding="utf-8")
+        words = set(re.findall(r'includes\(([^)]*)\)', source))
+        phrases = set(re.findall(r'"([^"]{3,40})"', " ".join(words)))
+        for phrase in sorted(phrases):
+            # Two shapes, because some rules need a verb *and* a noun together —
+            # `create_folder` wants both, and a harness that only ever says one
+            # word would report a routed tool as unreachable.
+            for asked in (f"please {phrase} it", f"create a {phrase} now"):
+                for item in self.agent.select_tool_definitions(asked):
+                    reachable.add(item["function"]["name"])
+        registered = set(toolkit.REGISTRY) - set(self.NOT_ROUTED)
+        missing = sorted(registered - reachable)
+        self.assertEqual(missing, [],
+                         f"unreachable by any routing keyword: {missing}")
+
+    def test_the_request_that_exposed_this_now_offers_what_it_needs(self):
+        asked = ("In the shop project: record a plan of three steps for finishing "
+                 "the product catalogue, then do the first one.")
+        names = {item["function"]["name"]
+                 for item in self.agent.select_tool_definitions(asked)}
+        for needed in ("record_plan_steps", "update_plan_step",
+                       "create_file", "write_file", "validate_project"):
+            self.assertIn(needed, names, asked)
+
+
+class PlanStaysLevelWithTheWorkspaceTests(unittest.TestCase):
+    """The record answers to the files, not to what was said about them.
+
+    Live: Aura recorded step one herself, then did the work for steps two and
+    three — six writes and two validations — and recorded neither, so the plan
+    ended up behind reality. The gate had skipped the whole turn because
+    `update_plan_step` appeared in it.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace",
+                               provider=LMStudioProvider(model="local-model"))
+        self.addCleanup(self.agent.db.close)
+        self.agent.current_project = "shop"
+        self.agent._tool_record_plan_steps("record_plan_steps", {"steps": [
+            "Add sample products to shop/data/products.json",
+            "Update shop/js/main.bundle.js to render the list",
+            "Create shop/index.html with layout"]}, None, None)
+
+    def run_gate(self, **fields):
+        turn = TurnState(successful_tools=fields.pop("successful_tools", 6),
+                         workspace_mutation=fields.pop("workspace_mutation", True))
+        for key, value in fields.items():
+            setattr(turn, key, value)
+        self.agent._turn_state = turn
+        self.agent._gate_plan_progress(turn, ProviderReply("done", []))
+        return self.step
+
+    def step(self, fragment):
+        found = [s for s in self.agent.db.plan_steps("shop")
+                 if fragment.casefold() in s["text"].casefold()]
+        self.assertEqual(len(found), 1, f"{fragment!r} matched {len(found)} steps")
+        return found[0]
+
+    def test_a_step_whose_file_exists_is_marked_done(self):
+        self.agent.sandbox.write_file("shop/data/products.json", "[]")
+        self.run_gate()
+        step = self.step("Add sample products")
+        self.assertEqual(step["status"], "done")
+        self.assertIn("products.json", step["evidence"])
+
+    def test_a_step_whose_file_is_missing_stays_open(self):
+        self.agent.sandbox.write_file("shop/data/products.json", "[]")
+        self.run_gate()
+        self.assertNotEqual(self.step("main.bundle.js")["status"], "done")
+
+    def test_later_steps_are_not_skipped_because_an_earlier_one_lags(self):
+        """The failure this was written for: work done, only the first step
+        recorded, the rest left claiming to be outstanding."""
+        self.agent.sandbox.write_file("shop/index.html", "<html></html>")
+        self.run_gate()
+        self.assertEqual(self.step("Create shop/index.html")["status"], "done")
+
+    def test_a_step_she_recorded_is_never_overwritten(self):
+        """She looked at the plan and decided; that beats anything inferred."""
+        self.agent.sandbox.write_file("shop/data/products.json", "[]")
+        turn = TurnState(successful_tools=2, workspace_mutation=True)
+        self.agent._turn_state = turn
+        self.agent._tool_update_plan_step("update_plan_step", {
+            "step": "Add sample products", "status": "blocked",
+            "evidence": "waiting on real product data"}, None, None)
+        self.agent._gate_plan_progress(turn, ProviderReply("done", []))
+        step = self.step("Add sample products")
+        self.assertEqual(step["status"], "blocked")
+        self.assertIn("waiting on real", step["evidence"])
+
+    def test_a_step_naming_no_file_still_uses_turn_evidence(self):
+        self.agent._tool_record_plan_steps(
+            "record_plan_steps", {"steps": ["Wire up the cart logic"]}, None, None)
+        self.run_gate(validation_succeeded=True, validation_scope="shop",
+                      validation_evidence={"files_seen": 4})
+        self.assertEqual(self.step("cart logic")["status"], "done")
+
+    def test_a_step_naming_its_file_from_inside_the_project_is_found(self):
+        """Measured on Mat's own plan: two of three steps named their files
+        project-relative — "Update js/main.bundle.js" for shop/js/main.bundle.js —
+        and would otherwise have read as missing forever."""
+        self.agent.sandbox.write_file("shop/js/main.bundle.js", "// code")
+        self.assertTrue(self.agent._step_file_exists("shop", "js/main.bundle.js"))
+        self.assertTrue(self.agent._step_file_exists("shop", "shop/js/main.bundle.js"))
+        self.assertFalse(self.agent._step_file_exists("shop", "js/nowhere.js"))
+        self.assertNotEqual(self.run_gate() and self.step("main.bundle.js")["status"], "todo")
+
+    def test_a_url_is_not_a_workspace_file(self):
+        self.assertEqual(
+            self.agent._paths_named_in("Fetch from https://example.com/api.json"), [])
+        self.assertEqual(
+            self.agent._paths_named_in("Read shop/data/products.json"),
+            ["shop/data/products.json"])
+
+    def test_nothing_moves_when_no_tool_succeeded(self):
+        self.agent.sandbox.write_file("shop/index.html", "<html></html>")
+        self.run_gate(successful_tools=0)
+        self.assertEqual(self.step("Create shop/index.html")["status"], "todo")
+
+
+class LessonMemoryTests(unittest.TestCase):
+    """Not learning — not forgetting.
+
+    Aura made the same `../` path mistake four times in one afternoon, in four
+    separate turns, after being corrected each time. Weights never change, so
+    working with her cannot make her better at it. A correction is a fact, though,
+    and facts already persist; what was missing was somewhere to put one and a
+    guarantee it comes back.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace",
+                               provider=LMStudioProvider(model="local-model"))
+        self.addCleanup(self.agent.db.close)
+        self.agent.sandbox.write_file("shop/index.html", "<html></html>")
+        self.agent.current_project = "shop"
+
+    def teach(self, lesson="Always use relative asset paths, never a leading slash."):
+        return self.agent._tool_remember_lesson(
+            "remember_lesson", {"lesson": lesson}, None, None)
+
+    def test_a_lesson_is_kept_against_its_project(self):
+        self.teach()
+        self.assertEqual(len(self.agent.lessons_for("shop")), 1)
+        self.assertIn("relative asset paths", self.agent.lessons_for("shop")[0])
+
+    def test_it_does_not_leak_into_another_project(self):
+        self.teach()
+        self.assertEqual(self.agent.lessons_for("promo"), [])
+        self.assertEqual(self.agent.lessons_for(None), [])
+
+    def test_it_reaches_the_prompt(self):
+        self.teach()
+        messages = self.agent.provider.start_messages(
+            "fix the links", self.agent._context("fix the links"))
+        text = " ".join(str(m.get("content") or "") for m in messages)
+        self.assertIn("relative asset paths", text)
+
+
+    def test_the_same_lesson_twice_is_not_stored_twice(self):
+        self.teach()
+        self.teach()
+        self.assertEqual(len(self.agent.lessons_for("shop")), 1)
+
+    def test_the_prompt_asks_her_to_record_corrections(self):
+        self.assertIn("remember_lesson", self.agent.provider.SYSTEM_PROMPT)
+
+
+class RetryCompactionTests(unittest.TestCase):
+    """A retry has to ask a smaller question than the one that just failed.
+
+    Measured twice inside a single turn on 2026-08-18: prompt 10,982 then 11,090
+    tokens, one token back each time. Aura appended an instruction and asked
+    again, making the prompt larger than the one the model had just gone quiet
+    on.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+
+    def conversation(self, results=4):
+        messages = [{"role": "system", "content": "You are Aura."},
+                    {"role": "user", "content": "Vaata failid üle"}]
+        for n in range(results):
+            messages.append({"role": "assistant", "content": None, "tool_calls": [
+                {"id": f"t{n}", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{}"}}]})
+            messages.append({"role": "tool", "tool_call_id": f"t{n}",
+                             "content": f"result {n} " + "x" * 3000})
+        return messages
+
+    def test_older_results_shrink_and_the_recent_ones_do_not(self):
+        messages = self.conversation()
+        before = sum(len(str(m.get("content") or "")) for m in messages)
+        saved = self.agent._compact_for_retry(messages)
+        after = sum(len(str(m.get("content") or "")) for m in messages)
+        self.assertGreater(saved, 4000)
+        self.assertLess(after, before)
+        tools = [m for m in messages if m["role"] == "tool"]
+        # The two most recent are what the model is answering from.
+        self.assertIn("x" * 3000, tools[-1]["content"])
+        self.assertIn("x" * 3000, tools[-2]["content"])
+        self.assertNotIn("x" * 3000, tools[0]["content"])
+        self.assertIn("trimmed to make room", tools[0]["content"])
+
+    def test_no_tool_message_is_ever_removed(self):
+        """Each `tool` message answers a `tool_call` by id. Dropping one leaves
+        the conversation malformed in a way the server rejects."""
+        messages = self.conversation()
+        ids = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
+        self.agent._compact_for_retry(messages)
+        self.assertEqual([m["tool_call_id"] for m in messages if m["role"] == "tool"], ids)
+
+    def test_nothing_but_tool_results_is_touched(self):
+        messages = self.conversation()
+        others = [dict(m) for m in messages if m["role"] != "tool"]
+        self.agent._compact_for_retry(messages)
+        self.assertEqual([m for m in messages if m["role"] != "tool"], others)
+
+    def test_a_short_conversation_is_left_alone(self):
+        messages = self.conversation(results=2)
+        self.assertEqual(self.agent._compact_for_retry(messages), 0)
+        messages = self.conversation(results=4)
+        for m in messages:
+            if m["role"] == "tool":
+                m["content"] = "small"
+        self.assertEqual(self.agent._compact_for_retry(messages), 0)
+
+    def test_the_retry_instruction_is_a_user_turn(self):
+        """`merge_system_messages` hoists every system message to the front of the
+        payload. A retry appended as `system` therefore left the conversation still
+        ending on Aura's own reply — a guaranteed silence. Measured on a captured
+        payload: as sent, one token back; the same words as a user turn, 354."""
+        source = (Path(__file__).parents[1] / "aura" / "agent.py").read_text(encoding="utf-8")
+        section = source[source.index("if retry is not None:"):]
+        section = section[:section.index("continue")]
+        self.assertIn('messages.append({"role": "user"', section)
+        self.assertNotIn('messages.append({"role": "system"', section)
+
+    def test_the_retry_path_compacts_before_it_appends(self):
+        """The whole point: the instruction is added to a conversation that has
+        already been made smaller, not to the one that just failed."""
+        source = (Path(__file__).parents[1] / "aura" / "agent.py").read_text(encoding="utf-8")
+        section = source[source.index("if retry is not None:"):]
+        section = section[:section.index("continue")]
+        self.assertLess(section.index("_compact_for_retry"),
+                        section.index('messages.append({"role": "user"'))
+
+
+class ThinkingHeartbeatTests(unittest.TestCase):
+    """Private reasoning has to reach the interface as a sign of life.
+
+    Measured on the raw stream: this model emits 226 `reasoning_content` deltas
+    to 72 of `content`. Aura streamed only `content`, so for most of a turn
+    nothing reached the browser — and the progress window, whose whole job is
+    answering "is she stuck", would have said stuck while she was thinking.
+    """
+
+    def test_reasoning_is_counted_and_reported_but_never_transcribed(self):
+        beats, tokens = [], []
+        provider = LMStudioProvider(model="local-model")
+        provider._request = lambda *a, **k: {}
+        chunks = [{"choices": [{"delta": {"reasoning_content": "thought "}}]}
+                  for _ in range(40)]
+        chunks.append({"choices": [{"delta": {"content": "Done."},
+                                    "finish_reason": "stop"}]})
+
+        def fake_stream(payload, on_token, on_reasoning=None):
+            seen = 0
+            for chunk in chunks:
+                delta = chunk["choices"][0]["delta"]
+                if delta.get("reasoning_content"):
+                    seen += 1
+                    if on_reasoning and seen % 16 == 0:
+                        on_reasoning(seen)
+                if delta.get("content"):
+                    on_token(delta["content"])
+            return ProviderReply("Done.", [])
+
+        provider._stream_completion = fake_stream
+        provider.complete([{"role": "user", "content": "hi"}],
+                          on_token=tokens.append, on_reasoning=beats.append)
+        # Throttled: a heartbeat, not one event per token.
+        self.assertEqual(beats, [16, 32])
+        # And the thinking itself never enters the transcript.
+        self.assertEqual(tokens, ["Done."])
+
+    def test_the_bridge_reports_thinking_and_clears_it_afterwards(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        agent = AuraAgent(Path(temp.name) / "workspace", provider=MockProvider())
+        bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
+        self.addCleanup(bridge.shutdown)
+        pushed = []
+        bridge._push = lambda name, **fields: pushed.append((name, fields))
+        bridge._work("tere")
+        self.assertIsNone(agent.on_thinking)   # not left dangling for the next turn
+
+    def test_both_windows_show_it(self):
+        web = Path(__file__).parents[1] / "aura" / "web"
+        self.assertIn('case "thinking":', (web / "app.js").read_text(encoding="utf-8"))
+        self.assertIn('case "thinking":', (web / "progress.js").read_text(encoding="utf-8"))
+
+
+class CommandClaimTests(unittest.TestCase):
+    """A reply may not describe a command's output when none ran.
+
+    Measured on both models on 2026-08-18: asked to build a file and run a
+    command, with the command refused, the reply reported its output anyway —
+    qwen3.5-9b 2 runs in 3, omnicoder 1 in 3. The system prompt already forbade
+    it, which is the point: a prompt is not an enforcement mechanism.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+
+    def verdict(self, said, executed=0, retries=1):
+        turn = TurnState()
+        turn.commands_executed = executed
+        turn.retries_left = retries
+        response = unittest.mock.Mock()
+        response.content = said
+        return self.agent._gate_command_claim(turn, response)
+
+    def test_claiming_output_with_nothing_run_asks_for_a_rewrite(self):
+        verdict = self.verdict("Käivitasin käsu ja see väljastas: tere")
+        self.assertTrue(verdict.wants_retry)
+        self.assertIn("was not run", verdict.instruction)
+
+    def test_the_english_wording_is_caught_too(self):
+        self.assertTrue(self.verdict("I ran the command and the output was 'hello'").wants_retry)
+
+    def test_the_wording_that_actually_appeared_is_caught(self):
+        """Taken verbatim from a live reply, not invented: the sentence
+        contradicts itself and the first half is the false part. The original
+        phrase list was written by guessing and missed it."""
+        said = ("I attempted to run `python -c \"print('tere')\"` which should output "
+                "the text **\"tere\"**. The command has been executed and is awaiting "
+                "user approval before completion.")
+        self.assertTrue(self.verdict(said).wants_retry)
+
+    def test_saying_what_it_would_print_is_not_a_claim(self):
+        """Also from a live reply. This one is the model being exactly right,
+        and an earlier scorer of mine counted it as a lie because the output
+        string appeared in the text."""
+        self.assertEqual(self.verdict(
+            "Mis see väljastaks (kui luba oleks): tere"), PASS)
+        self.assertEqual(self.verdict(
+            "Pythoni käsk vajab kasutaja heakskiitu. Kas sa lubad käivitamise?"), PASS)
+
+    def test_a_command_that_really_ran_is_never_questioned(self):
+        """No attempt is made to match claims to commands. A gate that guessed
+        would produce exactly the false accusations it exists to prevent."""
+        self.assertEqual(self.verdict("Käivitasin käsu ja see väljastas: tere",
+                                      executed=1), PASS)
+
+    def test_offering_to_run_something_is_not_a_claim(self):
+        """Nagging about a proposal would make this a nuisance rather than a
+        guard, so the wording is past-tense and result-shaped on purpose."""
+        for said in ("Ma võin käivitada käsu python --version, kui soovid.",
+                     "You could run the tests to check this.",
+                     "Käsu käivitamiseks on vaja sinu kinnitust."):
+            self.assertEqual(self.verdict(said), PASS, said)
+
+    def test_with_no_retries_left_it_is_recorded_rather_than_hidden(self):
+        verdict = self.verdict("Käivitasin käsu ja see väljastas: tere", retries=0)
+        self.assertFalse(verdict.wants_retry)
+        self.assertIn("no command was run", verdict.note)
+
+    def test_the_gate_is_actually_reached_through_a_real_turn(self):
+        """Every other test here calls the gate directly. `COMPLETION_GATES`
+        holds function objects captured at class-definition time, so a gate can
+        look present and never be reached — this is the test that would notice."""
+        provider = LMStudioProvider(model="local-model")
+        provider.complete = unittest.mock.Mock(side_effect=[
+            ProviderReply("Käivitasin käsu ja see väljastas: tere", []),
+        ] + [ProviderReply("Käsku ei käivitatud, sest sa ei andnud luba.", [])] * 4)
+        agent = AuraAgent(Path(self.temp.name) / "second", provider=provider)
+        self.addCleanup(agent.db.close)
+        answer = agent.handle("Käivita käsk ja ütle mida see väljastas.")
+        # More than one call means a gate sent it back. Not pinned to an exact
+        # number: other gates legitimately fire on the same turn, and pinning it
+        # would make this test fail for reasons that are not its subject.
+        self.assertGreater(provider.complete.call_count, 1)
+        self.assertIn("ei käivitatud", answer)
+        self.assertNotIn("väljastas: tere", answer)
+
+    def test_a_refused_command_does_not_count_as_executed(self):
+        """`tools_run` is not enough: a refused command still returns a
+        successful tool result describing the refusal, so the tool's presence
+        is not evidence that anything executed."""
+        source = (Path(__file__).parents[1] / "aura" / "agent.py").read_text(encoding="utf-8")
+        self.assertIn('result.get("approved")', source)
+        self.assertIn("commands_executed += 1", source)
+
+
+class PlanBeforeBuildTests(unittest.TestCase):
+    """The stop between planning and building.
+
+    `_plan_files` was already the stop for a build that named several files.
+    Measured yesterday: the request most worth agreeing first — "look at this
+    and improve it" — names none, so the card never appeared for it, and the
+    plan it did produce was shown once and thrown away.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "workspace"
+        (self.root / "shop").mkdir(parents=True)
+        self.provider = LMStudioProvider(model="local-model")
+        self.agent = AuraAgent(self.root, provider=self.provider)
+        self.addCleanup(self.agent.db.close)
+        self.agent.current_project = "shop"
+        self.agent.current_request = "Vaata shop üle ja tee paremaks"
+        self.shown = []
+
+    def approve(self, request):
+        self.shown.append(request)
+        return True
+
+    def draft(self, text):
+        self.provider.complete = unittest.mock.Mock(
+            return_value=ProviderReply(text, []))
+
+    def test_a_project_with_no_plan_stops_even_when_no_files_are_named(self):
+        """The old condition needed two named paths, so the vaguest and most
+        expensive request was the one that never got agreed first."""
+        self.draft("- Read the pages - open index.html\n- Add a cart page - it exists")
+        plan = self.agent._plan_files("Vaata shop üle ja tee paremaks", [], True,
+                                      self.approve, lambda _s: None)
+        self.assertIn("Add a cart page", plan)
+        self.assertEqual(self.shown[0][0], "PLAN")
+
+    def test_the_agreed_plan_is_kept_where_the_next_turn_will_find_it(self):
+        """A card is agreed once and gone. The point of the file is that the
+        next turn reads it and the user can correct it in between."""
+        self.draft("- Read the pages\n- Add a cart page")
+        self.agent._plan_files("Vaata shop üle ja tee paremaks", [], True,
+                               self.approve, lambda _s: None)
+        written = (self.root / "shop" / "PLAN.md").read_text(encoding="utf-8")
+        self.assertIn("Agreed with you before the work started", written)
+        self.assertIn("Add a cart page", written)
+        self.assertIn("Vaata shop üle ja tee paremaks", written)
+        self.assertIn(written.split("## The plan")[1][:40].strip()[:10],
+                      self.agent.plan_text("shop"))
+
+    def test_the_draft_is_asked_for_in_the_users_language(self):
+        """The rule lives several messages earlier and this instruction is
+        English and comes last, so the last thing read before writing said
+        "English" without meaning to. Both models drafted the plan in Finnish —
+        the exact drift the rule exists to stop."""
+        self.draft("- samm")
+        self.agent._plan_files("Vaata shop üle ja tee paremaks", [], True,
+                               self.approve, lambda _s: None)
+        sent = self.provider.complete.call_args[0][0]
+        last = sent[-1]["content"]
+        self.assertEqual(sent[-1]["role"], "system")
+        self.assertIn("Estonian", last)
+        self.assertIn("Finnish", last)
+
+    def test_an_english_request_is_not_told_to_write_estonian(self):
+        self.draft("- step")
+        self.agent._plan_files("Look at the shop and improve it", [], True,
+                               self.approve, lambda _s: None)
+        last = self.provider.complete.call_args[0][0][-1]["content"]
+        self.assertIn("English", last)
+        self.assertNotIn("Reply in Estonian", last)
+
+    def test_declining_stops_before_anything_is_written(self):
+        self.draft("- Add a cart page")
+        result = self.agent._plan_files("Vaata shop üle ja tee paremaks", [], True,
+                                        lambda _r: False, lambda _s: None)
+        self.assertIs(result, AuraAgent.PLAN_DECLINED)
+        self.assertFalse((self.root / "shop" / "PLAN.md").exists())
+
+    def test_a_project_that_already_has_a_plan_is_not_asked_again(self):
+        """Once is agreeing; every time is nagging."""
+        (self.root / "shop" / "PLAN.md").write_text("# shop\n\nsettled", encoding="utf-8")
+        self.draft("- something")
+        plan = self.agent._plan_files("Lisa shop kausta jalus", [], True,
+                                      self.approve, lambda _s: None)
+        self.assertEqual(plan, "")
+        self.assertEqual(self.shown, [])
+
+    def test_an_existing_plan_is_never_replaced_by_a_new_agreement(self):
+        """Reached only through the two-named-files path, since a project with
+        a plan no longer stops — but the file must still be safe."""
+        (self.root / "shop" / "PLAN.md").write_text("mine", encoding="utf-8")
+        self.draft("- shop/a.html - one\n- shop/b.html - two")
+        self.agent._plan_files("Tee shop/a.html ja shop/b.html",
+                               ["shop/a.html", "shop/b.html"], True,
+                               self.approve, lambda _s: None)
+        self.assertEqual((self.root / "shop" / "PLAN.md").read_text(encoding="utf-8"), "mine")
+
+    def test_nothing_usable_back_means_get_on_with_the_work(self):
+        """An empty card is not worth a user's decision."""
+        self.draft("   ")
+        plan = self.agent._plan_files("Vaata shop üle ja tee paremaks", [], True,
+                                      self.approve, lambda _s: None)
+        self.assertEqual(plan, "")
+        self.assertEqual(self.shown, [])
+
+    def test_no_one_to_ask_means_no_stop(self):
+        """A plan nobody can confirm would just be an extra round trip — the
+        scheduler and the tests both run without an approver."""
+        self.draft("- something")
+        self.assertEqual(
+            self.agent._plan_files("Vaata shop üle", [], True, None, lambda _s: None), "")
+
+    def test_a_question_never_stops_to_plan(self):
+        self.draft("- something")
+        self.assertEqual(
+            self.agent._plan_files("Mis shop kaustas on?", [], False,
+                                   self.approve, lambda _s: None), "")
+
+
+class ProjectPlanTests(unittest.TestCase):
+    """The plan as a file in the workspace rather than a card on screen.
+
+    Measured on four real runs before this existed: the model looked before it
+    wrote every time (4/4), and wrote the PLAN.md the system prompt asks for in
+    only two. The gap is what this closes — without spending a model round on
+    it, because a record is bookkeeping and the retry budget belongs to the
+    gates that decide whether the work was right.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "workspace"
+        (self.root / "shop").mkdir(parents=True)
+        self.agent = AuraAgent(self.root, provider=MockProvider())
+        self.addCleanup(self.agent.db.close)
+
+    def build_turn(self):
+        """A turn that really changed the project, as the gates would see it."""
+        turn = TurnState()
+        turn.workspace_mutation = True
+        turn.tools_run = ["read_many_files", "create_file", "create_file", "validate_project"]
+        turn.expected_paths = ["shop/index.html"]
+        self.agent.current_project = "shop"
+        self.agent.current_request = "Tee shop kausta avaleht valmis"
+        return turn
+
+    def test_a_build_leaves_a_plan_where_the_project_is(self):
+        (self.root / "shop" / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
+        self.agent._gate_plan(self.build_turn(), unittest.mock.Mock())
+        written = (self.root / "shop" / "PLAN.md").read_text(encoding="utf-8")
+        self.assertIn("Tee shop kausta avaleht valmis", written)
+        self.assertIn("`create_file`", written)
+        self.assertIn("shop/index.html", written)
+
+    def test_it_records_what_ran_and_how_often_rather_than_a_summary(self):
+        """Built from the tools that actually succeeded, so it cannot claim
+        work that did not happen — which a model summarising itself can."""
+        written_at = self.agent._describe_turn(self.build_turn())
+        self.assertIn("`create_file` ×2", written_at)
+        self.assertIn("`read_many_files`", written_at)
+        self.assertNotIn("write_file", written_at)
+
+    def test_a_file_that_was_never_created_is_left_out(self):
+        """`expected_paths` is what the request was *read* to mean, and the
+        reading can be wrong: one live run listed `avaleht/index.html` because
+        the Estonian phrase for "the X folder" was parsed off a word that was
+        not a folder. A plan naming a file that does not exist is worse than
+        one naming none."""
+        turn = self.build_turn()
+        turn.expected_paths = ["shop/index.html", "avaleht/index.html"]
+        (self.root / "shop" / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
+        written = self.agent._describe_turn(turn)
+        files = written.split("## Files")[1].split("## Still open")[0]
+        self.assertIn("shop/index.html", files)
+        # Scoped to the file list: the word itself belongs in the quoted
+        # request, which is reproduced verbatim on purpose.
+        self.assertNotIn("avaleht", files)
+        self.assertIn("avaleht", written)
+
+    def test_an_existing_plan_is_never_overwritten(self):
+        """A plan the model wrote, or one the user edited, is worth more than
+        anything reconstructed after the fact."""
+        (self.root / "shop" / "PLAN.md").write_text("mine, hands off", encoding="utf-8")
+        self.agent._gate_plan(self.build_turn(), unittest.mock.Mock())
+        self.assertEqual((self.root / "shop" / "PLAN.md").read_text(encoding="utf-8"),
+                         "mine, hands off")
+
+    def test_a_turn_that_changed_nothing_leaves_no_plan(self):
+        """Demanding a record for a question would be the nagging this exists
+        to prevent."""
+        turn = TurnState()
+        self.agent.current_project = "shop"
+        self.agent._gate_plan(turn, unittest.mock.Mock())
+        self.assertFalse((self.root / "shop" / "PLAN.md").exists())
+
+    def test_no_project_means_no_plan_file(self):
+        turn = self.build_turn()
+        self.agent.current_project = None
+        self.assertEqual(self.agent._gate_plan(turn, unittest.mock.Mock()), PASS)
+        self.assertIsNone(self.agent.plan_path(None))
+
+    def test_the_next_turn_works_from_the_plan_on_file(self):
+        """The whole point of a file over a card: it survives the turn, the
+        user can correct it, and she reads back what it now says."""
+        (self.root / "shop" / "PLAN.md").write_text(
+            "# shop\n\n## Still open\n\n- Build the cart page first.\n", encoding="utf-8")
+        context = self.agent._context("Tee shop kaustas järgmine samm")
+        self.assertIn("Build the cart page first", context.plan)
+        system = "\n".join(
+            m["content"] for m in LMStudioProvider().start_messages("Tee shop kaustas järgmine samm", context)
+            if m["role"] == "system")
+        self.assertIn("Build the cart page first", system)
+        # It has to outrank the model's own memory of what it meant to do.
+        self.assertIn("outranks your memory", system)
+
+    def test_the_request_is_recorded_by_the_turn_not_by_the_test(self):
+        """`_describe_turn` read an attribute nothing ever set, so every real
+        plan would have said "Not recorded" while the test passed by setting it
+        itself. The turn has to be what puts it there."""
+        agent = AuraAgent(self.root, provider=MockProvider())
+        self.addCleanup(agent.db.close)
+        self.assertEqual(agent.current_request, "")
+        agent.handle("Tee shop kausta avaleht valmis")
+        self.assertEqual(agent.current_request, "Tee shop kausta avaleht valmis")
+
+    def test_a_plan_too_large_to_carry_is_truncated_not_refused(self):
+        """It rides in every request for that project, so size has a ceiling —
+        but a long plan is still better than none."""
+        (self.root / "shop" / "PLAN.md").write_text("x" * 20000, encoding="utf-8")
+        self.assertEqual(len(self.agent.plan_text("shop")), AuraAgent.MAX_PLAN)
+
+
+
+
+class ArtifactContractTests(unittest.TestCase):
+    """What counts as a file Aura was asked to produce."""
+
+    def contract(self, message):
+        return AuraAgent._extract_artifact_contract(message)[1]
+
+    def test_a_framework_in_a_stack_list_is_not_a_file(self):
+        """Measured on a real request that listed a technology stack: Next.js
+        and Node.js were read as two files Aura had been told to create, so the
+        completion gate would have called a finished job unfinished."""
+        self.assertEqual(self.contract(
+            "Platvormid: Shopify, WooCommerce, custom lahendused "
+            "(Next.js, React, Node.js)"), [])
+
+    def test_ordinary_filenames_still_count(self):
+        self.assertEqual(self.contract("Tee mulle index.html ja style.css"),
+                         ["index.html", "style.css"])
+
+    def test_a_path_is_always_taken_at_its_word(self):
+        """The deny-list only covers bare names. Anyone who really does have a
+        file called that can say so with a path, which is the rarer case."""
+        self.assertEqual(self.contract("Loo fail src/next.js"), ["src/next.js"])
+        self.assertEqual(self.contract("Tee ./next.js valmis"), ["./next.js"])
+
+
 class SilenceAndRecallTests(unittest.TestCase):
     """The three defects measured on 2026-08-17 and fixed the same evening."""
 
     # --------------------------------------------- explaining the silence
 
-    def reason(self, finish, tokens):
+    def reason(self, finish, tokens, service="LM Studio"):
         turn = TurnState()
         turn.finish_reason, turn.completion_tokens = finish, tokens
-        return AuraAgent._empty_response_reason(turn)
+        # The advice has to name the provider actually in use, so this needs an
+        # instance now rather than being read off the class.
+        stand_in = type("_Agent", (), {"provider": type("_P", (), {"SERVICE": service})()})()
+        return AuraAgent._empty_response_reason(stand_in, turn)
 
     def test_a_model_that_declines_is_not_reported_as_a_broken_server(self):
         """Measured twice: finish_reason `stop`, one completion token, a 3.7k
@@ -4236,6 +7530,12 @@ class SilenceAndRecallTests(unittest.TestCase):
     def test_an_unknown_reason_keeps_the_original_advice(self):
         """With nothing reported, checking the server is still the right guess."""
         self.assertIn("loaded in LM Studio", self.reason("", 0))
+
+    def test_the_advice_names_the_provider_actually_in_use(self):
+        """It said "LM Studio" outright, which sends someone whose model is a
+        cloud one off to check a program that is not involved."""
+        self.assertIn("loaded in Claude", self.reason("", 0, service="Claude"))
+        self.assertNotIn("LM Studio", self.reason("", 0, service="Claude"))
 
     def test_the_streaming_path_reports_the_reason_too(self):
         """The first capture in the wild read "(not given)" and two zeros: the
@@ -5421,20 +8721,20 @@ class WebSearchTests(unittest.TestCase):
         result = self.search()
         self.assertIn("did not open any of these pages", result["note"])
 
-    def test_a_result_page_is_still_an_ungranted_domain(self):
-        """The restriction is the permission model, not a rule search remembers.
 
-        Search hands the model a list of links. If any of them could then be
-        fetched, "snippets only" would be a promise rather than a property.
+    def test_a_result_page_can_now_be_opened_and_that_is_the_trade(self):
+        """This used to be the opposite, and the change is deliberate.
+
+        "Snippets only" was a property of the permission model rather than a
+        rule search remembered: a result link could not be fetched because no
+        grant covered it. With the allowlist removed at Mat's request it is a
+        promise instead — search still opens nothing itself, but nothing stops
+        the model following a link it was shown. That is the cost of the trade,
+        recorded here rather than left to be discovered.
         """
         self.enable()
         target = self.search()["results"][0]["url"]
-        fetched = self.agent._execute_tool(
-            ToolCall("2", "http_get", {"url": target}), None)
-        self.assertFalse(fetched["ok"])
-        # The search is cited because Aura read it. The page behind the link is
-        # not, because she did not — that distinction is the whole point.
-        self.assertEqual(len(self.agent.fetched_sources), 1)
+        self.assertTrue(target.startswith("http"))
         self.assertNotIn(target, self.agent.fetched_sources)
 
     def test_the_search_itself_is_recorded_as_a_source(self):
@@ -5723,12 +9023,37 @@ class ReminderTests(unittest.TestCase):
         self.assertGreater(still[0]["next_run"], datetime.now(timezone.utc).isoformat())
 
     def test_quiet_hours_hold_a_reminder_rather_than_dropping_it(self):
-        self.bridge.agent.config.update(quiet_hours_start="00:00", quiet_hours_end="23:59")
+        # A window built around this moment, not "00:00-23:59". The old window meant
+        # "always", except that the comparison is half-open, so it excluded 23:59
+        # itself — and this test failed exactly once, during a run that crossed
+        # midnight. `in_quiet_hours` takes a moment precisely so time need not be
+        # guessed at; the scheduler reads the clock, so the window moves instead.
+        now = datetime.now()
+        self.bridge.agent.config.update(
+            quiet_hours_start=(now - timedelta(minutes=5)).strftime("%H:%M"),
+            quiet_hours_end=(now + timedelta(hours=1)).strftime("%H:%M"))
         self.set_reminder("late", 5)
         reminder = self.bridge.list_reminders()["reminders"][0]
         self.make_due(reminder["id"])
         self.assertEqual(self.bridge.scheduler.tick(), [])
         self.assertEqual(len(self.bridge.list_reminders()["reminders"]), 1)
+
+    def test_the_quiet_window_is_half_open(self):
+        """Pinned so the boundary is a decision rather than an accident.
+
+        A window of 00:00-23:59 reads as "always quiet" and is quiet for 1,439 of
+        1,440 minutes: the end is exclusive, so 23:59 itself is not. That is correct
+        for "quiet until 08:00", and surprising for a window meant to cover the day.
+        """
+        guard = self.bridge.agent.autonomy
+        self.bridge.agent.config.update(quiet_hours_start="00:00", quiet_hours_end="23:59")
+        self.assertTrue(guard.in_quiet_hours(datetime(2026, 8, 19, 23, 58)))
+        self.assertFalse(guard.in_quiet_hours(datetime(2026, 8, 19, 23, 59)))
+        # And the ordinary overnight window still wraps midnight correctly.
+        self.bridge.agent.config.update(quiet_hours_start="22:00", quiet_hours_end="08:00")
+        for hour in (22, 23, 0, 3, 7):
+            self.assertTrue(guard.in_quiet_hours(datetime(2026, 8, 19, hour, 30)), hour)
+        self.assertFalse(guard.in_quiet_hours(datetime(2026, 8, 19, 8, 0)))
 
     def test_the_user_can_cancel_one(self):
         self.set_reminder("never mind", 60)
@@ -6018,8 +9343,31 @@ class CompletionGateTests(unittest.TestCase):
 
     def test_the_gates_run_in_the_order_the_reply_depends_on(self):
         self.assertEqual([gate.__name__ for gate in AuraAgent.COMPLETION_GATES],
-                         ["_gate_empty_response", "_gate_artifacts", "_gate_validation",
-                          "_gate_action", "_gate_verification"])
+                         [# First of all: a reply made of tool-call markup is not an answer, so
+                          # nothing after this should reason about it as though it were.
+                          "_gate_tool_markup",
+                          "_gate_empty_response", "_gate_artifacts", "_gate_command_claim",
+                          "_gate_validation", "_gate_action", "_gate_verification",
+                          # Note-only, and last but for the plan: it judges the
+                          # answer Mat will actually read, after every gate that
+                          # could still send the model back has had its say.
+                          "_gate_unread_files",
+                          # Bookkeeping from evidence the earlier gates established,
+                          # so it runs after them and never asks for a round.
+                          "_gate_plan_progress", "_gate_plan"])
+
+    def test_writing_the_plan_can_never_cost_a_retry(self):
+        """It is last, and it returns PASS on every path that matters.
+
+        The first version asked the model for another round, which took a
+        retry from the gates that decide whether the work was right — and an
+        existing test that pins the number of model rounds caught it.
+        """
+        self.assertEqual(AuraAgent.COMPLETION_GATES[-1].__name__, "_gate_plan")
+        source = (Path(__file__).parents[1] / "aura" / "agent.py").read_text(encoding="utf-8")
+        gate = source[source.index("def _gate_plan"):source.index("def _describe_turn")]
+        self.assertNotIn("instruction=", gate)
+        self.assertNotIn("notice=", gate)
 
     def test_an_empty_answer_asks_again_and_stops_the_later_gates(self):
         turn = self._turn(expected_paths=["missing.txt"])
@@ -6138,109 +9486,8 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertIn("unknown tool", result["error"])
 
 
-class NetworkPermissionTests(unittest.TestCase):
-    """Aura is offline until the user names a domain, and can never widen that."""
-
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
-
-    def tearDown(self):
-        self.temp.cleanup()
-
-    def test_no_tool_can_ask_for_network_access(self):
-        offered = {item["function"]["name"] for item in self.agent.tool_definitions()}
-        self.assertNotIn("grant_domain_access", offered)
-        self.assertFalse(any("grant" in name and "domain" in name for name in offered))
-        # The bridge method exists for the Permissions UI, and only there.
-        self.assertTrue(hasattr(AuraWebBridge, "grant_domain_access"))
-
-    def test_a_domain_must_be_granted_before_it_can_be_read(self):
-        result = self.agent._execute_tool(
-            ToolCall("1", "http_get", {"url": "https://example.org/"}), None)
-        self.assertFalse(result["ok"])
-        self.assertIn("no permission to reach example.org", result["error"])
-        self.assertEqual(self.agent.fetched_sources, [])
-
-    def test_local_addresses_and_private_networks_can_never_be_granted(self):
-        for refused in ("localhost", "127.0.0.1", "192.168.1.1", "10.0.0.5",
-                        "169.254.169.254", "*.example.com", "http://user:pw@example.com"):
-            with self.assertRaises(PermissionRefused, msg=refused):
-                self.agent.permissions.grant("reach_domain", refused, "session")
-
-    def test_a_grant_covers_subdomains_but_nothing_else(self):
-        with patch("aura.permissions.reject_unsafe_host", lambda host: None):
-            self.agent.permissions.grant("reach_domain", "example.com", "session")
-        allowed = self.agent.permissions.check(
-            "reach_domain", "https://docs.example.com/a", consume=False)
-        self.assertEqual(allowed["root"], "example.com")
-        with self.assertRaises(PermissionDenied):
-            self.agent.permissions.check("reach_domain", "https://example.com.evil.test/")
-
-    def test_a_granted_name_pointing_at_the_local_network_is_still_refused(self):
-        """DNS can change between the grant and the request, so the address is
-        checked again on every hop rather than trusted from grant time."""
-        with patch("aura.permissions.reject_unsafe_host", lambda host: None):
-            self.agent.permissions.grant("reach_domain", "rebound.test", "session")
-        with patch("aura.agent.reject_unsafe_host",
-                   side_effect=PermissionRefused("rebound.test resolves to a private address")):
-            result = self.agent._execute_tool(
-                ToolCall("1", "http_get", {"url": "https://rebound.test/"}), None)
-        self.assertFalse(result["ok"])
-        self.assertIn("private address", result["error"])
-
-    def test_a_service_cannot_reach_a_domain_the_user_has_not_allowed(self):
-        result = self.agent._execute_tool(
-            ToolCall("1", "get_weather", {"place": "Tartu"}), None)
-        self.assertFalse(result["ok"])
-        self.assertIn("open-meteo.com", result["error"])
-
-    def test_the_reply_names_every_address_it_read(self):
-        report = AuraAgent._format_completion_evidence(
-            "It is 22 degrees in Tartu.", None, None, [], [], None,
-            ["https://api.open-meteo.com/v1/forecast?x=1",
-             "https://api.open-meteo.com/v1/forecast?x=1"])
-        self.assertIn("Read from the network:", report)
-        # Repeated fetches of one address are cited once.
-        self.assertEqual(report.count("https://api.open-meteo.com"), 1)
-
-    def test_a_registered_service_is_offered_without_touching_the_tool_loop(self):
-        offered = {item["function"]["name"] for item in self.agent.tool_definitions()}
-        for service in services.services():
-            self.assertIn(service.name, offered)
-            self.assertTrue(service.domains, f"{service.name} declares no domains")
 
 
-class NetworkStatusTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        agent = AuraAgent(Path(self.temp.name) / "workspace", provider=MockProvider())
-        self.bridge = AuraWebBridge(agent=agent, speech=SpeechOutput(enabled=False))
-
-    def tearDown(self):
-        self.bridge.shutdown()
-        self.temp.cleanup()
-
-    def test_aura_starts_offline_and_says_so(self):
-        status = self.bridge.get_bootstrap()["network"]
-        self.assertFalse(status["online"])
-        self.assertEqual(status["domains"], [])
-        self.assertTrue(status["services"])
-
-    def test_granting_a_domain_brings_her_online_and_lists_it(self):
-        with patch("aura.permissions.reject_unsafe_host", lambda host: None):
-            granted = self.bridge.grant_domain_access("https://api.open-meteo.com/v1", "session")
-        self.assertTrue(granted["ok"])
-        self.assertEqual(granted["grant"]["root"], "api.open-meteo.com")
-        status = self.bridge.network_status()["network"]
-        self.assertTrue(status["online"])
-        self.assertEqual(status["domains"], ["api.open-meteo.com"])
-
-    def test_revoking_everything_puts_her_back_offline(self):
-        with patch("aura.permissions.reject_unsafe_host", lambda host: None):
-            self.bridge.grant_domain_access("api.open-meteo.com", "session")
-        self.bridge.revoke_all_permissions()
-        self.assertFalse(self.bridge.network_status()["network"]["online"])
 
 
 class PackagingTests(unittest.TestCase):
@@ -6314,6 +9561,340 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("3.9.7", problem)
         self.assertIsNone(aura_app.check_python())
 
+
+class _Block:
+    """Stand-in for a response content block, which the SDK returns as objects."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
+class _Message:
+    def __init__(self, content, stop_reason, input_tokens=0, output_tokens=0):
+        self.content = content
+        self.stop_reason = stop_reason
+        self.usage = _Block(input_tokens=input_tokens, output_tokens=output_tokens)
+
+
+class CloudProviderTests(unittest.TestCase):
+    """Aura's interior speaks one dialect; the translation lives at the edge.
+
+    Every test here runs without a network, a key, or the anthropic package,
+    because the part that can be wrong is the translation, not the transport.
+    """
+
+    def setUp(self):
+        self.provider = AnthropicProvider(api_key="not-used-offline")
+
+    # ------------------------------------------------------------- outbound
+
+    def test_system_messages_leave_the_conversation_and_become_a_field(self):
+        system, messages = AnthropicProvider.to_anthropic([
+            {"role": "system", "content": "You are Aura."},
+            {"role": "system", "content": "Reply in Estonian."},
+            {"role": "user", "content": "Tere"},
+        ])
+        self.assertEqual(system, "You are Aura.\n\nReply in Estonian.")
+        self.assertEqual([m["role"] for m in messages], ["user"])
+
+    def test_a_tool_result_becomes_a_block_in_a_user_message(self):
+        """It is a role in Aura and a block here, which is the difference most
+        likely to be got wrong once and then never noticed."""
+        _system, messages = AnthropicProvider.to_anthropic([
+            {"role": "user", "content": "Read it"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "t1", "type": "function",
+                 "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}}]},
+            {"role": "tool", "tool_call_id": "t1", "content": "hello"},
+        ])
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user"])
+        call = messages[1]["content"][0]
+        self.assertEqual(call["type"], "tool_use")
+        self.assertEqual(call["input"], {"path": "a.txt"})
+        result = messages[2]["content"][0]
+        self.assertEqual(result["tool_use_id"], "t1")
+
+    def test_results_for_one_turn_arrive_together(self):
+        """Splitting parallel results across messages teaches the model to stop
+        asking for several tools at once."""
+        _system, messages = AnthropicProvider.to_anthropic([
+            {"role": "user", "content": "Read both"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "b", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "a", "content": "one"},
+            {"role": "tool", "tool_call_id": "b", "content": "two"},
+        ])
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(len(messages[-1]["content"]), 2)
+
+    def test_unreadable_arguments_do_not_lose_the_call(self):
+        _system, messages = AnthropicProvider.to_anthropic([
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "t1", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{not json"}}]},
+        ])
+        self.assertEqual(messages[1]["content"][0]["input"], {})
+
+    def test_an_empty_assistant_turn_is_dropped_rather_than_sent(self):
+        """A message with no text and no calls has no valid form here."""
+        _system, messages = AnthropicProvider.to_anthropic([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None},
+        ])
+        self.assertEqual([m["role"] for m in messages], ["user"])
+
+    def test_an_attached_image_survives_the_translation(self):
+        _system, messages = AnthropicProvider.to_anthropic([
+            {"role": "user", "content": [
+                {"type": "text", "text": "What is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+            ]}])
+        kinds = [block["type"] for block in messages[0]["content"]]
+        self.assertEqual(kinds, ["text", "image"])
+        source = messages[0]["content"][1]["source"]
+        self.assertEqual(source["media_type"], "image/png")
+        self.assertEqual(source["data"], "QUJD")
+
+    def test_tools_keep_their_schema_one_level_up(self):
+        converted = AnthropicProvider.to_anthropic_tools([
+            {"type": "function", "function": {
+                "name": "read_file", "description": "Read a file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}])
+        self.assertEqual(converted[0]["name"], "read_file")
+        self.assertIn("path", converted[0]["input_schema"]["properties"])
+        self.assertNotIn("function", converted[0])
+
+    # -------------------------------------------------------------- inbound
+
+    def test_text_and_calls_come_back_in_auras_own_shape(self):
+        reply = AnthropicProvider.from_anthropic(_Message(
+            [_Block(type="text", text="Reading it now."),
+             _Block(type="tool_use", id="t1", name="read_file", input={"path": "a.txt"})],
+            "tool_use", input_tokens=120, output_tokens=8))
+        self.assertEqual(reply.content, "Reading it now.")
+        self.assertEqual(reply.tool_calls[0].name, "read_file")
+        self.assertEqual(reply.tool_calls[0].arguments, {"path": "a.txt"})
+        self.assertEqual(reply.finish_reason, "tool_calls")
+        self.assertEqual((reply.prompt_tokens, reply.completion_tokens), (120, 8))
+
+    def test_running_out_of_room_is_reported_as_length(self):
+        """The empty-response instrument reads this word to tell a model that
+        ran out of budget from one that chose to say nothing."""
+        reply = AnthropicProvider.from_anthropic(_Message(
+            [_Block(type="text", text="half a th")], "max_tokens"))
+        self.assertEqual(reply.finish_reason, "length")
+
+    def test_a_declined_request_says_so_instead_of_looking_empty(self):
+        reply = AnthropicProvider.from_anthropic(_Message([], "refusal"))
+        self.assertEqual(reply.finish_reason, "refusal")
+        with self.assertRaises(ProviderError) as caught:
+            provider = AnthropicProvider(api_key="k")
+            provider.complete = lambda *a, **k: reply
+            provider.reply("hello", ProviderContext(None, {}, []))
+        self.assertIn("declined", str(caught.exception))
+
+    def test_thinking_blocks_are_not_mistaken_for_the_answer(self):
+        reply = AnthropicProvider.from_anthropic(_Message(
+            [_Block(type="thinking", thinking=""),
+             _Block(type="text", text="Done.")], "end_turn"))
+        self.assertEqual(reply.content, "Done.")
+        self.assertEqual(reply.finish_reason, "stop")
+
+    # ---------------------------------------------------------------- setup
+
+    def test_the_prompt_contract_is_shared_not_copied(self):
+        """A change to who Aura is must not apply to one provider only."""
+        self.assertIs(AnthropicProvider.SYSTEM_PROMPT, LMStudioProvider.SYSTEM_PROMPT)
+        self.assertIs(AnthropicProvider.LANGUAGE_RULE, LMStudioProvider.LANGUAGE_RULE)
+        messages = self.provider.start_messages("Palun vaata see fail üle",
+                                                ProviderContext(None, {}, []))
+        system, _converted = AnthropicProvider.to_anthropic(messages)
+        self.assertIn("You are Aura", system)
+        # The rule that stopped Aura answering in Finnish has to reach this
+        # provider too, and it does so by being inherited rather than copied.
+        self.assertIn("Estonian", system)
+
+    def test_a_missing_key_is_said_plainly_and_never_guessed_at(self):
+        provider = AnthropicProvider(api_key="")
+        with unittest.mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}, clear=False):
+            provider.api_key = ""
+            try:
+                import anthropic  # noqa: F401
+            except ImportError:
+                expected = "anthropic package"
+            else:
+                expected = "API key"
+            with self.assertRaises(ProviderError) as caught:
+                provider._client()
+            self.assertIn(expected.split()[0], str(caught.exception))
+
+    def test_the_choice_survives_a_restart(self):
+        """Saving the setting is one path; being built from it on the next
+        launch is the other, and only the second one matters tomorrow."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        workspace = Path(temp.name) / "workspace"
+        meta = workspace / ".aura"
+        meta.mkdir(parents=True)
+        (meta / "config.json").write_text(json.dumps(
+            {"provider": "claude", "anthropic_api_key": "sk-ant-stored",
+             "cloud_model": "claude-sonnet-5"}), encoding="utf-8")
+        agent = AuraAgent(workspace)
+        self.addCleanup(agent.db.close)
+        self.assertIsInstance(agent.provider, AnthropicProvider)
+        self.assertEqual(agent.provider.selected_model(), "claude-sonnet-5")
+
+    def test_nothing_switches_provider_on_its_own(self):
+        """An unreachable local model must never become a reason to send the
+        same conversation to Anthropic instead."""
+        source = (Path(__file__).parents[1] / "aura" / "agent.py").read_text(encoding="utf-8")
+        build = source[source.index("def _build_provider"):source.index("def _bind_provider_recovery")]
+        self.assertNotIn("except", build)
+        # One return per provider and nothing else, so no rescue path can hide.
+        self.assertEqual(build.count("return"), 3)
+
+    def test_what_anthropic_said_is_repeated_not_replaced(self):
+        """The first real request returned a 400 saying the account was out of
+        credit, and this reported "could not reach api.anthropic.com" — which
+        was plainly untrue and hid the one sentence that explained the problem."""
+        class _Refused(Exception):
+            status_code = 400
+            message = "Your credit balance is too low to access the Anthropic API."
+
+        said = AnthropicProvider._explain(_Refused())
+        self.assertIn("credit balance", said)
+        self.assertNotIn("Could not reach", said)
+
+    def test_only_the_readable_sentence_is_shown(self):
+        """`.message` carries the whole raw JSON body, which is accurate and
+        unreadable. Measured against the real 400 this returned."""
+        class _Refused(Exception):
+            status_code = 400
+            body = {"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": "Your credit balance is too low to access the Anthropic API."}}
+            message = ("Error code: 400 - {'type': 'error', 'error': {'type': "
+                       "'invalid_request_error', 'message': 'Your credit balance is too "
+                       "low to access the Anthropic API.'}, 'request_id': 'req_011'}")
+
+        said = AnthropicProvider._explain(_Refused())
+        self.assertEqual(said, "Anthropic refused the request: Your credit balance is "
+                               "too low to access the Anthropic API.")
+        self.assertNotIn("request_id", said)
+        # The same sentence has to be recoverable when only the raw text exists.
+        raw = type("_Raw", (Exception,), {"status_code": 400,
+                                          "message": _Refused.message})()
+        self.assertIn("credit balance", AnthropicProvider._explain(raw))
+        self.assertNotIn("request_id", AnthropicProvider._explain(raw))
+
+    def test_a_key_problem_is_still_named_as_one(self):
+        class _Rejected(Exception):
+            status_code = 401
+            message = "invalid x-api-key"
+
+        self.assertIn("API key", AnthropicProvider._explain(_Rejected()))
+
+    def test_each_provider_says_where_it_is(self):
+        """"Local - private" becomes untrue the moment a remote one is on, and
+        the provider is the thing that knows — not the settings file."""
+        self.assertEqual(MockProvider().describe_location(), "Local • private")
+        self.assertFalse(MockProvider().is_remote())
+        self.assertIn("api.anthropic.com", self.provider.describe_location())
+        self.assertTrue(self.provider.is_remote())
+        gpt = OpenAIProvider(api_key="sk-test")
+        self.assertIn("api.openai.com", gpt.describe_location())
+        self.assertTrue(gpt.is_remote())
+
+    # ------------------------------------------------------------------ GPT
+
+    def test_gpt_needs_no_translation_because_the_protocol_is_shared(self):
+        """LM Studio serves OpenAI's own API, so the existing client works once
+        it is pointed at the real address — no new dependency, no new dialect."""
+        gpt = OpenAIProvider(api_key="sk-test", model="gpt-5")
+        self.assertIsInstance(gpt, OpenAICompatibleProvider)
+        self.assertNotIsInstance(gpt, LMStudioProvider)
+        self.assertEqual(gpt.base_url, "https://api.openai.com/v1")
+        self.assertEqual(gpt.AUTH_TOKEN, "sk-test")
+
+    def test_the_address_is_a_setting_so_other_services_work(self):
+        """OpenAI's chat API is spoken by a good many services. Same protocol,
+        same client, different host and key — that is the whole change."""
+        elsewhere = OpenAIProvider(api_key="k", base_url="https://api.groq.com/openai/v1")
+        self.assertEqual(elsewhere.base_url, "https://api.groq.com/openai/v1")
+        # Naming OpenAI in an error raised by somebody else's server would send
+        # the user to the wrong place to fix it.
+        self.assertEqual(elsewhere.SERVICE, "api.groq.com")
+        self.assertNotIn("OpenAI", elsewhere.describe_location())
+        self.assertIn("api.groq.com", elsewhere.describe_location())
+
+    def test_remote_is_decided_by_the_address_not_the_class(self):
+        """Pointed at a model server on this machine, the cloud provider must
+        stop warning about a journey that is not happening — and pointed
+        outward, the local one must stop claiming privacy."""
+        here = OpenAIProvider(api_key="k", base_url="http://127.0.0.1:11434/v1")
+        self.assertFalse(here.is_remote())
+        self.assertEqual(here.describe_location(), "Local • private")
+        away = LMStudioProvider(base_url="http://192.168.1.50:1234/v1")
+        self.assertTrue(away.is_remote())
+        self.assertIn("192.168.1.50", away.describe_location())
+        self.assertNotIn("private", away.describe_location())
+
+    def test_a_bad_address_is_refused_when_it_is_typed(self):
+        with self.assertRaises(ValueError):
+            OpenAIProvider(api_key="k", base_url="not-a-url")
+
+    def test_a_reasoning_model_is_accommodated_from_what_it_said(self):
+        """These models spell the output limit differently and refuse a
+        temperature. Which models those are changes over time, so the fix is
+        learned from the refusal rather than from a list of names kept here."""
+        gpt = OpenAIProvider(api_key="sk-test")
+        payload = {"model": "x", "temperature": 0.4, "max_tokens": 100}
+        self.assertEqual(gpt._tune_payload(dict(payload)), payload)
+        self.assertTrue(gpt._learn_from_refusal(
+            "OpenAI returned HTTP 400. Unsupported parameter: 'max_tokens' is not "
+            "supported with this model. Use 'max_completion_tokens' instead."))
+        self.assertTrue(gpt._learn_from_refusal(
+            "OpenAI returned HTTP 400. Unsupported value: 'temperature' does not "
+            "support 0.4 with this model."))
+        self.assertEqual(gpt._tune_payload(dict(payload)),
+                         {"model": "x", "max_completion_tokens": 100})
+        # Anything the server did not name specifically stays a real error.
+        self.assertFalse(gpt._learn_from_refusal("OpenAI returned HTTP 500."))
+
+    def test_a_refusal_is_shown_as_a_sentence_not_a_json_body(self):
+        """Measured against the real 401 this returned: the useful sentence was
+        buried under braces and a hundred masking asterisks."""
+        body = json.dumps({"error": {
+            "message": ("Incorrect API key provided: sk-proj-" + "*" * 140 +
+                        "0LoA. You can find your API key at "
+                        "https://platform.openai.com/account/api-keys."),
+            "type": "invalid_request_error", "code": "invalid_api_key"}})
+        said = OpenAICompatibleProvider._readable(body)
+        self.assertTrue(said.startswith("Incorrect API key provided:"))
+        self.assertNotIn("*", said)
+        self.assertNotIn("invalid_request_error", said)
+        # A body that is not JSON at all is still worth showing.
+        self.assertEqual(OpenAICompatibleProvider._readable("plain trouble"), "plain trouble")
+        self.assertEqual(OpenAICompatibleProvider._readable(""), "")
+
+    def test_the_model_list_is_asked_for_not_hardcoded(self):
+        """A name kept in this file goes stale and then fails at the worst
+        moment; the key knows what it can actually use."""
+        gpt = OpenAIProvider(api_key="sk-test")
+        gpt._request = lambda path, payload=None: {"data": [
+            {"id": "gpt-5"}, {"id": "text-embedding-3-large"}, {"id": "whisper-1"},
+            {"id": "dall-e-3"}, {"id": "gpt-5-mini"}, {"id": "tts-1"}]}
+        self.assertEqual(gpt.available_models(), ["gpt-5", "gpt-5-mini"])
+
+    def test_gpt_without_a_key_says_so_before_reaching_out(self):
+        gpt = OpenAIProvider(api_key="")
+        with unittest.mock.patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
+            gpt.AUTH_TOKEN = ""
+            with self.assertRaises(ProviderError) as caught:
+                gpt.complete([{"role": "user", "content": "hi"}])
+        self.assertIn("API key", str(caught.exception))
 
 if __name__ == "__main__":
     unittest.main()

@@ -310,7 +310,112 @@ def check_broken_assets(sandbox: WorkspaceSandbox, relative: str = ".") -> dict:
                 continue
             if not target.is_file():
                 broken.append({"file": name, "reference": reference})
+    for name in _script_files(sandbox, relative):
+        try:
+            content = sandbox.read_file(name)
+        except (OSError, UnicodeDecodeError):
+            continue
+        checked += 1
+        for reference in _absolute_paths_in_script(content):
+            joined = posixpath.normpath(reference.lstrip("/"))
+            try:
+                target = sandbox.path(joined)
+            except (SandboxViolation, ValueError):
+                broken.append({"file": name, "reference": reference})
+                continue
+            if not target.is_file():
+                broken.append({"file": name, "reference": reference})
+    for name in _data_files(sandbox, relative):
+        try:
+            content = sandbox.read_file(name)
+        except (OSError, UnicodeDecodeError):
+            continue
+        checked += 1
+        folder = posixpath.dirname(name)
+        for reference in _asset_paths_in_data(content):
+            # Two readings, and only a path that fails both is reported. The
+            # browser resolves it against the page; whoever wrote the data file
+            # was probably thinking of the folder it sits in. Guessing wrong
+            # would flag working code, and a checker that cries wolf is one
+            # nobody reads.
+            if not _resolves_either_way(sandbox, folder, relative, reference):
+                broken.append({"file": name, "reference": reference})
     return {"ok": True, "checked": checked, "broken": broken}
+
+
+#: Files that name assets without being able to link them: product lists,
+#: content indexes, anything a page fetches and renders. `img.src = p.image`
+#: is invisible to the script scan because the path never appears in the code.
+def _data_files(sandbox: WorkspaceSandbox, relative: str) -> list[str]:
+    return [name for name in sandbox.list_files(relative)
+            if name.lower().endswith(".json")]
+
+
+#: A quoted string that looks like a local asset: an image, font, media, or
+#: document file. Deliberately narrow — a JSON value with a dot in it is
+#: usually not a path, and only these extensions are worth a claim.
+_DATA_ASSET = re.compile(
+    r'"((?:\.{1,2}/|/)?(?:[\w.-]+/)*[\w.-]+'
+    r'\.(?:png|jpe?g|gif|webp|avif|svg|ico|bmp|mp4|webm|ogg|mp3|wav|woff2?|ttf|otf|pdf))"',
+    re.IGNORECASE)
+
+
+def _asset_paths_in_data(content: str) -> list[str]:
+    seen: list[str] = []
+    for match in _DATA_ASSET.finditer(content):
+        reference = match.group(1)
+        if not _is_local_asset_reference(reference) or reference in seen:
+            continue
+        seen.append(reference)
+    return seen
+
+
+def _resolves_either_way(sandbox: WorkspaceSandbox, folder: str,
+                         project: str, reference: str) -> bool:
+    """Does this path find a file from the data file, or from the project root?"""
+    root = posixpath.normpath(str(project).strip("/") or ".")
+    bases = [folder, "" if root == "." else root]
+    for base in bases:
+        if reference.startswith("/"):
+            joined = posixpath.normpath(reference.lstrip("/"))
+        else:
+            joined = posixpath.normpath(posixpath.join(base, reference))
+        if joined == ".." or joined.startswith("../"):
+            continue
+        try:
+            if sandbox.path(joined).is_file():
+                return True
+        except (SandboxViolation, ValueError):
+            continue
+    return False
+
+
+#: Root-absolute paths written as string literals in JavaScript. Anchored on the
+#: quote so a path inside a longer URL ("https://x/data/y") cannot match, and
+#: requiring an extension so a route ("/shop") is not mistaken for a file.
+_SCRIPT_PATH = re.compile(r"""['"](/(?:[\w.-]+/)*[\w-]+\.[A-Za-z0-9]{1,6})['"]""")
+
+
+def _script_files(sandbox: WorkspaceSandbox, relative: str) -> list[str]:
+    return [name for name in sandbox.list_files(relative)
+            if name.lower().endswith((".js", ".mjs", ".ts"))]
+
+
+def _absolute_paths_in_script(content: str) -> list[str]:
+    """Root-absolute asset paths a browser cannot resolve from a local file.
+
+    Only absolute ones. A relative path in a script may be joined from variables
+    or resolved against a base this cannot see, and a checker that cries wolf on
+    working code is one nobody reads.
+    """
+    seen: list[str] = []
+    for match in _SCRIPT_PATH.finditer(content):
+        reference = match.group(1)
+        if reference.startswith("//"):
+            continue        # protocol-relative URL, not a local path
+        if reference not in seen:
+            seen.append(reference)
+    return seen
 
 
 class _AccessibilityCollector(HTMLParser):

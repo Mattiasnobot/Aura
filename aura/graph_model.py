@@ -72,6 +72,32 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
         f"{len(preferences)} preferences • {len(personal_memories)} personal memories",
     )
 
+    _add_categories(add, link, memory)
+    remembered = _add_personal_memories(add, link, personal_memories)
+    _add_preferences(add, link, preferences, remembered)
+    asked = _add_conversation(add, link, conversations)
+    _add_tasks(add, link, tasks, asked)
+    _add_schedule(add, link, scheduled)
+    _add_proposals(add, link, proposals)
+    _add_files(add, link, files, max_files)
+
+    return list(nodes.values()), edges
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The layers of the map, in the order they are drawn.
+#
+# Each one used to be a block inside `build_mind_graph`, reaching the graph through
+# the same two closures it still takes. What the extraction made visible is the
+# small amount of state that genuinely crosses between layers: `remembered` so a
+# preference already learned in conversation is hung under both headings instead of
+# drawn twice, and `asked` so a task links back to the message that started it.
+# Those were local variables carrying real coupling; now the signatures say so.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _add_categories(add, link, memory: dict) -> None:
+    """The spine: the headings every other layer hangs from."""
     categories = [
         ("identity", "Identity"),
         ("preferences", "Preferences"),
@@ -94,6 +120,11 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
         add("person:name", "Name not set", "empty", "Aura has not been told the user's name yet.")
     link("identity", "person:name")
 
+
+def _add_personal_memories(add, link, personal_memories: list[dict]) -> dict[str, str]:
+    """What Aura knows about Mat. Returns each fact by value, so a preference
+    that says the same thing can point at the node instead of repeating it."""
+    remembered: dict[str, str] = {}
     remembered: dict[str, str] = {}
     if personal_memories:
         ordered_memories = sorted(
@@ -133,7 +164,10 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
             "Clear non-sensitive facts you share will appear here, and you can edit or forget them anytime.",
         )
         link("personal_memory", "personal:empty")
+    return remembered
 
+
+def _add_preferences(add, link, preferences: dict, remembered: dict[str, str]) -> None:
     if preferences:
         for index, (key, value) in enumerate(sorted(preferences.items())[:16]):
             # One fact, one node. A preference Aura also learned in conversation
@@ -157,6 +191,11 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
         )
         link("preferences", "preference:empty")
 
+
+def _add_conversation(add, link, conversations: list[dict]) -> dict[str, str]:
+    """Recent messages. Returns Mat's own messages by text, so a task can link
+    back to the words that started it rather than printing them twice."""
+    asked: dict[str, str] = {}
     recent_conversation = conversations[-10:]
     asked: dict[str, str] = {}
     if recent_conversation:
@@ -179,7 +218,12 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
     else:
         add("conversation:empty", "No conversation yet", "empty", "New messages will appear here.")
         link("conversation", "conversation:empty")
+    return asked
 
+
+def _add_tasks(add, link, tasks: list[dict], asked: dict[str, str]) -> None:
+    """Tasks, and the tools each one actually used."""
+    tool_nodes: dict[str, str] = {}
     tool_nodes: dict[str, str] = {}
     if tasks:
         for index, task in enumerate(tasks[:10]):
@@ -218,6 +262,8 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
         add("tool:empty", "No tools used yet", "empty", "Tools appear after Aura acts on a task.")
         link("capabilities", "tool:empty")
 
+
+def _add_schedule(add, link, scheduled: list[dict]) -> None:
     # Everything phase 48 built was stored and never drawn: a map claiming to
     # show what Aura knows and does was silent about the half she does unasked.
     checks = [item for item in scheduled if item.get("kind") == "check"]
@@ -242,6 +288,8 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
             f"Reminder\nDue {item.get('next_run', '')}")
         link("watching", node_id)
 
+
+def _add_proposals(add, link, proposals: list[dict]) -> None:
     if proposals:
         for item in proposals:
             node_id = f"proposal:{item.get('id', '')}"
@@ -254,6 +302,8 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
             "Aura changes nothing on her own; anything she suggests waits here.")
         link("waiting", "proposal:empty")
 
+
+def _add_files(add, link, files: list[str], max_files: int) -> None:
     visible_files = sorted(files)[:max_files]
     for file_path in visible_files:
         parts = PurePosixPath(file_path).parts
@@ -279,5 +329,3 @@ def build_mind_graph(memory: dict, tasks: list[dict], files: list[str],
             f"The map is capped for readability. {hidden} additional files are still safely stored.",
         )
         link("workspace", "file:more")
-
-    return list(nodes.values()), edges

@@ -15,11 +15,14 @@ from .errors import AuraError
 from .store import Database
 
 
-CAPABILITIES = {"read_folder", "write_folder", "reach_domain"}
+CAPABILITIES = {"read_folder", "write_folder"}
 # Only these are scoped to a folder; the rest grant the capability itself.
 PATH_CAPABILITIES = {"read_folder", "write_folder"}
 # Scoped to a hostname instead: the grant covers that host and its subdomains.
-HOST_CAPABILITIES = {"reach_domain"}
+#: Nothing is host-scoped since the domain allowlist was removed. Kept as
+#: the extension point it always was, so a future capability that scopes
+#: by host does not have to reinvent the branch that handles one.
+HOST_CAPABILITIES: set[str] = set()
 MODES = {"once", "session", "project", "persistent"}
 
 
@@ -198,6 +201,17 @@ class PermissionStore:
             # granted as itself. None exist today; every current capability is
             # folder-scoped.
             root = ""
+        if mode in {"session", "persistent"}:
+            # Granting the same thing twice is one permission, not two. Without
+            # this the list fills with duplicates that all have to be revoked
+            # separately — and a service granting its sibling domains makes
+            # re-granting the ordinary case rather than the careless one.
+            for existing in self.active():
+                if (existing.get("capability") == capability
+                        and str(existing.get("root", "")) == root
+                        and existing.get("mode") == mode
+                        and existing.get("project") == project):
+                    return dict(existing)
         record = {
             "id": uuid4().hex[:12],
             "capability": capability,

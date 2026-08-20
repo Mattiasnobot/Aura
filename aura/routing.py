@@ -62,7 +62,12 @@ def select(message: str, autonomy: str = "balanced",
     def includes(*words: str) -> bool:
         return any(word in lower for word in words)
     build_intent = includes("create", "make", "build", "generate", "write", "improve", "polish",
-                            "enhance")
+                            "enhance",
+                            # Measured live: "record a plan of three steps … then do
+                            # the first one" offered six read-only tools, so Aura read
+                            # and searched thirty-eight times and then described work
+                            # she had no way to perform.
+                            "implement", "finish", "complete", "add", "set up", "do the")
     run_forbidden = bool(re.search(
         r"\b(?:do not|don't|dont|never|without|" + "|".join(language.NEGATIONS)
         + r")\b[^.!?;\n]*\b(?:run|execute)\b", raw_lower))
@@ -91,9 +96,19 @@ def select(message: str, autonomy: str = "balanced",
         names.update({"list_files", "move_file", "read_file"})
     if includes("delete", "remove", "trash") and not includes("memory", "what you know", "about me", "forget"):
         names.update({"list_files", "safe_delete_file"})
-    if includes("run", "test", "check", "validate", "compile", "execute"):
+    # "Is anything broken in shop?" is a request to validate, and it carries
+    # none of the verbs above — measured, and it came back offering only the
+    # read-only fallback, so the one tool that answers the question was the one
+    # tool missing.
+    asks_if_sound = includes("broken", "wrong with", "anything wrong", "problems",
+                             "issues", "errors", "mistakes", "valid")
+    if includes("run", "test", "check", "validate", "compile", "execute") or asks_if_sound:
         names.update({"list_files", "read_file", "validate_project"})
-        if not run_forbidden:
+        # Not offered when the question is "is this sound?". `validate_project`
+        # answers it, and a shell beside it is an invitation: asked to check the
+        # shop, the model reached past the offered tool for
+        # `python -m validate_project`, which cost a round and a refusal.
+        if not run_forbidden and not asks_if_sound:
             names.add("run_command")
     if includes("code", "symbol", "function", "class", "outline", "architecture", "entry point"):
         names.update({"inspect_code", "read_file", "search_text"})
@@ -160,6 +175,42 @@ def select(message: str, autonomy: str = "balanced",
         names.update({"list_personal_memory", "correct_personal_fact"})
     if includes("recent task", "task history", "what did you do"):
         names.add("recent_tasks")
+    # The plan is state, so reaching it must not depend on the word "plan" being
+    # used. Anything that continues, finishes or reports on a project needs it —
+    # and a build request needs it most, because that is when steps get recorded.
+    if build_intent or includes("plan", "step", "steps", "continue", "carry on",
+                                "progress", "next", "finish", "resume", "todo",
+                                "plaan", "samm", "jätka", "edasi"):
+        names.update({"record_plan_steps", "update_plan_step"})
+    # Work over a *set* of files is what `execute_code` is for: reading many and
+    # reporting on them, or making one change across all of them. Offered on the
+    # words that mean "more than one", because a script whose whole body is a
+    # single tool call costs a process and saves nothing.
+    if includes("every", "each", "all the", "all of", "any file", "across",
+                "everywhere", "bulk", "one by one", "in turn", "throughout",
+                "kõik", "igas", "iga"):
+        names.add("execute_code")
+        names.update({"list_files", "search_text"})
+    # A correction is the moment a lesson is worth keeping, so the words that
+    # carry one have to reach the tool that keeps it. Built this afternoon and
+    # unroutable until a test went looking for tools nothing could offer.
+    if includes("rule", "always", "never", "from now on", "remember that",
+                "do not", "don't", "correction", "reegel", "alati", "mitte kunagi"):
+        names.add("remember_lesson")
+    if includes("self check", "self-check", "are you ok", "are you healthy",
+                "diagnose yourself", "health", "something wrong with you"):
+        names.add("self_check")
+    # Asked how fast she is or what has been failing, Aura answered with a table
+    # headed "Real Data Only" containing invented numbers, having run no tools —
+    # because the tool that measures exactly that was not among the four she was
+    # offered. A question about herself has to reach the mirror, or she has no
+    # option but to imagine the answer.
+    if includes("how fast", "how slow", "your speed", "response time", "performance",
+                "how long do you take", "how are you doing", "what could be better",
+                "what could be improved", "your weakness", "your shortcomings",
+                "failing", "failures", "what went wrong", "how have you been",
+                "kui kiire", "kui aeglane", "ebaõnnestunud", "mis läks valesti"):
+        names.add("how_i_have_been_running")
     if autonomy == "powerful" and names and reasoning_depth == "deep":
         names.update({"workspace_summary", "file_info", "read_many_files"})
     definitions = list(definitions or [])

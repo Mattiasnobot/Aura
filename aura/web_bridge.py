@@ -400,6 +400,21 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
                 "reasoning_depth": config["reasoning_depth"],
                 "autonomy_mode": config["autonomy_mode"],
                 "personal_memories": len(self.agent.memory.profile_memories()),
+                # The status line said "Local" unconditionally, which stops
+                # being true the moment a cloud provider is switched on. Where
+                # the thinking happens is information the user wants at a
+                # glance, not a warning buried in Settings.
+                "thinking_at": "cloud" if self.agent.provider.is_remote() else "local",
+                "thinking_label": self.agent.provider.describe_location(),
+                # Sent rather than parsed back out of the label, which was only
+                # ever going to work while every label had the same shape.
+                "thinking_host": str(getattr(self.agent.provider, "SERVICE", "")
+                                     or "Local model"),
+                "project": self.agent.current_project or "",
+                # Deliberately the configured name rather than selected_model(),
+                # which would reach the network on every page load.
+                "thinking_model": str(getattr(self.agent.provider, "model", "") or "")
+                if self.agent.provider.is_remote() else "",
             },
             "ui": {
                 "sidebar_width": int(config["web_sidebar_width"]),
@@ -547,7 +562,14 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
 
         try:
             self._plan_steps = []
+            # Announced before the work rather than only with the reply. Which
+            # project is in play decides which memories are recalled and which
+            # role is applied, so learning it afterwards is learning it too late
+            # to say "no, not that one" — which is the whole reason to show it.
+            project = self.agent.project_for(text)
+            self._push("project", project=project or "")
             self.agent.on_tool = self._on_tool
+            self.agent.on_thinking = lambda seen: self._push("thinking", tokens=seen)
             try:
                 response = self.agent.handle(
                     text,
@@ -557,6 +579,7 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
                 )
             finally:
                 self.agent.on_tool = None
+                self.agent.on_thinking = None
                 if self._plan_steps:
                     self._push("plan_finished",
                                done=sum(1 for step in self._plan_steps if step["done"]),
@@ -789,6 +812,9 @@ class AuraWebBridge(SettingsBridge, VoiceBridge, WorkspaceBridge, MemoryBridge):
 
 
     DIAGNOSTIC_SETTINGS = (
+        # `anthropic_api_key` is deliberately absent: a diagnostics file is
+        # meant to be shareable, and this list is the only thing keeping it so.
+        "provider", "cloud_model", "openai_model",
         "lm_studio_url", "model", "timeout", "temperature", "max_tokens",
         "reasoning_depth", "autonomy_mode", "learn_from_conversations",
         "vision_mode", "speech_engine", "voice_engine", "avatar_quality",

@@ -126,5 +126,39 @@ class CommandAgent:
                 stderr = stderr.decode(errors="replace")
             return CommandResult(command, None, stdout, stderr, True, True)
         except OSError as exc:
-            self.log.record("command", "error", command=command, error=str(exc))
-            return CommandResult(command, None, "", str(exc), True)
+            # "[WinError 2] The system cannot find the file specified" names
+            # nothing — not the program, not the cause — and a model reading it
+            # concludes the capability is missing rather than the executable.
+            # Fourteen of the sixteen recorded command failures were this.
+            error = self._missing_program(resolved, exc)
+            self.log.record("command", "error", command=command,
+                            error=error, raw_error=str(exc))
+            return CommandResult(command, None, "", error, True)
+
+    #: Unix habits that simply are not present on a stock Windows box. Named so
+    #: the model stops reaching for them rather than retrying with a flag change.
+    WINDOWS_HAS_NO = {
+        "bash": "There is no bash on this machine.",
+        "sh": "There is no sh on this machine.",
+        "zsh": "There is no zsh on this machine.",
+        "grep": "Use the search_text tool instead of grep.",
+        "sed": "Use apply_edits or replace_in_file instead of sed.",
+        "awk": "Use read_file and work on the text instead of awk.",
+        "find": "Use search_files instead of find.",
+        "ls": "Use the list_files tool instead of ls.",
+        "which": "Use system_info instead of which.",
+        "apply_patch": "Use the apply_edits tool; there is no apply_patch here.",
+        "patch": "Use the apply_edits tool; there is no patch program here.",
+    }
+
+    def _missing_program(self, resolved: list[str], exc: OSError) -> str:
+        """Say which program was missing, and what to use instead."""
+        if getattr(exc, "winerror", None) != 2 and not isinstance(exc, FileNotFoundError):
+            return str(exc)
+        program = Path(resolved[0]).name.casefold().removesuffix(".exe") if resolved else ""
+        known = self.WINDOWS_HAS_NO.get(program)
+        if known:
+            return f"{program!r} is not installed on this machine. {known}"
+        return (f"{program!r} is not installed on this machine, or is not on PATH. "
+                f"This says nothing about your tools — those are always available. "
+                f"Use one of them, or a program you have confirmed exists.")

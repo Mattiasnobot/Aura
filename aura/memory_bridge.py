@@ -77,26 +77,6 @@ class MemoryBridge:
                                   error=str(exc))
             return {"ok": False, "error": str(exc)}
 
-    def grant_domain_access(self, domain: str, mode: str = "session",
-                            project: str | None = None) -> dict:
-        """Allow Aura to read one domain. Only ever called by the user.
-
-        There is deliberately no tool for this: as with folders, the model can
-        use a grant but can never ask for one, so nothing it reads on the
-        network can talk Aura into reaching further.
-        """
-        try:
-            grant = self.agent.permissions.grant("reach_domain", str(domain), str(mode),
-                                                 project=project or None)
-            self.agent.log.record("grant_domain_access", "ok", domain=grant["root"],
-                                  mode=grant["mode"], grant_id=grant["id"])
-            self._push("permissions_changed", action="granted", grant=grant)
-            self._push("network", **self.network_status()["network"])
-            return {"ok": True, "grant": grant}
-        except (PermissionRefused, OSError, ValueError) as exc:
-            self.agent.log.record("grant_domain_access", "error", domain=str(domain),
-                                  error=str(exc))
-            return {"ok": False, "error": str(exc)}
 
     def autonomy_status(self) -> dict:
         """What background work is allowed right now, and why not when it is not."""
@@ -146,12 +126,15 @@ class MemoryBridge:
         self._push("state", value="idle")
         return status
 
+
     def network_status(self) -> dict:
         """Whether Aura can reach anything at all, and exactly what."""
-        domains = sorted({str(grant.get("root", "")) for grant in self.agent.permissions.active()
-                          if grant.get("capability") == "reach_domain" and grant.get("root")})
+        # Every service can reach its own domains now, so what the panel shows
+        # is what Aura *would* read rather than what she has been allowed to.
+        domains = sorted({str(host) for service in services.services()
+                          for host in service.domains})
         return {"ok": True, "network": {
-            "online": bool(domains),
+            "online": True,
             "domains": domains,
             "services": [{"name": service.name, "domains": list(service.domains),
                           "hint": service.grant_hint}

@@ -13,6 +13,10 @@ class MemoryStore:
     MAX_HISTORY = 5
     PROFILE_CATEGORIES = {
         "preference", "interest", "goal", "project", "tool", "work_style", "personal",
+        # A rule about how work is done, learned from being corrected. Its own
+        # category so lessons can be recalled as a set rather than hoped for
+        # among everything else Aura knows.
+        "lesson",
     }
     SENSITIVE_MARKERS = {
         "password", "passcode", "pin code", "secret", "api key", "access token", "private key",

@@ -105,6 +105,23 @@ CREATE TABLE IF NOT EXISTS proposals (
 );
 CREATE INDEX IF NOT EXISTS proposals_status ON proposals (status, created);
 
+-- The plan, as state rather than prose. `PLAN.md` stays the readable record
+-- Mat can edit; this is the part a turn can resume from, because "what is left
+-- to do" has to survive the conversation that decided it.
+CREATE TABLE IF NOT EXISTS plan_steps (
+    id TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    -- todo -> doing -> done, or blocked with a reason. Blocked is not failure:
+    -- it is a step that cannot proceed until something outside it changes.
+    status TEXT NOT NULL DEFAULT 'todo',
+    evidence TEXT NOT NULL DEFAULT '',
+    created TEXT NOT NULL,
+    updated TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS plan_steps_project ON plan_steps (project, position);
+
 CREATE TABLE IF NOT EXISTS external_changes (
     id TEXT PRIMARY KEY,
     path TEXT NOT NULL,
@@ -172,6 +189,9 @@ class Database:
         # existing database through SCHEMA, and the version is what lets code
         # ask whether this database understands proposals.
         (),
+        # 5 — `plan_steps` arrived, reaching existing databases through SCHEMA
+        # like 2 and 3 before it. The version is what lets code ask whether this
+        # database can hold a resumable plan at all.
         # 4 — the first migration that earns the mechanism. `task_events` gained
         # `session_id`, and no `CREATE TABLE IF NOT EXISTS` can add a column to a
         # table that already holds the user's history. Without it there is no way
@@ -521,6 +541,60 @@ class Database:
                       (str(status), _now(), str(identifier)))
 
     # ------------------------------------------------------------- schedules
+
+    #: The four states a step can be in. `blocked` is deliberately not `failed`:
+    #: a step waiting on something outside itself has not gone wrong.
+    STEP_STATES = ("todo", "doing", "done", "blocked")
+
+    def plan_steps(self, project: str) -> list[dict]:
+        return [dict(row) for row in self._query(
+            "SELECT * FROM plan_steps WHERE project = ? ORDER BY position",
+            (str(project),))]
+
+    def set_plan_steps(self, project: str, steps: list[str]) -> list[dict]:
+        """Replace a project's plan, keeping what is already finished.
+
+        A re-planned project should not forget the work already done — that is
+        exactly the amnesia this table exists to end. A step whose text matches
+        one already recorded keeps its status and its evidence.
+        """
+        existing = {row["text"]: row for row in self.plan_steps(project)}
+        self._execute("DELETE FROM plan_steps WHERE project = ?", (str(project),))
+        written = []
+        for position, text in enumerate(steps):
+            text = str(text).strip()
+            if not text:
+                continue
+            was = existing.get(text)
+            identifier = uuid4().hex[:12]
+            self._execute(
+                "INSERT INTO plan_steps (id, project, position, text, status, "
+                "evidence, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (identifier, str(project), position, text,
+                 str(was["status"]) if was else "todo",
+                 str(was["evidence"]) if was else "",
+                 str(was["created"]) if was else _now(), _now()))
+            written.append(identifier)
+        return self.plan_steps(project)
+
+    def set_step_status(self, identifier: str, status: str, evidence: str = "") -> dict | None:
+        if str(status) not in self.STEP_STATES:
+            raise ValueError(f"status must be one of {', '.join(self.STEP_STATES)}")
+        self._execute(
+            "UPDATE plan_steps SET status = ?, evidence = ?, updated = ? WHERE id = ?",
+            (str(status), str(evidence), _now(), str(identifier)))
+        rows = self._query("SELECT * FROM plan_steps WHERE id = ?", (str(identifier),))
+        return dict(rows[0]) if rows else None
+
+    def next_plan_step(self, project: str) -> dict | None:
+        """The step to pick up: whatever was started, else the first not begun.
+
+        A step left in `doing` comes back first, because a turn that stopped
+        mid-step is the case this whole table exists for.
+        """
+        steps = self.plan_steps(project)
+        return (next((s for s in steps if s["status"] == "doing"), None)
+                or next((s for s in steps if s["status"] == "todo"), None))
 
     def add_scheduled(self, kind: str, request: str, *, every_minutes: int = 0,
                       next_run: str | None = None) -> dict:

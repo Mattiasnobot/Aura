@@ -348,13 +348,20 @@ def detect(text: str, default: str = "en") -> str:
         return "en"
     lowered = body.casefold()
     words = [word.casefold() for word in _WORDS.findall(body)]
-    # These three letters are Estonian's alone and settle it. `ä`, `ö` and `ü`
-    # do not: they are shared with Finnish, which is exactly where a small model
-    # drifts when it is asked in Estonian.
-    if ESTONIAN_LETTERS & set(lowered):
-        return "et"
     estonian = sum(word in _ESTONIAN_ONLY for word in words)
     english = sum(word in _ENGLISH_ONLY for word in words)
+    # These three letters are Estonian's alone. `ä`, `ö` and `ü` are not: they
+    # are shared with Finnish, which is exactly where a small model drifts when
+    # it is asked in Estonian.
+    #
+    # They settle the language of a *word*, not of a sentence. "What's the
+    # current weather in Estonia Jõgeva" is English with one Estonian place name
+    # in it, and answering it in Estonian — which Aura did, badly enough to
+    # render "today's high" as "tänapäeva kõrge" — is worse than not noticing
+    # the letter at all. So a name is allowed to be foreign: the letter decides
+    # unless the surrounding grammar is plainly English.
+    if ESTONIAN_LETTERS & set(lowered) and english <= estonian:
+        return "et"
     if estonian != english:
         return "et" if estonian > english else "en"
     # No grammar to go on — "Meeldetuletus: venita" has neither a marker nor a

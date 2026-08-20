@@ -19,6 +19,7 @@ const elements = {
   avatarCanvas: $("#avatarCanvas"),
   attachButton: $("#attachButton"), filePicker: $("#filePicker"), dropOverlay: $("#dropOverlay"),
   mindView: $("#mindView"), mindCanvas: $("#mindCanvas"), mindSearch: $("#mindSearch"),
+  mindCard: $("#mindCard"),
   mindSummary: $("#mindSummary"), mindDetail: $("#mindDetail"), mindActions: $("#mindActions"),
   workspaceView: $("#workspaceView"), workspaceTree: $("#workspaceTree"),
   workspaceTreeLabel: $("#workspaceTreeLabel"),
@@ -78,6 +79,8 @@ let planSteps = [];
 // Which project Aura believes the conversation is about. It decides which
 // remembered facts she brings, so it is shown rather than kept to herself.
 let currentProject = null;
+// Whether a role is being applied. The project alone did not answer "is she
+// being ShopMaster right now", which is the question the setting raises.
 let dragDepth = 0;
 let personalMemories = [];
 let memoryCategories = [];
@@ -174,7 +177,7 @@ function renderMessage(body, value) {
     paragraph = [];
   };
   const closeList = () => { list = null; listType = null; };
-  const appendListItem = (type, text) => {
+  const appendListItem = (type, text, number = null) => {
     flushParagraph();
     if (!list || listType !== type) {
       list = document.createElement(type);
@@ -182,6 +185,11 @@ function renderMessage(body, value) {
       body.append(list);
     }
     const item = document.createElement("li");
+    // Keep the number the model actually wrote. A numbered section whose points
+    // are bullets closes the ordered list and opens a new one at the next
+    // heading, so "4. Practical impact" rendered as "1." — as did 2 and 3,
+    // which makes a four-part lesson look like four separate ones.
+    if (number !== null) item.value = number;
     appendInlineMarkdown(item, text);
     list.append(item);
   };
@@ -212,8 +220,8 @@ function renderMessage(body, value) {
     }
     const bullet = line.match(/^\s*[-*•]\s+(.+)$/);
     if (bullet) { appendListItem("ul", bullet[1]); continue; }
-    const numbered = line.match(/^\s*\d+[.)]\s+(.+)$/);
-    if (numbered) { appendListItem("ol", numbered[1]); continue; }
+    const numbered = line.match(/^\s*(\d+)[.)]\s+(.+)$/);
+    if (numbered) { appendListItem("ol", numbered[2], Number(numbered[1])); continue; }
     const quote = line.match(/^\s*>\s?(.*)$/);
     if (quote) {
       flushParagraph(); closeList();
@@ -408,7 +416,8 @@ function setState(state) {
   elements.voiceButton.classList.toggle("listening", name === "listening");
   avatarMotion?.setState(name);
   const activity = {
-    idle: "Aura is ready.", listening: "Listening locally…", thinking: "Thinking with LM Studio…",
+    idle: "Aura is ready.", listening: "Listening locally…",
+    thinking: `Thinking with ${capabilityState.thinking_host || "LM Studio"}…`,
     working: "Working safely in the workspace…", success: "Finished successfully.",
     error: "Something needs attention.",
   };
@@ -426,7 +435,10 @@ function setBusy(value) {
 function setProvider(payload) {
   elements.provider.classList.toggle("offline", payload.online === false);
   const count = payload.count ? ` • ${payload.count} models` : "";
-  elements.provider.textContent = `LM Studio • ${payload.label || "offline"}${count}`;
+  // Naming LM Studio unconditionally put the wrong host in front of the right
+  // model name the moment the cloud provider was switched on.
+  const host = capabilityState.thinking_host || "LM Studio";
+  elements.provider.textContent = `${host} • ${payload.label || "offline"}${count}`;
   if (payload.error) elements.provider.title = payload.error;
 }
 
@@ -453,10 +465,18 @@ function updatePowerStatus(values = {}) {
   elements.statusLine.innerHTML = "";
   const dot = document.createElement("span");
   dot.className = "dot";
+  // "Local • private" is a claim, not decoration: it has to stop being made
+  // when the conversation is going to Anthropic instead.
+  const cloud = capabilityState.thinking_at === "cloud";
+  const where = capabilityState.thinking_label || "Local • private";
+  elements.statusLine.classList.toggle("status-cloud", cloud);
   elements.statusLine.append(dot, document.createTextNode(
-    currentProject ? `Local • private • on ${currentProject}` : "Local • private • calm"));
+    currentProject
+      ? `${where} • on ${currentProject}`
+      : `${where} • calm`));
   elements.statusLine.title =
-    `${depth[0].toUpperCase()}${depth.slice(1)} thinking • ${capabilityState.tools || "many"} tools • `
+    (capabilityState.thinking_model ? `${capabilityState.thinking_model} • ` : "")
+    + `${depth[0].toUpperCase()}${depth.slice(1)} thinking • ${capabilityState.tools || "many"} tools • `
     + `${capabilityState.autonomy_mode || "balanced"} • ${memories} ${memories === 1 ? "memory" : "memories"}`;
 }
 
@@ -620,11 +640,19 @@ async function handleEvent(event) {
       streamMessage.body.textContent = streamMessage.raw;
       elements.conversation.scrollTop = elements.conversation.scrollHeight;
       break;
+    case "thinking":
+      // No text — she is reasoning privately. Enough to keep the activity line
+      // honest and the progress window's "last sign of life" moving.
+      elements.activity.textContent = `Thinking… (${event.tokens} tokens so far)`;
+      break;
+    case "project":
+      // Announced as the turn starts, so the status line says which project
+      // before the answer arrives rather than after it, when it is too late to
+      // say "no, not that one".
+      applyProject(event.project);
+      break;
     case "reply":
-      if (event.project !== undefined && event.project !== currentProject) {
-        currentProject = event.project || null;
-        updatePowerStatus();
-      }
+      applyProject(event.project);
       let completedMessage;
       if (event.streamed && streamMessage) {
         completedMessage = streamMessage;
@@ -1236,6 +1264,17 @@ async function previewWorkspaceFile(file) {
       frame.setAttribute("referrerpolicy", "no-referrer");
       frame.src = result.url;
       elements.previewMeta.textContent += " • scripts off";
+      if (result.scripts_present) {
+        // A page that builds its own content renders here as an empty shell,
+        // which reads as a broken site rather than a disabled preview. Saying
+        // so beside the file size was not enough — it needs to be the first
+        // thing read, above the frame it explains.
+        const notice = document.createElement("p");
+        notice.className = "preview-scripts-off";
+        notice.textContent = "This page runs JavaScript, and the safe preview does not. "
+          + "Anything the page builds itself is missing here. Use the live preview to see it working.";
+        elements.workspacePreview.append(notice);
+      }
       elements.workspacePreview.append(frame);
     } else if (result.kind === "image") {
       const image = document.createElement("img"); image.alt = file.name; image.src = `data:${result.mime};base64,${result.content}`; elements.workspacePreview.append(image);
@@ -1785,17 +1824,6 @@ async function grantFolderAccess(event) {
   await openPermissions(false);
 }
 
-async function grantDomainAccess(event) {
-  event.preventDefault();
-  const domain = $("#domainName").value.trim();
-  if (!domain) return toast("Enter a domain first.", true);
-  const result = await callApi("grant_domain_access", domain, $("#domainMode").value);
-  if (!result.ok) return toast(result.error, true);
-  $("#domainName").value = "";
-  toast(`Aura may now read ${result.grant.root}`);
-  await openPermissions(false);
-}
-
 function renderAutonomyStatus(status) {
   if (!status) return;
   const paused = Boolean(status.paused);
@@ -1811,22 +1839,15 @@ function renderAutonomyStatus(status) {
 
 function renderNetworkStatus(network) {
   if (!network) return;
-  const online = Boolean(network.online);
-  elements.networkLabel.textContent = online
-    ? `Online • ${network.domains.length} domain${network.domains.length === 1 ? "" : "s"}`
-    : "Offline • local only";
-  elements.networkLabel.classList.toggle("online", online);
-  elements.networkLabel.title = online
-    ? `Aura may read: ${network.domains.join(", ")}`
-    : "Aura cannot reach the network. Grant a domain under Permissions to change that.";
-  // Name what each built-in service still needs, so enabling one is not guesswork.
-  const hint = $("#domainSuggestions");
-  if (!hint) return;
-  const missing = (network.services || []).flatMap(service =>
-    (service.domains || []).filter(domain => !network.domains.includes(domain)));
-  hint.textContent = missing.length
-    ? `Built-in services still need: ${[...new Set(missing)].join(", ")}`
-    : "Every built-in service has the domains it needs.";
+  // No allowlist to count any more. What the label reports is whether the
+  // machine can reach the web at all, and the tooltip names what the built-in
+  // services read — the only network traffic Aura starts on her own.
+  elements.networkLabel.textContent = "Online • public web";
+  elements.networkLabel.classList.add("online");
+  const reads = (network.domains || []).join(", ");
+  elements.networkLabel.title = reads
+    ? `Built-in services read: ${reads}. Never an address on this machine or your network.`
+    : "Aura reads public addresses only, never one on this machine or your network.";
 }
 
 async function revokeAllPermissions() {
@@ -1992,6 +2013,78 @@ async function teachAura(event) {
   toast("Aura will remember that.");
 }
 
+function showCloudFields() {
+  const chosen = $("#settingProvider").value;
+  $("#cloudFields").classList.toggle("hidden", chosen !== "claude");
+  $("#openaiFields").classList.toggle("hidden", chosen !== "openai");
+}
+
+async function loadLessonProjects(keep = "") {
+  const wanted = keep || $("#lessonProject").value;
+  const result = await callApi("get_project_lessons", wanted);
+  if (!result.ok) return;
+  const select = $("#lessonProject");
+  const names = result.projects || [];
+  select.replaceChildren(...names.map((name) => {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    return option;
+  }));
+  if (!names.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No projects yet";
+    select.replaceChildren(option);
+  }
+  if (wanted && names.includes(wanted)) select.value = wanted;
+  else if (result.current && names.includes(result.current)) select.value = result.current;
+  await loadLessons();
+}
+
+function applyProject(project) {
+  if (project === undefined) return;
+  const changed = (project || null) !== currentProject;
+  currentProject = project || null;
+  if (changed) updatePowerStatus();
+}
+
+async function loadLessons() {
+  const project = $("#lessonProject").value;
+  const result = await callApi("get_project_lessons", project);
+  const list = $("#lessonList");
+  list.replaceChildren();
+  if (!result.ok) return;
+  for (const lesson of result.lessons || []) {
+    const row = document.createElement("li");
+    // Marked when Aura wrote it herself: her rules are guesses worth reading.
+    row.classList.toggle("from-aura", !!lesson.from_aura);
+    row.append(Object.assign(document.createElement("span"), { textContent: lesson.text }));
+    const drop = document.createElement("button");
+    drop.type = "button";
+    drop.textContent = "×";
+    drop.title = "Forget this rule";
+    drop.addEventListener("click", async () => {
+      const gone = await callApi("forget_project_lesson", lesson.id);
+      if (!gone.ok) return toast(gone.error, true);
+      await loadLessons();
+    });
+    row.append(drop);
+    list.append(row);
+  }
+}
+
+async function addLesson() {
+  const project = $("#lessonProject").value;
+  const text = $("#lessonText").value.trim();
+  if (!text) return;
+  const result = await callApi("add_project_lesson", project, text);
+  if (!result.ok) return toast(result.error, true);
+  $("#lessonText").value = "";
+  toast(`Rule set for ${project}. Aura will apply it from now on.`);
+  await loadLessons();
+}
+
 async function openSettings() {
   openModal(elements.settingsModal);
   const status = $("#settingsStatus");
@@ -1999,11 +2092,35 @@ async function openSettings() {
   status.textContent = "Loading local settings…";
   try {
     const settings = await callApi("get_settings");
+    $("#settingProvider").value = settings.provider || "local";
+    setSelectValue($("#settingCloudModel"), settings.cloud_model || "claude-opus-5");
+    // Never filled in from the server: the key is write-only from here on.
+    const keyField = $("#settingCloudKey");
+    keyField.value = "";
+    keyField.placeholder = settings.anthropic_key_from_env
+      ? "Using ANTHROPIC_API_KEY from the environment"
+      : (settings.anthropic_key_set ? "A key is stored — type to replace it" : "sk-ant-…");
+    $("#settingOpenaiUrl").value = settings.openai_base_url || "";
+    $("#settingOpenaiModel").value = settings.openai_model || "";
+    const openaiKey = $("#settingOpenaiKey");
+    openaiKey.value = "";
+    openaiKey.placeholder = settings.openai_key_from_env
+      ? "Using OPENAI_API_KEY from the environment"
+      : (settings.openai_key_set ? "A key is stored — type to replace it" : "sk-…");
+    showCloudFields();
+    await loadLessonProjects();
     $("#settingUrl").value = settings.lm_studio_url;
     setSelectValue($("#settingModel"), settings.model || "");
     $("#settingTimeout").value = settings.timeout;
-    $("#settingTemperature").value = settings.temperature;
-    $("#settingTokens").value = settings.max_tokens;
+    $("#settingTempChat").value = settings.temperature_chat;
+    $("#settingTokensChat").value = settings.max_tokens_chat;
+    $("#settingTempWork").value = settings.temperature_work;
+    $("#settingTokensWork").value = settings.max_tokens_work;
+    $("#settingTempCode").value = settings.temperature_code;
+    $("#settingTokensCode").value = settings.max_tokens_code;
+    $("#settingTopP").value = settings.top_p === null || settings.top_p === undefined ? "" : settings.top_p;
+    $("#settingTopK").value = settings.top_k === null || settings.top_k === undefined ? "" : settings.top_k;
+    $("#settingTurnBudget").value = settings.turn_budget_seconds;
     $("#settingReasoning").value = settings.reasoning_depth;
     $("#settingAutonomy").value = settings.autonomy_mode;
     $("#settingVision").value = settings.vision_mode || "auto";
@@ -2146,11 +2263,25 @@ async function saveSettings() {
   status.className = "modal-status";
   status.textContent = "Saving…";
   const values = {
+    provider: $("#settingProvider").value,
+    cloud_model: $("#settingCloudModel").value,
+    // Blank means "keep the stored key", which is why it is never pre-filled.
+    anthropic_api_key: $("#settingCloudKey").value,
+    openai_base_url: $("#settingOpenaiUrl").value,
+    openai_model: $("#settingOpenaiModel").value,
+    openai_api_key: $("#settingOpenaiKey").value,
     lm_studio_url: $("#settingUrl").value,
     model: $("#settingModel").value || null,
     timeout: $("#settingTimeout").value,
-    temperature: $("#settingTemperature").value,
-    max_tokens: $("#settingTokens").value,
+    temperature_chat: $("#settingTempChat").value,
+    max_tokens_chat: $("#settingTokensChat").value,
+    temperature_work: $("#settingTempWork").value,
+    max_tokens_work: $("#settingTokensWork").value,
+    temperature_code: $("#settingTempCode").value,
+    max_tokens_code: $("#settingTokensCode").value,
+    top_p: $("#settingTopP").value,
+    top_k: $("#settingTopK").value,
+    turn_budget_seconds: $("#settingTurnBudget").value,
     reasoning_depth: $("#settingReasoning").value,
     autonomy_mode: $("#settingAutonomy").value,
     vision_mode: $("#settingVision").value,
@@ -2354,22 +2485,30 @@ function showApproval(event) {
   currentApproval = event.approval_id;
   const kind = event.command?.[0];
   const plan = kind === "PLAN";
-  $("#approvalTitle").textContent = plan ? "Before Aura builds this"
+  // A plan is either files about to be written or steps about to be taken, and
+  // calling steps "files" described an action that was not going to happen.
+  const steps = plan && event.command?.[event.command.length - 1] === "STEPS";
+  $("#approvalTitle").textContent = steps ? "Before Aura starts"
+    : plan ? "Before Aura builds this"
     : kind === "HTTP GET" ? "Network approval"
     : kind === "OPEN" ? "Open application" : "Command approval";
   // A plan is a list to read, not a command to scan, so it keeps its line breaks
   // and the wording asks about the shape of the work rather than permission.
-  $("#approvalLead").textContent = plan
+  $("#approvalLead").textContent = steps
+    ? "This is the approach she would take. Agreeing now is cheaper than undoing later:"
+    : plan
     ? "These are the files she would create. Approving is cheaper than undoing:"
     : "Aura wants to use a capability that needs your permission:";
-  $("#approvalNote").textContent = plan
+  $("#approvalNote").textContent = steps
+    ? "Stopping changes nothing, and you can describe a different approach."
+    : plan
     ? "Denying stops before anything is written, and you can describe a different list."
     : "“Allow identical for task” covers only this exact command or URL until the current task ends.";
   $("#allowTaskApproval").classList.toggle("hidden", plan);
-  $("#allowApproval").textContent = plan ? "Build these" : "Allow once";
+  $("#allowApproval").textContent = steps ? "Go ahead" : plan ? "Build these" : "Allow once";
   $("#denyApproval").textContent = plan ? "Stop" : "Deny";
   elements.approvalCommand.textContent = plan
-    ? event.command.slice(1).join("\n")
+    ? event.command.slice(1, steps ? -1 : undefined).join("\n")
     : event.command.map(part => /\s/.test(part) ? JSON.stringify(part) : part).join(" ");
   openModal(elements.approvalModal);
 }
@@ -2531,9 +2670,149 @@ function installFaceInteraction() {
   });
 }
 
+/* What a card can offer depends on what the node really is.
+ *
+ * Almost everything on this map is derived from Aura's actual state — a task
+ * happened, a file exists, a conversation was had — and offering to "edit" any of
+ * that would be offering to lie. A personal memory is the one exception: it is a
+ * guess Aura made about Mat, and the person a guess is about should be able to
+ * correct it. So that is the only kind with an edit button. */
+let cardNode = null;
+let cardEditing = false;
+
+function hideNodeCard() {
+  cardNode = null;
+  cardEditing = false;
+  elements.mindCard.classList.add("hidden");
+}
+
+function placeNodeCard(point) {
+  const card = elements.mindCard;
+  // The canvas, not the view. The view also contains the legend and the footer,
+  // and clamping to it let the card settle on top of both.
+  const stage = card.offsetParent || card.parentElement;
+  const origin = stage.getBoundingClientRect();
+  const canvas = elements.mindCanvas.getBoundingClientRect();
+  const bounds = { width: canvas.width, height: canvas.height,
+                   dx: canvas.left - origin.left, dy: canvas.top - origin.top };
+  card.classList.remove("hidden");
+  // Measured after it is shown, because an element with display:none has no size.
+  const width = card.offsetWidth;
+  const height = card.offsetHeight;
+  // Beside the node, flipped to whichever side has room — the same rule the
+  // labels use, for the same reason.
+  let left = point.x + 22;
+  if (left + width > bounds.width - 12) left = Math.max(12, point.x - 22 - width);
+  let top = point.y - 20;
+  top = Math.min(Math.max(12, top), Math.max(12, bounds.height - height - 12));
+  card.style.left = `${Math.round(left + bounds.dx)}px`;
+  card.style.top = `${Math.round(top + bounds.dy)}px`;
+}
+
+function nodeCardAction(label, handler, variant = "") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  if (variant) button.className = variant;
+  button.addEventListener("click", handler);
+  return button;
+}
+
+function showNodeCard(node, point) {
+  if (!node || node.kind === "empty") return hideNodeCard();
+  cardNode = node;
+  cardEditing = false;
+  $("#mindCardTitle").textContent = node.label;
+  $("#mindCardKind").textContent = String(node.kind || "").replace(/_/g, " ");
+  // The whole thing. The footer strip used to cut this at 500 characters, which
+  // reliably removed the source and the date — the two parts that say how much to
+  // trust it.
+  $("#mindCardBody").textContent = node.detail || "Aura has no detail recorded for this.";
+  $("#mindCardEdit").classList.add("hidden");
+
+  const actions = $("#mindCardActions");
+  actions.replaceChildren();
+  const memory = !!node.memory_id;
+
+  if (memory) {
+    actions.append(nodeCardAction("Edit", () => {
+      cardEditing = true;
+      $("#mindCardText").value = memoryTextOf(node);
+      $("#mindCardProject").value = node.project || "";
+      $("#mindCardEdit").classList.remove("hidden");
+      renderCardActions(node, true);
+      $("#mindCardText").focus();
+    }));
+    actions.append(nodeCardAction(
+      node.kind === "personal_memory_pinned" ? "Unpin" : "Pin",
+      () => setMemoryPinned(node, node.kind !== "personal_memory_pinned")));
+    actions.append(nodeCardAction("Forget", () => forgetMemory(node), "danger"));
+  }
+  if (node.target) {
+    actions.append(nodeCardAction(node.kind === "folder" ? "Browse" : "Open",
+      () => openMindTarget()));
+  }
+  actions.append(nodeCardAction("Ask Aura", () => askAboutMindNode()));
+  placeNodeCard(point);
+}
+
+/* The node's detail is a rendered block — category, confidence, source, date — and
+ * the memory's own words are the line after the heading. Editing must offer those
+ * words alone, not the presentation around them. */
+function memoryTextOf(node) {
+  const lines = String(node.detail || "").split("\n");
+  return (lines[1] || lines[0] || "").trim();
+}
+
+function renderCardActions(node, editing) {
+  const actions = $("#mindCardActions");
+  actions.replaceChildren();
+  if (editing) {
+    actions.append(nodeCardAction("Save", () => saveMemoryCard(node), "primary"));
+    actions.append(nodeCardAction("Cancel", () => showNodeCard(node, lastCardPoint)));
+    return;
+  }
+  showNodeCard(node, lastCardPoint);
+}
+
+let lastCardPoint = { x: 0, y: 0 };
+
+async function saveMemoryCard(node) {
+  const value = $("#mindCardText").value.trim();
+  if (!value) return toast("A memory cannot be empty. Use Forget to remove it.", true);
+  const result = await callApi("update_personal_memory", node.memory_id, {
+    value, project: $("#mindCardProject").value.trim(),
+  });
+  if (!result.ok) return toast(result.error, true);
+  toast("Updated.");
+  hideNodeCard();
+  await openMind();
+}
+
+async function setMemoryPinned(node, pinned) {
+  const result = await callApi("update_personal_memory", node.memory_id, { pinned });
+  if (!result.ok) return toast(result.error, true);
+  toast(pinned ? "Pinned — it will not be evicted." : "Unpinned.");
+  hideNodeCard();
+  await openMind();
+}
+
+async function forgetMemory(node) {
+  // Asked once, plainly. Forgetting is the only action here that loses something.
+  if (!window.confirm(`Forget this? Aura will no longer know: ${node.label}`)) return;
+  const result = await callApi("forget_personal_memory", node.memory_id);
+  if (!result.ok) return toast(result.error, true);
+  toast("Forgotten.");
+  hideNodeCard();
+  await openMind();
+}
+
 function updateMindActions(node) {
   selectedMindNode = node || null;
-  elements.mindActions.classList.toggle("hidden", !node);
+  // Kept as the record of what is selected — `askAboutMindNode` and
+  // `openMindTarget` both read it — but the buttons live on the card now, so the
+  // footer row stays down.
+  elements.mindActions.classList.add("hidden");
   $("#mindOpen").classList.toggle("hidden", !node?.target);
   $("#mindOpen").textContent = node?.kind === "folder" ? "Browse" : "Open";
   // Every other edge on this map is derived from the data and cannot be
@@ -2576,6 +2855,11 @@ async function openMindTarget() {
 }
 
 class MindGraph {
+  static ROOT_SLOTS = 24;
+  static EXTRA_SLOTS = 36;
+  static PLACED_KEY = "aura.mind.placed";
+  static PLACED_LIMIT = 400;
+
   constructor(canvas) {
     this.canvas = canvas;
     this.context = canvas.getContext("2d");
@@ -2587,6 +2871,8 @@ class MindGraph {
     this.panX = 0;
     this.panY = 0;
     this.selected = null;
+    this.hover = null;
+    this.placed = this.recall();
     updateMindActions(null);
     this.dragNode = null;
     this.panAnchor = null;
@@ -2661,44 +2947,151 @@ class MindGraph {
     this.reset();
   }
 
+  /* FNV-1a over the node id. Every ring used to be laid out by array index, so a
+   * node's direction depended on how many siblings it had and on the order the
+   * server sent them — one new memory renumbered the ring and the same graph
+   * arrived looking like a different map. A node's direction now comes from its
+   * own name and nothing else. */
+  seed(id) {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < id.length; i += 1) {
+      hash ^= id.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash;
+  }
+
+  /* Identity on its own clumps: three ids can hash into the same corner and
+   * leave half the circle bare. Each node claims a slot on a wheel of *fixed*
+   * size and probes forward if it is taken — even spacing, without anyone's
+   * angle depending on how many others turned up. Sorted first so the probe
+   * order is the same however the nodes arrived. */
+  wheel(ids, slots) {
+    const taken = new Set();
+    const angles = new Map();
+    for (const id of [...ids].sort()) {
+      let slot = this.seed(id) % slots;
+      while (taken.has(slot)) slot = (slot + 1) % slots;
+      taken.add(slot);
+      angles.set(id, -Math.PI / 2 + Math.PI * 2 * slot / slots);
+    }
+    return angles;
+  }
+
+  /* Where the node goes, in order of authority: where Mat put it, then where
+   * its name says it belongs. */
+  place(id, x, y) {
+    const kept = this.placed.get(id);
+    this.positions.set(id, kept
+      ? { x: kept.x, y: kept.y, vx: 0, vy: 0, held: true }
+      : { x, y, vx: 0, vy: 0 });
+  }
+
+  /* Which constellation a node belongs to. Walked from the categories outward, so
+   * a memory three hops from "What I know about you" still belongs to it — and a
+   * node reachable from two categories keeps the first that claimed it rather than
+   * being torn between them. */
+  claim(children) {
+    const owner = new Map([["aura", "aura"]]);
+    for (const root of children.get("aura") || []) {
+      const queue = [root];
+      owner.set(root, root);
+      while (queue.length) {
+        const node = queue.shift();
+        for (const child of children.get(node) || []) {
+          if (owner.has(child)) continue;
+          owner.set(child, root);
+          queue.push(child);
+        }
+      }
+    }
+    return owner;
+  }
+
   reset() {
     cancelAnimationFrame(this.frame);
-    this.positions = new Map([["aura", { x: 0, y: 0, vx: 0, vy: 0 }]]);
+    this.positions = new Map();
+    this.place("aura", 0, 0);
     const children = new Map();
     for (const edge of this.edges) {
       if (!children.has(edge.source)) children.set(edge.source, []);
       children.get(edge.source).push(edge.target);
     }
+    this.owner = this.claim(children);
     const roots = children.get("aura") || [];
-    roots.forEach((id, index) => {
-      const angle = -Math.PI / 2 + Math.PI * 2 * index / Math.max(1, roots.length);
-      this.positions.set(id, { x: Math.cos(angle) * 230, y: Math.sin(angle) * 230, vx: 0, vy: 0 });
-    });
+    // The categories are a fixed list of nine that never changes, so hashing them
+    // into wheel slots bought no stability and cost real spacing — two could land
+    // in adjacent slots and sit on top of each other however wide the ring got.
+    // Sorted and spread evenly: just as stable, and evenly spaced by construction.
+    const ordered = [...roots].sort();
+    const ring = new Map(ordered.map((id, index) =>
+      [id, -Math.PI / 2 + Math.PI * 2 * index / Math.max(1, ordered.length)]));
+    for (const id of roots) {
+      const angle = ring.get(id);
+      // Far enough out that a constellation of radius ~100 clears its
+      // neighbours instead of bleeding into them. Nine categories on this
+      // ring sit about 290px apart; on the old 230 ring it was 153, which
+      // is why tightening the groups alone did not separate them.
+      this.place(id, Math.cos(angle) * 420, Math.sin(angle) * 420);
+    }
     const queue = roots.map(id => [id, 1]);
     while (queue.length) {
       const [parent, depth] = queue.shift();
       const parentPos = this.positions.get(parent);
-      const unplaced = (children.get(parent) || []).filter(id => !this.positions.has(id));
+      // Sorted, so a fan is dealt the same way every time. A new sibling still
+      // nudges the fan it joins — but it no longer rotates the map.
+      const unplaced = (children.get(parent) || [])
+        .filter(id => !this.positions.has(id)).sort();
       const base = Math.atan2(parentPos.y, parentPos.x);
       const spread = Math.min(1.8, .32 * Math.max(1, unplaced.length - 1));
       unplaced.forEach((id, index) => {
         const fraction = unplaced.length === 1 ? .5 : index / (unplaced.length - 1);
         const angle = base - spread / 2 + spread * fraction;
         const distance = Math.max(85, 145 - depth * 9);
-        this.positions.set(id, { x: parentPos.x + Math.cos(angle) * distance,
-          y: parentPos.y + Math.sin(angle) * distance, vx: 0, vy: 0 });
+        this.place(id, parentPos.x + Math.cos(angle) * distance,
+          parentPos.y + Math.sin(angle) * distance);
         queue.push([id, depth + 1]);
       });
     }
     const extras = this.nodes.filter(node => !this.positions.has(node.node_id));
-    extras.forEach((node, index) => {
-      const angle = Math.PI * 2 * index / Math.max(1, extras.length);
-      this.positions.set(node.node_id, { x: Math.cos(angle) * 380, y: Math.sin(angle) * 380, vx: 0, vy: 0 });
-    });
+    const outer = this.wheel(extras.map(node => node.node_id), MindGraph.EXTRA_SLOTS);
+    for (const node of extras) {
+      const angle = outer.get(node.node_id);
+      this.place(node.node_id, Math.cos(angle) * 380, Math.sin(angle) * 380);
+    }
     this.step = 0;
     this.resize();
     this.fit();
     this.animate();
+  }
+
+  /* A node Mat dragged is a decision, and it outlives the tab. Only dragged
+   * nodes are written down — settled physics positions are reproducible from
+   * the seeding, so storing them would be noise that goes stale. */
+  remember(id) {
+    const position = this.positions.get(id);
+    if (!position) return;
+    position.held = true;
+    this.placed.set(id, { x: Math.round(position.x), y: Math.round(position.y) });
+    try {
+      localStorage.setItem(MindGraph.PLACED_KEY,
+        JSON.stringify([...this.placed].slice(-MindGraph.PLACED_LIMIT)));
+    } catch (error) { /* private mode, or the quota is full: the map still works */ }
+  }
+
+  recall() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(MindGraph.PLACED_KEY) || "[]");
+      return new Map(Array.isArray(saved) ? saved.filter(entry =>
+        Array.isArray(entry) && typeof entry[0] === "string"
+        && Number.isFinite(entry[1]?.x) && Number.isFinite(entry[1]?.y)) : []);
+    } catch (error) { return new Map(); }
+  }
+
+  forgetPlaces() {
+    this.placed = new Map();
+    try { localStorage.removeItem(MindGraph.PLACED_KEY); } catch (error) { /* nothing to clear */ }
+    this.reset();
   }
 
   resize() {
@@ -2717,6 +3110,13 @@ class MindGraph {
     if (elements.mindView.classList.contains("hidden") || this.step >= 110) return;
     this.physics();
     this.draw();
+    // A card pinned to a node that is still drifting looks broken. Only while it
+    // is not being edited: moving the box out from under a half-typed correction
+    // would be worse than a card that lags for a moment.
+    if (cardNode && !cardEditing && this.positions.has(cardNode.node_id)) {
+      lastCardPoint = this.screen(this.positions.get(cardNode.node_id));
+      placeNodeCard(lastCardPoint);
+    }
     this.step += 1;
     this.frame = requestAnimationFrame(() => this.animate());
   }
@@ -2733,7 +3133,12 @@ class MindGraph {
         const dy = b.y - a.y;
         const distanceSq = Math.max(dx * dx + dy * dy, 100);
         const distance = Math.sqrt(distanceSq);
-        const force = Math.min(2.2, 2800 / distanceSq);
+        // Family bunches, strangers stand apart. This is the whole clustering
+        // idea: not a new force pulling things together — the edge spring already
+        // does that — but permission to sit close once they have arrived, and a
+        // harder shove between nodes that belong to different categories.
+        const together = this.owner && this.owner.get(first) === this.owner.get(second);
+        const force = Math.min(2.2, (together ? 1500 : 5200) / distanceSq);
         const fx = dx / distance * force;
         const fy = dy / distance * force;
         forces.get(first).x -= fx; forces.get(first).y -= fy;
@@ -2746,15 +3151,21 @@ class MindGraph {
       const dx = b.x - a.x;
       const dy = b.y - a.y;
       const distance = Math.max(Math.hypot(dx, dy), 1);
-      const desired = edge.source === "aura" ? 215 : 115;
-      const force = (distance - desired) * .0035;
+      // The hub keeps its arms long so the categories fan out; inside a
+      // constellation the links are shorter, which is what makes it read as one
+      // thing rather than a chain.
+      const desired = edge.source === "aura" ? 420 : 95;
+      const force = (distance - desired) * (edge.source === "aura" ? .0035 : .006);
       const fx = dx / distance * force;
       const fy = dy / distance * force;
       if (edge.source !== "aura") { forces.get(edge.source).x += fx; forces.get(edge.source).y += fy; }
       forces.get(edge.target).x -= fx; forces.get(edge.target).y -= fy;
     }
     for (const node of this.nodes) {
+      // A node that was placed by hand stays placed; physics does not get to
+      // drift it back afterwards.
       if (node.node_id === "aura" || node.node_id === this.dragNode) continue;
+      if (this.positions.get(node.node_id).held) continue;
       const position = this.positions.get(node.node_id);
       const force = forces.get(node.node_id);
       position.vx = Math.max(-5, Math.min(5, (position.vx + force.x) * .84));
@@ -2767,13 +3178,30 @@ class MindGraph {
   radius(node) { return node.kind === "aura" ? 15 : node.kind === "category" ? 10 : 6; }
   screen(position) { return { x: position.x * this.zoom + this.panX, y: position.y * this.zoom + this.panY }; }
 
+  /* Which nodes the pointer is asking about. Hovering one node makes its
+   * neighbourhood the subject and everything else context — the single largest
+   * readability win available on a graph this dense, because it needs no change
+   * to the layout and hides nothing permanently. */
+  focusSet() {
+    const anchor = this.hover || this.selected;
+    if (!anchor) return null;
+    const near = new Set([anchor]);
+    for (const edge of this.edges) {
+      if (edge.source === anchor) near.add(edge.target);
+      if (edge.target === anchor) near.add(edge.source);
+    }
+    return near;
+  }
+
   draw() {
     const context = this.context;
     const rect = this.canvas.getBoundingClientRect();
     context.clearRect(0, 0, rect.width, rect.height);
     const query = this.search.trim().toLowerCase();
     const matches = new Set(this.nodes.filter(node => query && `${node.label} ${node.detail}`.toLowerCase().includes(query)).map(node => node.node_id));
-    context.lineWidth = Math.max(1, this.zoom);
+    const focus = query ? null : this.focusSet();
+    const lit = (id) => (focus ? focus.has(id) : (!query || matches.has(id)));
+
     for (const edge of this.edges) {
       const a = this.screen(this.positions.get(edge.source));
       const b = this.screen(this.positions.get(edge.target));
@@ -2781,30 +3209,67 @@ class MindGraph {
       const dy = b.y - a.y;
       const middle = { x: (a.x + b.x) / 2 - dy * .07, y: (a.y + b.y) / 2 + dx * .07 };
       const source = this.nodeMap.get(edge.source);
-      context.strokeStyle = query && !matches.has(edge.source) && !matches.has(edge.target) ? "#172033" : (NODE_COLORS[source.kind] || "#334155");
-      context.globalAlpha = query ? .9 : .58;
+      const on = lit(edge.source) && lit(edge.target);
+      // An edge into the hub carries the structure; a leaf edge is a detail.
+      const spine = edge.source === "aura" || edge.target === "aura";
+      context.lineWidth = Math.max(spine ? 1.4 : .8, this.zoom * (spine ? 1.4 : .9));
+      context.strokeStyle = on ? (NODE_COLORS[source.kind] || "#334155") : "#141d2e";
+      context.globalAlpha = on ? (focus ? .85 : .5) : .5;
       context.beginPath(); context.moveTo(a.x, a.y); context.quadraticCurveTo(middle.x, middle.y, b.x, b.y); context.stroke();
     }
     context.globalAlpha = 1;
+
     for (const node of this.nodes) {
       const point = this.screen(this.positions.get(node.node_id));
       const radius = Math.max(3.5, this.radius(node) * Math.min(this.zoom, 1.5));
-      let color = NODE_COLORS[node.kind] || "#94a3b8";
-      if (query && !matches.has(node.node_id)) color = "#334155";
+      const on = lit(node.node_id);
+      const color = on ? (NODE_COLORS[node.kind] || "#94a3b8") : "#2a3a52";
+      const hub = node.kind === "aura";
+
+      // Light comes off the node itself, brightest at the hub. Reset after —
+      // a leaked shadow turns every later label into a smear.
+      context.save();
+      if (on) {
+        context.shadowColor = color;
+        context.shadowBlur = hub ? 26 : node.kind === "category" ? 14 : 7;
+      }
       if (node.node_id === this.selected || matches.has(node.node_id)) {
         context.strokeStyle = "#f8fafc"; context.lineWidth = 2; context.beginPath();
         context.arc(point.x, point.y, radius + 4, 0, Math.PI * 2); context.stroke();
       }
-      context.fillStyle = color; context.beginPath(); context.arc(point.x, point.y, radius, 0, Math.PI * 2); context.fill();
-      const showLabel = this.zoom >= .52 || ["aura", "category"].includes(node.kind) || matches.has(node.node_id);
-      if (showLabel) {
-        const base = node.kind === "aura" ? 15 : node.kind === "category" ? 11 : 9;
-        const size = Math.max(7, Math.round(base * Math.min(this.zoom, 1.25)));
-        context.font = `${["aura", "category"].includes(node.kind) ? 650 : 400} ${size}px "Segoe UI"`;
-        context.fillStyle = query && !matches.has(node.node_id) ? "#64748b" : "#f8fafc";
-        context.textBaseline = "middle";
-        context.fillText(node.label, point.x + radius + 4, point.y);
+      context.fillStyle = color;
+      context.beginPath(); context.arc(point.x, point.y, radius, 0, Math.PI * 2); context.fill();
+      context.restore();
+
+      // The hub wears a ring so it reads as the centre rather than the largest dot.
+      if (hub && on) {
+        context.strokeStyle = "rgba(127, 224, 209, .35)"; context.lineWidth = 1;
+        context.beginPath(); context.arc(point.x, point.y, radius + 9, 0, Math.PI * 2); context.stroke();
       }
+
+      const showLabel = this.zoom >= .52 || ["aura", "category"].includes(node.kind)
+        || matches.has(node.node_id) || (focus && focus.has(node.node_id));
+      if (!showLabel) continue;
+
+      const base = hub ? 15 : node.kind === "category" ? 11 : 9;
+      const size = Math.max(7, Math.round(base * Math.min(this.zoom, 1.25)));
+      context.font = `${["aura", "category"].includes(node.kind) ? 650 : 400} ${size}px "Segoe UI"`;
+      context.textBaseline = "middle";
+
+      // Labels used to run off the right edge and vanish. Past two-thirds of the
+      // canvas they flip to the left of their node and stay on screen.
+      const width = context.measureText(node.label).width;
+      const flip = point.x > rect.width * .66;
+      const x = flip ? point.x - radius - 4 - width : point.x + radius + 4;
+
+      // A label sitting on an edge was unreadable. A dark plate under it costs
+      // nothing and is what makes a dense map legible at all.
+      if (on) {
+        context.fillStyle = "rgba(7, 16, 28, .72)";
+        context.fillRect(x - 3, point.y - size * .72, width + 6, size * 1.44);
+      }
+      context.fillStyle = on ? "#f8fafc" : "#5b6b82";
+      context.fillText(node.label, x, point.y);
     }
   }
 
@@ -2837,9 +3302,13 @@ class MindGraph {
     if (id) {
       const node = this.nodeMap.get(id);
       updateMindActions(node);
-      const detail = node.detail.length > 500 ? `${node.detail.slice(0, 499)}…` : node.detail;
-      elements.mindDetail.textContent = `${node.label} — ${detail}`;
+      // The card carries the detail and the actions now; repeating them along the
+      // bottom was the same text twice, in the smaller and worse of the two places.
+      elements.mindDetail.textContent = node.label;
+      lastCardPoint = this.screen(this.positions.get(id));
+      showNodeCard(node, lastCardPoint);
     } else {
+      hideNodeCard();
       updateMindActions(null);
       elements.mindDetail.textContent = "Select a node to see what Aura knows about it.";
     }
@@ -2859,6 +3328,11 @@ class MindGraph {
       this.canvas.classList.add("dragging");
     });
     this.canvas.addEventListener("pointermove", event => {
+      if (!this.dragNode && !this.panAnchor) {
+        const over = this.nearest(event.offsetX, event.offsetY);
+        if (over !== this.hover) { this.hover = over; this.draw(); }
+        this.canvas.style.cursor = over ? "pointer" : "";
+      }
       if (this.dragNode && this.dragNode !== "aura") {
         const rect = this.canvas.getBoundingClientRect();
         const position = this.positions.get(this.dragNode);
@@ -2871,7 +3345,13 @@ class MindGraph {
         this.panAnchor = { x: event.clientX, y: event.clientY }; this.draw();
       }
     });
-    const release = () => { this.dragNode = null; this.panAnchor = null; this.canvas.classList.remove("dragging"); };
+    const release = () => {
+      if (this.dragNode && this.dragNode !== "aura") this.remember(this.dragNode);
+      this.dragNode = null; this.panAnchor = null; this.canvas.classList.remove("dragging");
+    };
+    this.canvas.addEventListener("pointerleave", () => {
+      if (this.hover) { this.hover = null; this.draw(); }
+    });
     this.canvas.addEventListener("pointerup", release);
     this.canvas.addEventListener("pointercancel", release);
     this.canvas.addEventListener("click", event => {
@@ -2964,6 +3444,50 @@ function bindControls() {
   $("#permissionsButton").addEventListener("click", () => openPermissions());
   $("#sessionsButton").addEventListener("click", () => openSessions());
   $("#showArchivedSessions").addEventListener("change", () => openSessions(false));
+  $("#openProgress").addEventListener("click", () => {
+    // A window rather than a panel: the point is to keep it visible while
+    // looking at something else, which a panel inside this page cannot do.
+    window.open("/progress", "aura-progress",
+                "width=460,height=620,menubar=no,toolbar=no,location=no");
+  });
+  $("#settingProvider").addEventListener("change", showCloudFields);
+  $("#lessonProject").addEventListener("change", loadLessons);
+  $("#addLesson").addEventListener("click", addLesson);
+  $("#lessonText").addEventListener("keydown", event => {
+    if (event.key === "Enter") { event.preventDefault(); addLesson(); }
+  });
+  $("#refreshOpenaiModels").addEventListener("click", async () => {
+    const status = $("#settingsStatus");
+    status.className = "modal-status";
+    status.textContent = "Asking OpenAI which models this key can use…";
+    const result = await callApi("get_openai_models", $("#settingOpenaiKey").value);
+    if (result.ok) {
+      $("#openaiModels").replaceChildren(...result.models.map((name) => {
+        const option = document.createElement("option");
+        option.value = name;
+        return option;
+      }));
+      status.textContent = `${result.models.length} models available to this key.`;
+    } else {
+      status.className = "modal-status error";
+      status.textContent = result.error || "Could not read the model list.";
+    }
+  });
+  const forgetKey = async (service) => {
+    const result = await callApi("forget_cloud_key", service);
+    const status = $("#settingsStatus");
+    status.className = "modal-status" + (result.ok ? "" : " error");
+    status.textContent = result.ok ? result.note : (result.error || "Could not remove the key.");
+    if (result.ok) {
+      $("#settingProvider").value = result.provider;
+      const field = service === "openai" ? $("#settingOpenaiKey") : $("#settingCloudKey");
+      field.value = "";
+      field.placeholder = service === "openai" ? "sk-…" : "sk-ant-…";
+      showCloudFields();
+    }
+  };
+  $("#forgetCloudKey").addEventListener("click", () => forgetKey("claude"));
+  $("#forgetCloudKeyB").addEventListener("click", () => forgetKey("openai"));
   let sessionSearchTimer = null;
   $("#sessionSearch").addEventListener("input", () => {
     clearTimeout(sessionSearchTimer);
@@ -2971,7 +3495,6 @@ function bindControls() {
   });
   $("#newSessionButton").addEventListener("click", startNewSession);
   $("#permissionGrant").addEventListener("submit", grantFolderAccess);
-  $("#domainGrant").addEventListener("submit", grantDomainAccess);
   $("#watchButton").addEventListener("click", () => openWatchPanel());
   $("#healthButton").addEventListener("click", () => openHealthPanel());
   $("#healthAgain").addEventListener("click", () => openHealthPanel(false));
@@ -3059,7 +3582,10 @@ function bindControls() {
   $("#memoryExport").addEventListener("click", exportPersonalMemory);
   $("#mindClose").addEventListener("click", closeMind);
   $("#mindFit").addEventListener("click", () => mindGraph.fit());
-  $("#mindReset").addEventListener("click", () => mindGraph.reset());
+  // Reset now means "forget where I put things", because a plain reset would
+  // put the held nodes straight back where they were.
+  $("#mindCardClose").addEventListener("click", hideNodeCard);
+  $("#mindReset").addEventListener("click", () => mindGraph.forgetPlaces());
   $("#mindRefresh").addEventListener("click", openMind);
   $("#mindProjectSave").addEventListener("click", saveMindProject);
   $("#mindProject").addEventListener("keydown", event => {
@@ -3133,6 +3659,9 @@ function bindControls() {
       else if (top === elements.welcomeModal) finishOnboarding(true);
       else if (top) closeModal(top);
       else if (!elements.workspaceView.classList.contains("hidden")) closeWorkspaceExplorer();
+      // The card first: Escape should close the smallest thing that is open, or it
+      // takes the whole map away when you only wanted to dismiss a note.
+      else if (cardNode) hideNodeCard();
       else if (!elements.mindView.classList.contains("hidden")) closeMind();
       else if (busy) callApi("stop");
     }
@@ -3180,6 +3709,9 @@ async function initialize() {
     applyLayout();
     elements.workspacePath.textContent = bootstrap.workspace;
     elements.workspacePath.title = bootstrap.workspace;
+    // A tab opened mid-conversation has to start out knowing, not find out on
+    // the next reply.
+    applyProject((bootstrap.capabilities || {}).project);
     updatePowerStatus(bootstrap.capabilities || {});
     renderNetworkStatus(bootstrap.network);
     renderAutonomyStatus(bootstrap.autonomy);

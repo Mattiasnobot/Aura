@@ -20,6 +20,8 @@ Three rules hold for everything in here:
 
 from __future__ import annotations
 
+from . import context_budget, sampling
+
 import shutil
 import sqlite3
 from contextlib import closing
@@ -70,21 +72,86 @@ def _check_model(agent) -> list[Result]:
         return [Result("provider", "Model server", UNKNOWN,
                        f"{type(agent.provider).__name__} does not report a server."),
                 Result("model", "Model", UNKNOWN, "Nothing to ask.")]
+    # Named from the provider in use. These sentences said "LM Studio" outright,
+    # so a cloud model that was merely out of credit sent the user off to start
+    # a local program that had nothing to do with it.
+    service = str(getattr(agent.provider, "SERVICE", "") or "Model server")
+    remote = bool(getattr(agent.provider, "is_remote", lambda: False)())
+    fix = ("Check the key and the address in Settings." if remote
+           else "Start LM Studio and open its local server.")
     models, error, seconds = _timed(lister)
     if error is not None:
-        return [Result("provider", "LM Studio", FAIL,
-                       f"No answer from {getattr(agent.provider, 'base_url', 'the server')}: {error}",
-                       "Start LM Studio and open its local server."),
+        return [Result("provider", service, FAIL,
+                       f"No answer from {getattr(agent.provider, 'base_url', service)}: {error}",
+                       fix),
                 Result("model", "Model", UNKNOWN,
                        "Cannot tell while the server is unreachable.")]
-    reachable = Result("provider", "LM Studio", OK,
+    reachable = Result("provider", service, OK,
                        f"Answered in {seconds:.1f}s with {len(models or [])} model(s).")
     if not models:
         return [reachable, Result("model", "Model", FAIL,
                                   "The server is running but no model is loaded.",
-                                  "Load a model in LM Studio.")]
-    selected = agent.provider.selected_model()
-    return [reachable, Result("model", "Model", OK, f"{selected} is selected.")]
+                                  fix if remote else "Load a model in LM Studio.")]
+    selected, model_error, _ = _timed(agent.provider.selected_model)
+    if model_error is not None:
+        return [reachable, Result("model", "Model", WARN,
+                                  f"Could not tell which model is selected: {model_error}", fix)]
+    return [reachable, Result("model", "Model", OK, f"{selected} is selected."),
+            _check_context(agent)]
+
+
+#: Below this, an ordinary Aura conversation is truncated within a few turns —
+#: the system prompt alone is around 4,000 characters before anything is said.
+COMFORTABLE_CONTEXT = 16384
+
+
+def _check_context(agent) -> Result:
+    """How much context the loaded model actually has.
+
+    Every silence Aura ever recorded was a conversation larger than this number,
+    and nothing displayed it. The server truncates a conversation that will not
+    fit, and when the truncation removes the last thing the user said, the chat
+    template refuses the request outright — which arrived looking exactly like a
+    model that had chosen to say nothing.
+    """
+    reader = getattr(agent.provider, "loaded_context", None)
+    if reader is None:
+        return Result("context", "Context window", UNKNOWN,
+                      "This provider does not report one.")
+    size, error, _ = _timed(reader)
+    if error is not None or not size:
+        return Result("context", "Context window", UNKNOWN,
+                      "The server did not report the loaded context length.")
+    if size < COMFORTABLE_CONTEXT:
+        return Result("context", "Context window", WARN,
+                      f"The model is loaded with only {size:,} tokens of context. "
+                      f"Longer conversations are silently truncated, which shows up "
+                      f"as Aura going quiet mid-task.",
+                      "Raise the context length in LM Studio and load the model again.")
+    # Not the answer *limit*. That is a ceiling the server does not hold back
+    # against the prompt — measured: an 18,880-token prompt succeeded with the
+    # limit at 64,000 on a 66,816-token window. Subtracting it here said a
+    # perfectly workable setup had 2,816 tokens left, and the preflight
+    # believed it and started cutting conversations that fitted.
+    limit = max((sampling.for_turn([kind_tools], agent.config.data).max_tokens
+                 for kind_tools in ("write_file", "read_file", "remember_name")),
+                default=int(agent.config.data.get("max_tokens", 0) or 0))
+    reserved = context_budget.answer_reserve(limit, size, getattr(agent, "budget", None))
+    room = size - reserved
+    if limit > size:
+        # Harmless but confused: an answer can never reach a cap larger than the
+        # window it is written into, so the number promises something it cannot
+        # do. Worth saying once rather than leaving as a puzzle.
+        return Result("context", "Context window", WARN,
+                      f"{size:,} tokens, and the response limit is set to {limit:,} — "
+                      f"larger than the whole window, so an answer can never reach it. "
+                      f"Aura keeps {reserved:,} clear for the reply, leaving "
+                      f"{room:,} for the conversation.",
+                      "Set the response limits in Settings below the context length, "
+                      "or raise the context length in LM Studio.")
+    return Result("context", "Context window", OK,
+                  f"{size:,} tokens, with {room:,} left for the conversation after "
+                  f"the {reserved:,} kept clear for a reply.")
 
 
 def _check_vision(agent) -> Result:
